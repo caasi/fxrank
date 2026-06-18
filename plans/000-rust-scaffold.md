@@ -4,7 +4,7 @@
 
 **Goal:** Scaffold the `fxrank` repository as a minimal, well-tooled Rust binary crate — a tested "Hello, world!" with formatter, linter, toolchain config, and CI.
 
-**Architecture:** A single binary crate (edition 2024). `main()` prints the return value of a pure `greeting()` function, which is covered by one built-in unit test. Tooling (rustfmt, clippy, toolchain channel, CI) is layered on in separate commits so each piece is verifiable on its own.
+**Architecture:** A single binary crate (edition 2024). `main()` prints the return value of a pure `greeting()` function, which is covered by one built-in unit test. Tooling (toolchain channel, rustfmt, clippy, CI) is layered on in separate commits so each piece is verifiable on its own. The toolchain file is created early so rustfmt/clippy components are resolved before the first `cargo fmt`/`cargo clippy` run.
 
 **Tech Stack:** Rust (edition 2024, stable channel), cargo built-in test harness, rustfmt, clippy, GitHub Actions.
 
@@ -19,10 +19,11 @@
 | File | Responsibility |
 | --- | --- |
 | `Cargo.toml` | Package manifest; declares crate name/edition and the `[lints.clippy]` config. |
+| `Cargo.lock` | Dependency lockfile — intentionally committed (correct for a binary crate). |
 | `src/main.rs` | Entry point: `greeting()` (pure), `main()` (prints it), and the `#[cfg(test)]` test module. |
-| `rustfmt.toml` | Formatter configuration. |
 | `rust-toolchain.toml` | Toolchain channel + components contributors/CI resolve. |
-| `.gitignore` | Excludes the cargo build directory. |
+| `rustfmt.toml` | Formatter configuration. |
+| `.gitignore` | Excludes the cargo build directory (`/target`); `Cargo.lock` stays tracked. |
 | `.github/workflows/ci.yml` | CI gate: fmt-check → clippy → test. |
 
 ---
@@ -34,13 +35,13 @@
 - Create: `src/main.rs`
 - Create: `.gitignore`
 
-- [ ] **Step 1: Create `.gitignore`**
+- [ ] **Step 1: Create `.gitignore`** (only `/target` is ignored; `Cargo.lock` is intentionally tracked for a binary crate)
 
 ```gitignore
 /target
 ```
 
-- [ ] **Step 2: Create `Cargo.toml`** (manifest only; clippy lints come in Task 4)
+- [ ] **Step 2: Create `Cargo.toml`** (manifest only; clippy lints come in Task 5)
 
 ```toml
 [package]
@@ -69,7 +70,36 @@ git commit -m "feat: initialize fxrank cargo crate skeleton"
 
 ---
 
-## Task 2: `greeting()` function (TDD)
+## Task 2: Toolchain configuration
+
+Created early so the `rustfmt` and `clippy` components are resolved before the first `cargo fmt`/`cargo clippy` invocation in later tasks.
+
+**Files:**
+- Create: `rust-toolchain.toml`
+
+- [ ] **Step 1: Create `rust-toolchain.toml`**
+
+```toml
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+```
+
+- [ ] **Step 2: Verify the toolchain file is honored and components resolve**
+
+Run: `cargo fmt --version && cargo clippy --version`
+Expected: both print a version (rustup installs the `stable` channel + components on first use if absent).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add rust-toolchain.toml
+git commit -m "chore: pin toolchain channel and components"
+```
+
+---
+
+## Task 3: `greeting()` function (TDD)
 
 **Files:**
 - Modify: `src/main.rs`
@@ -91,7 +121,8 @@ mod tests {
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test`
-Expected: FAIL — compile error `cannot find function 'greeting' in this scope`.
+Expected: FAIL — `error[E0425]: cannot find function 'greeting' in this scope`.
+(An incidental `warning: unused import: 'super::*'` may also appear; it is harmless and self-resolves once `greeting()` exists in Step 3.)
 
 - [ ] **Step 3: Implement `greeting()` and wire it into `main()`** — replace the `fn main() {}` line so the top of `src/main.rs` reads:
 
@@ -126,7 +157,7 @@ git commit -m "feat: add tested greeting function"
 
 ---
 
-## Task 3: Formatter (rustfmt)
+## Task 4: Formatter (rustfmt)
 
 **Files:**
 - Create: `rustfmt.toml`
@@ -153,7 +184,7 @@ git commit -m "chore: configure rustfmt"
 
 ---
 
-## Task 4: Linter (clippy)
+## Task 5: Linter (clippy)
 
 **Files:**
 - Modify: `Cargo.toml`
@@ -175,33 +206,6 @@ Expected: PASS — `Finished` with no warnings (the scaffold code is clippy-clea
 ```bash
 git add Cargo.toml
 git commit -m "chore: enable clippy all-group lints"
-```
-
----
-
-## Task 5: Toolchain configuration
-
-**Files:**
-- Create: `rust-toolchain.toml`
-
-- [ ] **Step 1: Create `rust-toolchain.toml`**
-
-```toml
-[toolchain]
-channel = "stable"
-components = ["rustfmt", "clippy"]
-```
-
-- [ ] **Step 2: Verify the toolchain file is honored and the build still works**
-
-Run: `cargo build`
-Expected: compiles successfully (rustup resolves the `stable` channel + components).
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add rust-toolchain.toml
-git commit -m "chore: pin toolchain channel and components"
 ```
 
 ---
@@ -233,10 +237,10 @@ jobs:
       - run: cargo test
 ```
 
-- [ ] **Step 2: Sanity-check the YAML parses**
+- [ ] **Step 2: Sanity-check the YAML parses** (Ruby ships with macOS; avoids the PyYAML dependency `python3 -c "import yaml"` would need)
 
-Run: `python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/ci.yml')); print('ok')"`
-Expected: `ok`.
+Run: `ruby -ryaml -e "YAML.load_file('.github/workflows/ci.yml'); puts 'ok'"`
+Expected: `ok`. (If Ruby is unavailable, skip — GitHub validates the workflow on push.)
 
 - [ ] **Step 3: Commit**
 
@@ -251,7 +255,7 @@ git commit -m "ci: add fmt, clippy, and test workflow"
 
 **Files:** none (verification only)
 
-- [ ] **Step 1: Run the full local gate — the same four checks CI runs**
+- [ ] **Step 1: Run the full local gate — the three checks CI runs, plus `cargo build`**
 
 ```bash
 cargo build
@@ -260,7 +264,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-Expected: all four exit 0 — build succeeds, `1 passed`, no fmt diff, no clippy warnings.
+Expected: all four exit 0 — build succeeds, `1 passed`, no fmt diff, no clippy warnings. (CI runs the latter three; `cargo build` is the spec's local-only sanity check.)
 
 - [ ] **Step 2: Confirm the working tree is clean**
 
