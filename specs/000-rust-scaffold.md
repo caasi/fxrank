@@ -4,7 +4,7 @@
 
 Initialize the `fxrank` repository as a minimal, well-tooled Rust binary crate: a
 "Hello, world!" entry point backed by a real unit test, with formatter, linter,
-toolchain pinning, and CI configured from the start. The result is a clean
+toolchain channel configuration, and CI configured from the start. The result is a clean
 baseline that future feature work can build on without revisiting tooling.
 
 ## Scope
@@ -17,7 +17,7 @@ In scope:
 - Formatter configuration (`rustfmt`).
 - Linter configuration (`clippy`) via the `Cargo.toml` `[lints]` table.
 - Toolchain configuration (`rust-toolchain.toml`, channel `stable`).
-- Git initialization with a Rust `.gitignore`.
+- A Rust `.gitignore` (the repository is already git-initialized).
 - A GitHub Actions CI workflow gating format, lint, and tests.
 
 Out of scope:
@@ -32,25 +32,33 @@ Out of scope:
 ### `Cargo.toml`
 
 - `[package]`: name `fxrank`, `edition = "2024"`, a starting `version` of `0.1.0`.
-- `[lints.clippy]`: enable `all` and `pedantic` at `warn` level. This is the
-  modern, centralized way to configure clippy (replaces scattered
-  `#![warn(...)]` crate attributes).
+- `[lints.clippy]`: enable the `all` group at `warn` level. This is the modern,
+  centralized way to configure clippy (replaces scattered `#![warn(...)]` crate
+  attributes). `all` covers the correctness, suspicious, style, complexity, and
+  perf lint groups — a pragmatic baseline. The noisier `pedantic` group is
+  intentionally omitted to avoid CI friction as the code grows (CI runs
+  `clippy -- -D warnings`, so any enabled group becomes a hard error).
+- Note for future edits: if individual per-lint overrides are later added to the
+  same table, the `all` group entry must become
+  `all = { level = "warn", priority = -1 }` so the specific lints take
+  precedence over the group; otherwise Cargo errors.
 
 ### `src/main.rs`
 
-- `fn greeting() -> String` returning `"Hello, world!"` — a pure function so the
-  behavior is unit-testable (capturing `println!` output is not clean).
+- `fn greeting() -> &'static str` returning `"Hello, world!"` — a pure function so
+  the behavior is unit-testable (capturing `println!` output is not clean).
+  Returning `&'static str` avoids a needless allocation.
 - `fn main()` that prints `greeting()`.
 - A `#[cfg(test)]` module with one test asserting `greeting()` equals
   `"Hello, world!"`.
 
 ### `rustfmt.toml`
 
-- `edition = "2024"`.
+- `edition = "2024"` (must match the `edition` in `Cargo.toml`).
 - `max_width = 100`.
 - `newline_style = "Unix"`.
 
-Only stable rustfmt options are used so `cargo fmt` works on the pinned stable
+Only stable rustfmt options are used so `cargo fmt` works on the stable
 toolchain without nightly features.
 
 ### `rust-toolchain.toml`
@@ -67,11 +75,14 @@ toolchain without nightly features.
 
 - Triggers: `push` and `pull_request`.
 - Single job on `ubuntu-latest`:
-  1. Checkout.
-  2. `cargo fmt --check`.
-  3. `cargo clippy --all-targets -- -D warnings`.
-  4. `cargo test`.
-- Relies on `rust-toolchain.toml` for toolchain + component resolution.
+  1. Checkout (`actions/checkout`).
+  2. Install the toolchain explicitly via `dtolnay/rust-toolchain@stable` with
+     `components: rustfmt, clippy`. Relying solely on `rust-toolchain.toml`
+     auto-install is fragile on hosted runners, so the workflow pins the setup
+     step.
+  3. `cargo fmt --check`.
+  4. `cargo clippy --all-targets -- -D warnings`.
+  5. `cargo test`.
 
 ## Data Flow
 
@@ -104,8 +115,8 @@ The scaffold is considered complete only when all of the following pass locally:
 
 | Decision | Choice | Rationale |
 | --- | --- | --- |
-| Edition | 2024 | Latest stable edition; toolchain (1.96.0) supports it. |
+| Edition | 2024 | Latest stable edition (stable since Rust 1.85). |
 | Testing | Built-in harness | Zero dependencies; sufficient for current scope. |
-| Toolchain pin | `channel = "stable"` | Auto-tracks latest stable; no manual version bumps. |
-| Clippy config | `[lints.clippy]` in `Cargo.toml` | Centralized, modern; `-D warnings` in CI enforces it. |
+| Toolchain channel | `channel = "stable"` | Auto-tracks latest stable; no manual version bumps. Not a version pin. |
+| Clippy config | `[lints.clippy] all = "warn"` | Centralized, modern; pragmatic baseline; `-D warnings` in CI enforces it. |
 | Repo/CI | git + `.gitignore` + GitHub Actions | Reproducible baseline with format/lint/test gating. |
