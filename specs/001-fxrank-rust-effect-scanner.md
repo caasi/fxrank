@@ -422,6 +422,9 @@ the `hidden` flag and the lower `confidence` of a heuristic detection:
   `summary.confidence` the **min** (weakest-link) across hotspots. All `summary.*`
   and `scope.*` are computed over **all** scanned functions; `--limit N` truncates
   only the `hotspots` array, not the summary.
+- **Zero hotspots** (empty input, or a file with only module-level risks):
+  `own_score: 0`, `confidence: 1.0`, and `max_class` / `risk_weight` are the max of
+  the `scope.risk_features` (or `0` if there are none).
 - `effects[].weight` reflects the **post-discount** class (`discounted_to` when a
   discount applies, else `class`).
 - `effects[].discount` / `discounted_to` / `tier` explain *why a score is what it
