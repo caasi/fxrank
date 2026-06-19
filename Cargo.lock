@@ -328,6 +328,7 @@ dependencies = [
  "clap",
  "fxrank-core",
  "fxrank-lang-rust",
+ "fxrank-lang-ts",
  "predicates",
  "serde_json",
 ]

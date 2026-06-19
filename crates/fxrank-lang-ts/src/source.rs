@@ -2,8 +2,9 @@
 use swc_common::{BytePos, SourceMap, Span, sync::Lrc};
 use swc_ecma_parser::{EsSyntax, Syntax, TsSyntax};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Lang {
+    #[default]
     Ts,
     Tsx,
     Js,

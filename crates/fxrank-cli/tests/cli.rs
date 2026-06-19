@@ -316,6 +316,38 @@ fn scan_skips_tests_by_default_and_include_tests_keeps_them() {
     );
 }
 
+// ── Test 10: stdin with --lang ts → TS frontend, one function counted ──
+
+#[test]
+fn cli_scans_ts_fragment_from_stdin() {
+    use assert_cmd::Command;
+    let mut cmd = Command::cargo_bin("fxrank").unwrap();
+    let assert = cmd
+        .args(["scan", "--lang", "ts", "-"])
+        .write_stdin("function f(): void {}\n")
+        .assert()
+        .success();
+    let json: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(json["scope"]["functions"], 1);
+}
+
+// ── Test 11: stdin WITHOUT --lang stays Rust (back-compat) ──
+
+#[test]
+fn cli_stdin_without_lang_is_rust() {
+    // A Rust fn body parses as Rust; the same text is not valid TS, so if the
+    // back-compat default ever flipped to TS this would error or miscount.
+    let json = scan_stdin("fn r() { println!(\"x\"); }");
+    assert_eq!(
+        json["scope"]["functions"], 1,
+        "stdin without --lang should parse as Rust"
+    );
+    assert!(
+        json.get("hotspots").is_some(),
+        "missing 'hotspots' key in: {json}"
+    );
+}
+
 // ── Test 6: --limit 1 on ≥2 functions → hotspots length 1, summary over all ──
 
 #[test]

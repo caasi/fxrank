@@ -4,6 +4,7 @@ use crate::model::{Diagnostic, Hotspot};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     Rust,
+    Ts,
 }
 
 pub struct SourceFile {

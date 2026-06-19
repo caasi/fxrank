@@ -14,9 +14,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Analyze Rust source files and emit a ranked JSON report to stdout.
+    /// Analyze source files and emit a ranked JSON report to stdout.
     Scan {
-        /// File or directory to scan. Omit to read from stdin.
+        /// File or directory to scan. Omit (or pass `-`) to read from stdin.
         path: Option<PathBuf>,
         /// Limit output to the top-N hotspots (summary still covers all).
         #[arg(long)]
@@ -24,7 +24,30 @@ enum Cmd {
         /// Include test functions and modules in the analysis (skipped by default).
         #[arg(long)]
         include_tests: bool,
+        /// Language dialect for stdin (`ts`, `tsx`, `js`, `jsx`). Only meaningful
+        /// for stdin; for files/directories the extension decides the frontend.
+        #[arg(long)]
+        lang: Option<String>,
     },
+}
+
+/// Which frontend a source file should be routed to.
+///
+/// Feature-independent: TS sources carry their extension (without the dot) so
+/// the (feature-gated) TS dispatch can resolve the `Lang` dialect itself. The
+/// CLI never references `fxrank_lang_ts::Lang` directly, so the binary still
+/// compiles without the `ts` feature.
+#[derive(Clone)]
+enum Route {
+    Rust,
+    /// TS-family source; the `String` is the file extension (e.g. `"ts"`, `"tsx"`).
+    Ts(String),
+}
+
+/// A source file paired with the frontend it should be routed to.
+struct RoutedSource {
+    source: SourceFile,
+    route: Route,
 }
 
 fn main() -> ExitCode {
@@ -33,9 +56,10 @@ fn main() -> ExitCode {
         path,
         limit,
         include_tests,
+        lang,
     } = cli.cmd;
 
-    match run_scan(path, limit, include_tests) {
+    match run_scan(path, limit, include_tests, lang) {
         Ok(report) => {
             // Compact JSON: no trailing newline issues — println! adds exactly one.
             println!(
@@ -56,46 +80,75 @@ fn run_scan(
     path: Option<PathBuf>,
     limit: Option<usize>,
     include_tests: bool,
+    lang: Option<String>,
 ) -> Result<Report, String> {
     // Accumulated read-error diagnostics (files that exist but couldn't be read).
     let mut read_errors: Vec<Diagnostic> = Vec::new();
 
-    let (input_label, sources) = match path {
-        None => {
-            // Read all of stdin into one synthetic SourceFile.
-            let mut text = String::new();
-            std::io::stdin()
-                .read_to_string(&mut text)
-                .map_err(|e| format!("read stdin: {e}"))?;
-            (
-                "stdin".to_owned(),
-                vec![SourceFile {
-                    path: "stdin".into(),
-                    text,
-                }],
-            )
-        }
-        Some(ref p) if !p.exists() => {
+    // `-` is the conventional "read stdin" path; treat it like an omitted path.
+    let is_stdin = match &path {
+        None => true,
+        Some(p) => p.as_os_str() == "-",
+    };
+
+    let (input_label, routed) = if is_stdin {
+        // Read all of stdin into one synthetic SourceFile.
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| format!("read stdin: {e}"))?;
+        let source = SourceFile {
+            path: "stdin".into(),
+            text,
+        };
+        // Back-compat: stdin defaults to Rust. `--lang` selects the TS frontend
+        // with the given dialect. (`--lang` is a TS-frontend concept; there is
+        // no `--lang rust`.)
+        let route = match lang.as_deref() {
+            None => Route::Rust,
+            Some(flag) => {
+                // We only accept the four TS dialects here; reject anything else.
+                match flag {
+                    "ts" | "tsx" | "js" | "jsx" => Route::Ts(flag.to_owned()),
+                    other => {
+                        return Err(format!(
+                            "unknown --lang value '{other}' (expected ts, tsx, js, or jsx)"
+                        ));
+                    }
+                }
+            }
+        };
+        ("stdin".to_owned(), vec![RoutedSource { source, route }])
+    } else {
+        let p = path.expect("path present when not stdin");
+        if !p.exists() {
             return Err(format!("path not found: {}", p.display()));
         }
-        Some(ref p) if p.is_file() => {
+        if p.is_file() {
+            // Single explicit file: route by its extension.
+            let route = route_for_path(&p)
+                .ok_or_else(|| format!("unsupported file extension: {}", p.display()))?;
+            let label = p.to_string_lossy().into_owned();
             let text =
-                std::fs::read_to_string(p).map_err(|e| format!("read {}: {e}", p.display()))?;
+                std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
+            let source = SourceFile {
+                path: label.clone(),
+                text,
+            };
+            (label, vec![RoutedSource { source, route }])
+        } else {
+            // Directory: walk recursively collecting routable source files.
             let label = p.to_string_lossy().into_owned();
-            (label.clone(), vec![SourceFile { path: label, text }])
-        }
-        Some(ref p) => {
-            // Directory: walk recursively collecting *.rs files.
-            let label = p.to_string_lossy().into_owned();
-            let sources = collect_rs_files(p, &mut read_errors);
-            (label, sources)
+            let routed = collect_source_files(&p, &mut read_errors);
+            (label, routed)
         }
     };
 
     let read_error_count = read_errors.len();
+    let source_count = routed.len();
 
-    // Dispatch to language frontend(s).
-    let output = dispatch(&sources, include_tests);
+    // Dispatch to the appropriate frontend(s) and merge outputs.
+    let output = dispatch(routed, include_tests);
 
     // Count parse diagnostics from the frontend (not read errors).
     let parse_diag_count = output.diagnostics.iter().filter(|d| !d.parsed).count();
@@ -106,8 +159,8 @@ fn run_scan(
 
     let scope = Scope {
         input: input_label,
-        files: sources.len() + read_error_count,
-        parsed: sources.len().saturating_sub(parse_diag_count),
+        files: source_count + read_error_count,
+        parsed: source_count.saturating_sub(parse_diag_count),
         functions: output.functions.len(),
         skipped_tests: output.skipped_tests,
         risk_features: output.module_risks,
@@ -121,15 +174,34 @@ fn run_scan(
     ))
 }
 
-/// Walk `dir` recursively, collecting every `*.rs` file as a `SourceFile`.
-/// Files that can't be read are pushed to `read_errors` instead.
-fn collect_rs_files(dir: &PathBuf, read_errors: &mut Vec<Diagnostic>) -> Vec<SourceFile> {
+/// Decide which frontend a path's extension routes to. Returns `None` for
+/// extensions no frontend handles.
+fn route_for_path(path: &std::path::Path) -> Option<Route> {
+    let ext = path.extension()?.to_str()?;
+    match ext {
+        "rs" => Some(Route::Rust),
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => Some(Route::Ts(ext.to_owned())),
+        _ => None,
+    }
+}
+
+/// Walk `dir` recursively, collecting every routable source file (`.rs` plus the
+/// JS/TS family) as a `RoutedSource`. Files that can't be read are pushed to
+/// `read_errors` instead.
+fn collect_source_files(
+    dir: &std::path::Path,
+    read_errors: &mut Vec<Diagnostic>,
+) -> Vec<RoutedSource> {
     let mut sources = Vec::new();
     walk_dir(dir, &mut sources, read_errors);
     sources
 }
 
-fn walk_dir(dir: &PathBuf, sources: &mut Vec<SourceFile>, read_errors: &mut Vec<Diagnostic>) {
+fn walk_dir(
+    dir: &std::path::Path,
+    sources: &mut Vec<RoutedSource>,
+    read_errors: &mut Vec<Diagnostic>,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -174,19 +246,23 @@ fn walk_dir(dir: &PathBuf, sources: &mut Vec<SourceFile>, read_errors: &mut Vec<
                 let path = entry.path();
                 if file_type.is_dir() {
                     walk_dir(&path, sources, read_errors);
-                } else if file_type.is_file()
-                    && path.extension().map(|e| e == "rs").unwrap_or(false)
-                {
-                    match std::fs::read_to_string(&path) {
-                        Ok(text) => sources.push(SourceFile {
-                            path: path.to_string_lossy().into_owned(),
-                            text,
-                        }),
-                        Err(e) => read_errors.push(Diagnostic {
-                            path: path.to_string_lossy().into_owned(),
-                            parsed: false,
-                            error: format!("{e}"),
-                        }),
+                } else if file_type.is_file() {
+                    // Route by extension; skip files no frontend handles.
+                    if let Some(route) = route_for_path(&path) {
+                        match std::fs::read_to_string(&path) {
+                            Ok(text) => sources.push(RoutedSource {
+                                source: SourceFile {
+                                    path: path.to_string_lossy().into_owned(),
+                                    text,
+                                },
+                                route,
+                            }),
+                            Err(e) => read_errors.push(Diagnostic {
+                                path: path.to_string_lossy().into_owned(),
+                                parsed: false,
+                                error: format!("{e}"),
+                            }),
+                        }
                     }
                 }
             }
@@ -194,24 +270,98 @@ fn walk_dir(dir: &PathBuf, sources: &mut Vec<SourceFile>, read_errors: &mut Vec<
     }
 }
 
-/// Feature-gated dispatch: run all sources through the Rust frontend when
-/// the `rust` feature is enabled; otherwise emit a "no frontend" diagnostic
-/// per file so the binary still compiles and produces valid (empty) output.
+/// Merge `other` into `acc` (concatenate functions/risks/diagnostics, sum
+/// skipped_tests).
+fn merge_output(acc: &mut FrontendOutput, mut other: FrontendOutput) {
+    acc.functions.append(&mut other.functions);
+    acc.module_risks.append(&mut other.module_risks);
+    acc.diagnostics.append(&mut other.diagnostics);
+    acc.skipped_tests += other.skipped_tests;
+}
+
+/// Route each source to its frontend, run the right frontend(s), and merge the
+/// per-frontend `FrontendOutput`s into one.
+///
+/// Rust sources need the `rust` feature; TS sources need the `ts` feature. When
+/// a source's frontend feature is not compiled in, a "no frontend available"
+/// diagnostic is emitted per file (mirroring the slim-build behavior).
+fn dispatch(routed: Vec<RoutedSource>, include_tests: bool) -> FrontendOutput {
+    // Partition by route.
+    let mut rust_sources: Vec<SourceFile> = Vec::new();
+    // TS sources keyed by extension so each `Lang` dialect group runs separately.
+    let mut ts_sources: Vec<(String, SourceFile)> = Vec::new();
+
+    for r in routed {
+        match r.route {
+            Route::Rust => rust_sources.push(r.source),
+            Route::Ts(ext) => ts_sources.push((ext, r.source)),
+        }
+    }
+
+    let mut output = FrontendOutput::default();
+    merge_output(&mut output, dispatch_rust(rust_sources, include_tests));
+    merge_output(&mut output, dispatch_ts(ts_sources, include_tests));
+    output
+}
+
 #[cfg(feature = "rust")]
-fn dispatch(sources: &[SourceFile], include_tests: bool) -> FrontendOutput {
+fn dispatch_rust(sources: Vec<SourceFile>, include_tests: bool) -> FrontendOutput {
     use fxrank_core::frontend::Frontend;
     use fxrank_lang_rust::RustFrontend;
-    RustFrontend { include_tests }.analyze(sources)
+    if sources.is_empty() {
+        return FrontendOutput::default();
+    }
+    RustFrontend { include_tests }.analyze(&sources)
 }
 
 #[cfg(not(feature = "rust"))]
-fn dispatch(sources: &[SourceFile], _include_tests: bool) -> FrontendOutput {
+fn dispatch_rust(sources: Vec<SourceFile>, _include_tests: bool) -> FrontendOutput {
     let mut output = FrontendOutput::default();
     for src in sources {
-        output.diagnostics.push(fxrank_core::model::Diagnostic {
-            path: src.path.clone(),
+        output.diagnostics.push(Diagnostic {
+            path: src.path,
             parsed: false,
             error: "no frontend available for .rs (built without 'rust' feature)".into(),
+        });
+    }
+    output
+}
+
+#[cfg(feature = "ts")]
+fn dispatch_ts(sources: Vec<(String, SourceFile)>, include_tests: bool) -> FrontendOutput {
+    use fxrank_core::frontend::Frontend;
+    use fxrank_lang_ts::TsFrontend;
+    use fxrank_lang_ts::source::Lang;
+    use std::collections::HashMap;
+
+    // Group by resolved `Lang` so each dialect runs with its own syntax. The
+    // grouping key is the `Lang` (a `.ts` and a `.tsx` in one dir differ).
+    let mut groups: HashMap<Lang, Vec<SourceFile>> = HashMap::new();
+    for (ext, source) in sources {
+        // Every collected extension is one `Lang::from_extension` recognizes.
+        let lang = Lang::from_extension(&ext).unwrap_or(Lang::Ts);
+        groups.entry(lang).or_default().push(source);
+    }
+
+    let mut output = FrontendOutput::default();
+    for (lang, group) in groups {
+        let frontend = TsFrontend {
+            lang,
+            include_tests,
+        };
+        merge_output(&mut output, frontend.analyze(&group));
+    }
+    output
+}
+
+#[cfg(not(feature = "ts"))]
+fn dispatch_ts(sources: Vec<(String, SourceFile)>, _include_tests: bool) -> FrontendOutput {
+    let mut output = FrontendOutput::default();
+    for (ext, src) in sources {
+        output.diagnostics.push(Diagnostic {
+            path: src.path,
+            parsed: false,
+            error: format!("no frontend available for .{ext} (built without 'ts' feature)"),
         });
     }
     output
