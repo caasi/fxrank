@@ -222,7 +222,8 @@ Further lowered by:
 - Unknown macro invocations — recorded as an `unknown.macro` **effect at class 2,
   weight 2, tier `heuristic`, confidence `0.4`** (a rank floor, so effects laundered
   into a local macro are not free), e.g.
-  `{ "kind": "unknown.macro", "class": 2, "weight": 2, "tier": "heuristic", "confidence": 0.4, "line": 9, "evidence": "my_macro!" }`.
+  `{ "kind": "unknown.macro", "class": 2, "weight": 2, "tier": "heuristic", "line": 9, "evidence": "my_macro!" }`
+  (its `0.4` detection confidence feeds the function min but, like every effect, is not serialized per-effect).
   The Milestone-A pure-macro whitelist (exempt, no effect emitted) is exactly:
   `vec!`, `format!`, `matches!`, `concat!`, `stringify!`, `cfg!`, `line!`,
   `column!`, `file!`. Macros already classified elsewhere (`println!`/`panic!`/
@@ -240,7 +241,8 @@ The scored unit is, precisely:
 - Free `fn` items; inherent-`impl` methods; trait-`impl` methods; trait
   default-method **bodies**. Included regardless of `const` / `unsafe` / `async`.
 - **Excluded**: trait method signatures without a body (nothing to score) and
-  `extern` fn declarations (no body; the FFI *call site* is what scores).
+  `extern` fn declarations (no body). The `extern` **block** is recorded as a
+  module-level risk; the FFI *call site* needs name resolution and is deferred.
 - **Closures and `async` blocks** are attributed to their enclosing function —
   their effects roll up into it — rather than scored as separate units in this
   milestone.
@@ -288,9 +290,9 @@ Fibonacci map.
 `risk_features` (flags; each carries a severity class per *Three channels*, so they
 feed `max_class` and `risk_weight`): `unsafe` block / `unsafe fn` / `unsafe impl`,
 raw pointer deref, `transmute`, `MaybeUninit`, `*::from_raw`, `get_unchecked`, FFI
-`extern` block / `extern "C"` call, `asm!`, volatile / `ptr::{read,write,
-copy_nonoverlapping}`, `Box::leak`, `mem::forget`, `ManuallyDrop`, module-level
-`impl Drop`.
+`extern` block (the `extern "C"` *call site* is deferred — see *Known Limitations*),
+`asm!`, volatile / `ptr::{read,write,copy_nonoverlapping}`, `Box::leak`,
+`mem::forget`, `ManuallyDrop`, module-level `impl Drop`.
 
 **Module-level risk.** Risk features that belong to an item rather than a function
 body — `impl Drop`, `extern` blocks (declarations, not call sites) — are **not**
@@ -502,6 +504,10 @@ correctness:
 - **`global.mutation` module-private downgrade is deferred.** Deciding "no visible
   public mutating accessor" needs whole-module analysis; Milestone A scores all
   detected global mutation at class 6 (the class-4 case lands with that analysis).
+- **FFI call-site detection is deferred.** Recognizing that a call targets an
+  `extern "C"` function needs name resolution; Milestone A records the `extern`
+  block as a module-level risk and leaves the class-7 call-site for the semantic
+  pass.
 
 ## Decisions
 
