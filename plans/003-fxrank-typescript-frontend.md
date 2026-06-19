@@ -567,6 +567,8 @@ fn detects_world_effects() {
   - Member-name signals with unknown receiver (`.query`, `.execute`, `.read_to_string` analog) → `heuristic` tier.
 
 > Build the `classify_call` and `classify_member` tables from the spec's *World effects* table. Keep them as `match`/`if` ladders like `classify_path_call` — readable, not clever.
+>
+> **Bare globals must work without imports.** `fetch`, `Date`, `Math`, `console`, `process` are ambient globals — they are NOT in the import table. The resolver (mirror Rust's `resolve`) must return the rendered name unchanged on a lookup miss, so `fetch(...)` classifies even when a stdin fragment has no `import` context (the spec's "fragment degrades to heuristic, still detects" case). Test this with a fixture that has zero imports.
 
 - [ ] **Step 5: Run — expect PASS.** Run: `cargo test -p fxrank-lang-ts detects_world_effects`
 
@@ -664,6 +666,8 @@ fn classifies_mutation_by_escape() {
   Write sites: `AssignExpr` (`=`, `+=`, …), `UpdateExpr` (`++`/`--`), member-mutator method calls (resolve receiver base ident like Rust's `base_ident`). Emit effects carrying a `contained: bool` (extend the detector's internal effect representation; `analyze_unit` consumes the flag in Task 9 — for now store it alongside, e.g. return `Vec<(Effect, bool)>` from this detector and have gather thread it).
 
 > Constructors: a `ClassMethod` with `MethodKind::Method` named `constructor`, or swc's dedicated `Constructor` node — check the pinned API.
+>
+> **Highest-friction integration point — slow down here.** Rust's `gather` returns a plain `Vec<Effect>`; this detector must additionally carry a per-effect `contained: bool` so Task 9 can decide eligibility. Pick ONE representation up front (e.g. this detector returns `Vec<(Effect, bool)>` and `gather` threads the flag; or add a private `contained` field to a frontend-local effect wrapper) and use it consistently across `mutation::detect` → `gather` → `analyze_unit`. Do not infer containment from `EffectKind` in `analyze_unit` — the mutation detector is the single source of truth.
 
 - [ ] **Step 5: Wire into gather** (mutation effects join calls effects), **run — expect PASS.**
 
@@ -731,7 +735,7 @@ fn boundary_discount_zeros_contained_local_mutation() {
   - return `BoundaryCoverage`: `has_any` → `None` (the gate is voided); else `t==S` → `Full`, `t>0` → `Partial`, else `None`.
   Return `(BoundaryCoverage, has_any)` so `analyze_unit` can also emit the `type.escape` risk when `has_any`.
 
-- [ ] **Step 5: Apply in `analyze_unit`.** After gather, compute `(coverage, has_any)`. For each `(effect, contained)`: set `effect.discounted_to = Some(apply_boundary_discount(effect.class, coverage, contained))` when `contained` and `coverage != None`, set `effect.discount = Some("contained by typed boundary (coverage …)".into())`, and `effect.sync_weight()`. When `has_any`, push a `type.escape` `RiskFeature`. Recompute `max_class`/`own_score` from `effective_class()`/synced weights.
+- [ ] **Step 5: Apply in `analyze_unit`.** After gather, compute `(coverage, has_any)`. For each `(effect, contained)`: set `effect.discounted_to = Some(apply_boundary_discount(effect.class, coverage, contained))` when `contained` and `coverage != None`, set `effect.discount = Some(format!("contained by typed boundary (coverage {t}/{s})"))` (match the spec's JSON example wording exactly — e.g. `"contained by fully-typed boundary (coverage 3/3)"` for the Full case; if Task 11's snapshot pins this string, keep them byte-identical), and `effect.sync_weight()`. When `has_any`, push a `type.escape` `RiskFeature`. Recompute `max_class`/`own_score` from `effective_class()`/synced weights.
 
 - [ ] **Step 6: Run — expect PASS.**
 
