@@ -143,7 +143,7 @@ git commit -m "feat(rust): detect test code (is_test) from #[test]/#[bench]/#[cf
 
 ### Task 3: Skip in `analyze` + module risks + the `RustFrontend` migration
 
-**Files:** Modify `crates/fxrank-lang-rust/src/lib.rs`, `crates/fxrank-lang-rust/src/detect/risk.rs`, and migrate `RustFrontend` call sites in `crates/fxrank-cli/src/main.rs` + `crates/fxrank-lang-rust/tests/rust_frontend.rs`.
+**Files:** Modify `crates/fxrank-lang-rust/src/lib.rs`, `crates/fxrank-lang-rust/src/detect/risk.rs`, and migrate `RustFrontend` call sites in `crates/fxrank-cli/src/main.rs`, `crates/fxrank-lang-rust/tests/rust_frontend.rs`, and `crates/fxrank-lang-rust/tests/snapshots.rs`.
 
 - [ ] **Step 1: Failing test** — default skips test code and counts it; `--include-tests` keeps it.
 
