@@ -13,7 +13,7 @@ fn analyze_worked_cases() -> fxrank_core::frontend::FrontendOutput {
         env!("CARGO_MANIFEST_DIR")
     );
     let text = std::fs::read_to_string(&path).expect("worked_cases.rs fixture exists");
-    RustFrontend.analyze(&[SourceFile {
+    RustFrontend::default().analyze(&[SourceFile {
         path: "worked_cases.rs".into(),
         text,
     }])

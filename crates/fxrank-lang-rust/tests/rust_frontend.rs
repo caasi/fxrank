@@ -2,13 +2,17 @@ use fxrank_core::effect::{Effect, EffectKind, RiskKind, Tier};
 use fxrank_core::frontend::{Frontend, FrontendOutput, SourceFile};
 use fxrank_lang_rust::RustFrontend;
 
-fn analyze_fixture(name: &str) -> fxrank_core::frontend::FrontendOutput {
+fn source_of(name: &str) -> SourceFile {
     let path = format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name);
     let text = std::fs::read_to_string(&path).expect("fixture exists");
-    RustFrontend.analyze(&[SourceFile {
+    SourceFile {
         path: name.into(),
         text,
-    }])
+    }
+}
+
+fn analyze_fixture(name: &str) -> fxrank_core::frontend::FrontendOutput {
+    RustFrontend::default().analyze(&[source_of(name)])
 }
 
 /// Pull the effects of a single fixture function by its symbol.
@@ -937,6 +941,24 @@ fn destructured_mut_param_no_global_mutation_false_positive() {
     );
 }
 
+// ── Task 2: is_test flag ─────────────────────────────────────────────────────
+
+#[test]
+fn collect_marks_test_code() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/skip_tests.rs"
+    ))
+    .unwrap();
+    let file = syn::parse_file(&text).unwrap();
+    let units = fxrank_lang_rust::functions::collect(&file, "skip_tests.rs");
+    let by = |s: &str| units.iter().find(|u| u.symbol == s).map(|u| u.is_test);
+    assert_eq!(by("prod"), Some(false));
+    assert_eq!(by("free_test"), Some(true)); // #[test]
+    assert_eq!(by("helper"), Some(true)); // inside #[cfg(test)] mod
+    assert_eq!(by("S::method"), Some(true)); // method inside #[cfg(test)] mod
+}
+
 // ── Task 16: parse diagnostics ───────────────────────────────────────────────
 
 // ── Gap 1: raw-ptr-deref in unsafe fn body (no inner block) ─────────────────
@@ -1089,7 +1111,7 @@ fn std_mem_manually_drop_new_still_produces_manually_drop_risk() {
 
 #[test]
 fn unparseable_file_becomes_a_diagnostic_not_a_panic() {
-    let out = RustFrontend.analyze(&[
+    let out = RustFrontend::default().analyze(&[
         SourceFile {
             path: "good.rs".into(),
             text: "fn f() { println!(\"x\"); }".into(),
@@ -1106,4 +1128,47 @@ fn unparseable_file_becomes_a_diagnostic_not_a_panic() {
     assert_eq!(out.diagnostics[0].path, "bad.rs");
     assert!(!out.diagnostics[0].parsed);
     assert!(!out.diagnostics[0].error.is_empty());
+}
+
+// ── Task 3: skip test code by default ───────────────────────────────────────
+
+#[test]
+fn default_skips_tests_and_counts_them() {
+    let out = analyze_fixture("skip_tests.rs"); // default: include_tests = false
+    let syms: Vec<_> = out.functions.iter().map(|f| f.symbol.clone()).collect();
+    assert!(syms.contains(&"prod".to_string()));
+    assert!(
+        !syms
+            .iter()
+            .any(|s| s == "free_test" || s.contains("helper") || s == "S::method")
+    );
+    assert_eq!(out.skipped_tests, 3); // free_test + helper + S::method
+}
+
+#[test]
+fn include_tests_keeps_everything() {
+    let out = RustFrontend {
+        include_tests: true,
+    }
+    .analyze(&[source_of("skip_tests.rs")]);
+    assert_eq!(out.skipped_tests, 0);
+    assert!(out.functions.iter().any(|f| f.symbol == "free_test"));
+}
+
+#[test]
+fn cfg_test_module_risks_skipped_by_default() {
+    let src = "#[cfg(test)] impl Drop for T {}\n#[cfg(test)] unsafe impl Send for T {}\n#[cfg(test)] extern \"C\" { fn x(); }";
+    let def = RustFrontend::default().analyze(&[SourceFile {
+        path: "m.rs".into(),
+        text: src.into(),
+    }]);
+    assert!(def.module_risks.is_empty());
+    let inc = RustFrontend {
+        include_tests: true,
+    }
+    .analyze(&[SourceFile {
+        path: "m.rs".into(),
+        text: src.into(),
+    }]);
+    assert_eq!(inc.module_risks.len(), 3); // ImplDrop + UnsafeImpl + ExternBlock
 }

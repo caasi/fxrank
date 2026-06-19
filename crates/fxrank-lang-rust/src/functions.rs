@@ -31,6 +31,31 @@ pub struct FnUnit {
     pub sig: syn::Signature,
     /// The function body (for detectors to walk expressions in T11–T15).
     pub block: syn::Block,
+    /// Whether this function is test code (`#[test]`/`#[bench]`, or inside a
+    /// `#[cfg(test)]` module). Computed at collection time; test units are
+    /// excluded from scoring by default.
+    pub is_test: bool,
+}
+
+/// Returns `true` when `attrs` contains `#[test]` or `#[bench]`.
+fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|a| a.path().is_ident("test") || a.path().is_ident("bench"))
+}
+
+/// Returns `true` when `attrs` contains the literal `#[cfg(test)]`.
+///
+/// Matches only the exact single-ident form (intentional — compound cfg
+/// expressions such as `#[cfg(all(test, feature = "foo"))]` are intentionally
+/// not matched). Also used by module-risk detection to suppress test modules.
+pub(crate) fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        a.path().is_ident("cfg")
+            && a.parse_args::<syn::Path>()
+                .map(|p| p.is_ident("test"))
+                .unwrap_or(false)
+    })
 }
 
 /// Collect all function units from a parsed file at `path`.
@@ -40,16 +65,17 @@ pub struct FnUnit {
 /// skipped — the caller is expected to feed each file separately.
 pub fn collect(file: &syn::File, path: &str) -> Vec<FnUnit> {
     let mut units = Vec::new();
-    collect_items(&file.items, path, &mut units);
+    collect_items(&file.items, path, false, &mut units);
     units
 }
 
-fn collect_items(items: &[Item], path: &str, out: &mut Vec<FnUnit>) {
+fn collect_items(items: &[Item], path: &str, in_cfg_test: bool, out: &mut Vec<FnUnit>) {
     for item in items {
         match item {
             Item::Fn(f) => {
                 let symbol = f.sig.ident.to_string();
                 let line = f.sig.ident.span().start().line;
+                let is_test = in_cfg_test || has_test_attr(&f.attrs);
                 out.push(FnUnit {
                     id: format!("{path}:{line}:{symbol}"),
                     symbol,
@@ -57,20 +83,22 @@ fn collect_items(items: &[Item], path: &str, out: &mut Vec<FnUnit>) {
                     line,
                     sig: f.sig.clone(),
                     block: *f.block.clone(),
+                    is_test,
                 });
             }
 
             Item::Impl(impl_block) => {
-                collect_from_impl(impl_block, path, out);
+                collect_from_impl(impl_block, path, in_cfg_test, out);
             }
 
             Item::Trait(trait_item) => {
-                collect_from_trait(trait_item, path, out);
+                collect_from_trait(trait_item, path, in_cfg_test, out);
             }
 
             Item::Mod(m) => {
                 if let Some((_, nested_items)) = &m.content {
-                    collect_items(nested_items, path, out);
+                    let nested_in_cfg_test = in_cfg_test || is_cfg_test(&m.attrs);
+                    collect_items(nested_items, path, nested_in_cfg_test, out);
                 }
                 // `mod foo;` without a body is out-of-line — skip.
             }
@@ -80,7 +108,7 @@ fn collect_items(items: &[Item], path: &str, out: &mut Vec<FnUnit>) {
     }
 }
 
-fn collect_from_impl(impl_block: &ItemImpl, path: &str, out: &mut Vec<FnUnit>) {
+fn collect_from_impl(impl_block: &ItemImpl, path: &str, in_cfg_test: bool, out: &mut Vec<FnUnit>) {
     // Render the self type as the last path-segment ident (e.g. `S` for `impl S`).
     let type_name = last_path_ident(&impl_block.self_ty);
 
@@ -100,6 +128,7 @@ fn collect_from_impl(impl_block: &ItemImpl, path: &str, out: &mut Vec<FnUnit>) {
                 None => format!("{type_name}::{method_name}"),
             };
 
+            let is_test = in_cfg_test || has_test_attr(&method.attrs);
             out.push(FnUnit {
                 id: format!("{path}:{line}:{symbol}"),
                 symbol,
@@ -107,12 +136,18 @@ fn collect_from_impl(impl_block: &ItemImpl, path: &str, out: &mut Vec<FnUnit>) {
                 line,
                 sig: method.sig.clone(),
                 block: method.block.clone(),
+                is_test,
             });
         }
     }
 }
 
-fn collect_from_trait(trait_item: &ItemTrait, path: &str, out: &mut Vec<FnUnit>) {
+fn collect_from_trait(
+    trait_item: &ItemTrait,
+    path: &str,
+    in_cfg_test: bool,
+    out: &mut Vec<FnUnit>,
+) {
     let trait_name = trait_item.ident.to_string();
 
     for item in &trait_item.items {
@@ -123,6 +158,7 @@ fn collect_from_trait(trait_item: &ItemTrait, path: &str, out: &mut Vec<FnUnit>)
                 let line = method.sig.ident.span().start().line;
                 let symbol = format!("{trait_name}::{method_name}");
 
+                let is_test = in_cfg_test || has_test_attr(&method.attrs);
                 out.push(FnUnit {
                     id: format!("{path}:{line}:{symbol}"),
                     symbol,
@@ -130,6 +166,7 @@ fn collect_from_trait(trait_item: &ItemTrait, path: &str, out: &mut Vec<FnUnit>)
                     line,
                     sig: method.sig.clone(),
                     block: block.clone(),
+                    is_test,
                 });
             }
             // Bodyless `fn required(&self);` — skip.

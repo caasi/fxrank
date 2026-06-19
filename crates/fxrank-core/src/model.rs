@@ -8,6 +8,7 @@ pub struct Scope {
     pub files: usize,
     pub parsed: usize,
     pub functions: usize,
+    pub skipped_tests: usize,
     pub risk_features: Vec<RiskFeature>,
 }
 
@@ -18,6 +19,7 @@ impl Scope {
             files: 0,
             parsed: 0,
             functions: 0,
+            skipped_tests: 0,
             risk_features: vec![],
         }
     }
@@ -170,6 +172,7 @@ mod tests {
                 files: 1,
                 parsed: 1,
                 functions: 2,
+                skipped_tests: 0,
                 risk_features: vec![],
             },
             vec![hot("a", 4, 5.0, 0.9), hot("b", 7, 25.5, 0.6)],
@@ -210,6 +213,7 @@ mod tests {
             files: 1,
             parsed: 1,
             functions: 0,
+            skipped_tests: 0,
             risk_features: vec![risk(RiskKind::ImplDrop, "f.rs", 3)], // class 2, weight 2
         };
         let report = Report::build(scope, vec![], vec![], None);
@@ -225,11 +229,31 @@ mod tests {
             files: 1,
             parsed: 1,
             functions: 1,
+            skipped_tests: 0,
             risk_features: vec![risk(RiskKind::Transmute, "f.rs", 1)],
         };
         let report = Report::build(scope, vec![hot("a", 4, 5.0, 0.9)], vec![], None);
         assert_eq!(report.summary.max_class, 7); // scope risk wins over hotspot's 4
         assert_eq!(report.summary.risk_weight, 21); // weight_for_class(7)
+    }
+
+    #[test]
+    fn scope_serializes_skipped_tests_between_functions_and_risk_features() {
+        let report = Report::build(
+            Scope {
+                input: "f".into(),
+                files: 1,
+                parsed: 1,
+                functions: 2,
+                skipped_tests: 3,
+                risk_features: vec![],
+            },
+            vec![],
+            vec![],
+            None,
+        );
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"functions\":2,\"skipped_tests\":3,\"risk_features\":"));
     }
 
     #[test]
@@ -240,6 +264,7 @@ mod tests {
                 files: 1,
                 parsed: 1,
                 functions: 3,
+                skipped_tests: 0,
                 risk_features: vec![],
             },
             vec![

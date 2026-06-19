@@ -231,6 +231,91 @@ fn directory_scan_diagnostics_key_present_in_output() {
     );
 }
 
+// ── Test 9: --include-tests flag controls test-code skipping ──
+
+#[test]
+fn scan_skips_tests_by_default_and_include_tests_keeps_them() {
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("fxrank_skip_tests_{}_a.rs", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp).expect("create temp file");
+        f.write_all(
+            b"fn prod() { let _ = std::fs::read(\"a\"); }\n\
+              #[cfg(test)] mod tests { #[test] fn t() { let _ = std::fs::read(\"b\"); } }",
+        )
+        .expect("write");
+    }
+
+    // default: test module is skipped; skipped_tests >= 1; symbol "t" not in hotspots
+    let out = fxrank()
+        .arg("scan")
+        .arg(&tmp)
+        .output()
+        .expect("process ran");
+    std::fs::remove_file(&tmp).ok();
+
+    assert!(
+        out.status.success(),
+        "exit non-zero; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8");
+    let j: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(
+        j["scope"]["skipped_tests"].as_u64().unwrap_or(0) >= 1,
+        "expected skipped_tests >= 1 by default, got: {j}"
+    );
+    assert!(
+        !j["hotspots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["symbol"] == "t"),
+        "test fn 't' should not appear in hotspots by default"
+    );
+
+    // --include-tests: test fn is included; skipped_tests == 0; symbol "t" in hotspots
+    let mut tmp2 = std::env::temp_dir();
+    tmp2.push(format!("fxrank_skip_tests_{}_b.rs", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp2).expect("create temp file");
+        f.write_all(
+            b"fn prod() { let _ = std::fs::read(\"a\"); }\n\
+              #[cfg(test)] mod tests { #[test] fn t() { let _ = std::fs::read(\"b\"); } }",
+        )
+        .expect("write");
+    }
+
+    let out2 = fxrank()
+        .arg("scan")
+        .arg(&tmp2)
+        .arg("--include-tests")
+        .output()
+        .expect("process ran");
+    std::fs::remove_file(&tmp2).ok();
+
+    assert!(
+        out2.status.success(),
+        "exit non-zero with --include-tests; stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let stdout2 = String::from_utf8(out2.stdout).expect("utf-8");
+    let j2: serde_json::Value = serde_json::from_str(stdout2.trim()).expect("valid JSON");
+    assert_eq!(
+        j2["scope"]["skipped_tests"].as_u64(),
+        Some(0),
+        "expected skipped_tests == 0 with --include-tests, got: {j2}"
+    );
+    assert!(
+        j2["hotspots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["symbol"] == "t"),
+        "test fn 't' should appear in hotspots with --include-tests"
+    );
+}
+
 // ── Test 6: --limit 1 on ≥2 functions → hotspots length 1, summary over all ──
 
 #[test]

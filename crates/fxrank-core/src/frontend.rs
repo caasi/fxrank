@@ -16,6 +16,7 @@ pub struct FrontendOutput {
     pub functions: Vec<Hotspot>,        // scored functions (pre-ranking)
     pub module_risks: Vec<RiskFeature>, // module-level (impl Drop, extern)
     pub diagnostics: Vec<Diagnostic>,
+    pub skipped_tests: usize,
 }
 
 pub trait Frontend {
