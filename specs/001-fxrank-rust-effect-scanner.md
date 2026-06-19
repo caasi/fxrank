@@ -209,7 +209,8 @@ that necessarily reaches for some type-level facts:
 
 **Numeric confidence.** Each detection starts at a base set by its tier — `exact` =
 `1.0`, `path` = `0.9`, `heuristic` = `0.6` — multiplied by penalties where they
-apply: an unresolved call `×0.8`, an alias/glob-shadowed path `×0.9`. A function's
+apply: an unresolved call `×0.8` (an unresolved *awaited* call uses the same
+`×0.8`), an alias/glob-shadowed path `×0.9`. A function's
 `confidence` is the **minimum** over its effects' per-detection confidence and over
 any `unknown.macro` / unresolved-await evidence items it carries. `summary.confidence`
 is the **minimum across hotspots**; parse coverage is **not** folded into it —
@@ -218,11 +219,17 @@ it is reported separately as `scope.parsed` / `scope.files`.
 Further lowered by:
 
 - Unresolved calls (target not determinable syntactically).
-- Unknown macro invocations — recorded as an `unknown.macro` **effect at class 2**
-  (a rank floor, so effects laundered into a local macro are not free) that also
-  lowers confidence. Known-pure macros (`vec!`, `format!`, `matches!`, …) are
-  whitelisted and exempt. Note the macro's *expansion* is invisible to `syn`, so
-  effects generated inside it are not seen at all — see *Known Limitations*.
+- Unknown macro invocations — recorded as an `unknown.macro` **effect at class 2,
+  weight 2, tier `heuristic`, confidence `0.4`** (a rank floor, so effects laundered
+  into a local macro are not free), e.g.
+  `{ "kind": "unknown.macro", "class": 2, "weight": 2, "tier": "heuristic", "confidence": 0.4, "line": 9, "evidence": "my_macro!" }`.
+  The Milestone-A pure-macro whitelist (exempt, no effect emitted) is exactly:
+  `vec!`, `format!`, `matches!`, `concat!`, `stringify!`, `cfg!`, `line!`,
+  `column!`, `file!`. Macros already classified elsewhere (`println!`/`panic!`/
+  `assert!`/`write!`/…) are handled by their own catalog rows. Every other
+  non-builtin macro is `unknown.macro`. Note the macro's *expansion* is invisible
+  to `syn`, so effects generated inside it are not seen at all — see *Known
+  Limitations*.
 - `async_boundary: true` with awaited calls whose targets are unresolved (an async
   shell may hide IO).
 
@@ -288,8 +295,13 @@ copy_nonoverlapping}`, `Box::leak`, `mem::forget`, `ManuallyDrop`, module-level
 **Module-level risk.** Risk features that belong to an item rather than a function
 body — `impl Drop`, `extern` blocks (declarations, not call sites) — are **not**
 attributed to individual functions in Milestone A. They are reported in a
-`scope.risk_features` list. Linking a `Drop` to the functions that construct the
-value needs type resolution and is deferred.
+`scope.risk_features` list, each entry shaped
+`{ kind, class, weight, path, line, evidence, tier }` (e.g.
+`{ "kind": "impl.drop", "class": 2, "weight": 2, "path": "src/io.rs", "line": 30, "evidence": "impl Drop for Conn", "tier": "exact" }`).
+`summary.max_class` and `summary.risk_weight` take the max over hotspots **and**
+`scope.risk_features`, so a file whose only risk is an `extern` block is not
+summarized as risk-free. Linking a `Drop` to the functions that construct the value
+needs type resolution and is deferred.
 
 `async_boundary` (informational flag, not an effect): set on `async fn` / functions
 containing `.await`, with `await_count`. Lowers confidence when awaited targets are
@@ -406,9 +418,10 @@ the `hidden` flag and the lower `confidence` of a heuristic detection:
   subset (parse coverage = `parsed / files`); `scope.functions` counts only
   functions in parsed files; `scope.risk_features` carries module-level risks.
 - `summary.own_score` is the **max** hotspot `own_score`; `summary.max_class` and
-  `summary.risk_weight` the max; `summary.confidence` the **min** (weakest-link)
-  across hotspots. All `summary.*` and `scope.*` are computed over **all** scanned
-  functions; `--limit N` truncates only the `hotspots` array, not the summary.
+  `summary.risk_weight` the max over hotspots **and** `scope.risk_features`;
+  `summary.confidence` the **min** (weakest-link) across hotspots. All `summary.*`
+  and `scope.*` are computed over **all** scanned functions; `--limit N` truncates
+  only the `hotspots` array, not the summary.
 - `effects[].weight` reflects the **post-discount** class (`discounted_to` when a
   discount applies, else `class`).
 - `effects[].discount` / `discounted_to` / `tier` explain *why a score is what it
@@ -420,7 +433,10 @@ the `hidden` flag and the lower `confidence` of a heuristic detection:
 - **Un-parseable file**: recorded in `diagnostics` with `parsed: false` and the
   parser error; the file is excluded from scoring; **the run still succeeds and
   emits JSON for everything else**. The agent learns which file was not seen
-  rather than the whole run aborting. Scope `confidence` is lowered proportionally.
+  rather than the whole run aborting. Parse coverage is reflected in
+  `scope.parsed` / `scope.files`; there is no separate `scope.confidence`, and a
+  parse failure does not lower `summary.confidence` (which is the min across
+  hotspots).
 - **No input / empty scope**: a valid JSON object with empty `hotspots` and a
   `scope` reflecting zero files, exit code 0.
 - **Unreadable path / IO error opening sources**: a `diagnostics` entry; only a
