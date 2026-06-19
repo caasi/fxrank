@@ -11,13 +11,21 @@ use std::collections::HashSet;
 
 /// The Rust language frontend.
 ///
-/// `RustFrontend.analyze()` parses each `SourceFile` with `syn::parse_file`,
+/// `RustFrontend::default().analyze()` parses each `SourceFile` with `syn::parse_file`,
 /// builds an `ImportTable`, collects the set of top-level `static` item names
 /// (for `ambient.read` detection), runs `functions::collect` to find all
 /// concrete function units, and maps each `FnUnit` to a scored `Hotspot` via
 /// `detect::analyze_unit`. The call-effect detector (T11) is wired today;
 /// detector tasks T12–T15 plug into `detect::analyze_unit`'s gather step.
-pub struct RustFrontend;
+///
+/// When `include_tests` is `false` (the default), function units marked
+/// `is_test` are excluded from scoring and counted in `FrontendOutput::skipped_tests`.
+/// Module-level risks (`impl Drop`, `unsafe impl`, `extern` blocks) that carry
+/// `#[cfg(test)]` are also suppressed.
+#[derive(Default)]
+pub struct RustFrontend {
+    pub include_tests: bool,
+}
 
 impl Frontend for RustFrontend {
     fn language(&self) -> Language {
@@ -40,14 +48,32 @@ impl Frontend for RustFrontend {
                     let imports = ImportTable::from_file(&parsed);
                     let statics = collect_static_names(&parsed);
                     let units = functions::collect(&parsed, &source.path);
-                    for unit in &units {
-                        output
-                            .functions
-                            .push(detect::analyze_unit(unit, &imports, &statics));
+                    if self.include_tests {
+                        for unit in &units {
+                            output
+                                .functions
+                                .push(detect::analyze_unit(unit, &imports, &statics));
+                        }
+                    } else {
+                        let mut skipped = 0usize;
+                        for unit in &units {
+                            if unit.is_test {
+                                skipped += 1;
+                            } else {
+                                output
+                                    .functions
+                                    .push(detect::analyze_unit(unit, &imports, &statics));
+                            }
+                        }
+                        output.skipped_tests += skipped;
                     }
                     output
                         .module_risks
-                        .extend(detect::risk::detect_module_risks(&parsed, &source.path));
+                        .extend(detect::risk::detect_module_risks(
+                            &parsed,
+                            &source.path,
+                            self.include_tests,
+                        ));
                 }
             }
         }

@@ -21,14 +21,21 @@ enum Cmd {
         /// Limit output to the top-N hotspots (summary still covers all).
         #[arg(long)]
         limit: Option<usize>,
+        /// Include test functions and modules in the analysis (skipped by default).
+        #[arg(long)]
+        include_tests: bool,
     },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let Cmd::Scan { path, limit } = cli.cmd;
+    let Cmd::Scan {
+        path,
+        limit,
+        include_tests,
+    } = cli.cmd;
 
-    match run_scan(path, limit) {
+    match run_scan(path, limit, include_tests) {
         Ok(report) => {
             // Compact JSON: no trailing newline issues — println! adds exactly one.
             println!(
@@ -45,7 +52,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_scan(path: Option<PathBuf>, limit: Option<usize>) -> Result<Report, String> {
+fn run_scan(
+    path: Option<PathBuf>,
+    limit: Option<usize>,
+    include_tests: bool,
+) -> Result<Report, String> {
     // Accumulated read-error diagnostics (files that exist but couldn't be read).
     let mut read_errors: Vec<Diagnostic> = Vec::new();
 
@@ -84,7 +95,7 @@ fn run_scan(path: Option<PathBuf>, limit: Option<usize>) -> Result<Report, Strin
     let read_error_count = read_errors.len();
 
     // Dispatch to language frontend(s).
-    let output = dispatch(&sources);
+    let output = dispatch(&sources, include_tests);
 
     // Count parse diagnostics from the frontend (not read errors).
     let parse_diag_count = output.diagnostics.iter().filter(|d| !d.parsed).count();
@@ -98,6 +109,7 @@ fn run_scan(path: Option<PathBuf>, limit: Option<usize>) -> Result<Report, Strin
         files: sources.len() + read_error_count,
         parsed: sources.len().saturating_sub(parse_diag_count),
         functions: output.functions.len(),
+        skipped_tests: output.skipped_tests,
         risk_features: output.module_risks,
     };
 
@@ -186,14 +198,14 @@ fn walk_dir(dir: &PathBuf, sources: &mut Vec<SourceFile>, read_errors: &mut Vec<
 /// the `rust` feature is enabled; otherwise emit a "no frontend" diagnostic
 /// per file so the binary still compiles and produces valid (empty) output.
 #[cfg(feature = "rust")]
-fn dispatch(sources: &[SourceFile]) -> FrontendOutput {
+fn dispatch(sources: &[SourceFile], include_tests: bool) -> FrontendOutput {
     use fxrank_core::frontend::Frontend;
     use fxrank_lang_rust::RustFrontend;
-    RustFrontend.analyze(sources)
+    RustFrontend { include_tests }.analyze(sources)
 }
 
 #[cfg(not(feature = "rust"))]
-fn dispatch(sources: &[SourceFile]) -> FrontendOutput {
+fn dispatch(sources: &[SourceFile], _include_tests: bool) -> FrontendOutput {
     let mut output = FrontendOutput::default();
     for src in sources {
         output.diagnostics.push(fxrank_core::model::Diagnostic {

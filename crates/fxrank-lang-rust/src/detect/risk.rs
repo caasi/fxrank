@@ -21,6 +21,7 @@
 //! false positives, but it is conservative in the opposite direction (it never
 //! misses a true raw deref) and `Tier::Heuristic` signals the uncertainty.
 
+use crate::functions::is_cfg_test;
 use fxrank_core::effect::{RiskFeature, RiskKind, Tier};
 use fxrank_core::score::weight_for_class;
 use syn::spanned::Spanned;
@@ -189,13 +190,17 @@ impl<'ast> Visit<'ast> for RiskWalker {
 /// - `extern "…" { }` blocks → `ExternBlock` (class 2).
 ///
 /// `path` is the file path; it is stored in every emitted `RiskFeature`.
-pub fn detect_module_risks(file: &syn::File, path: &str) -> Vec<RiskFeature> {
+/// When `include_tests` is `false`, items carrying `#[cfg(test)]` are skipped.
+pub fn detect_module_risks(file: &syn::File, path: &str, include_tests: bool) -> Vec<RiskFeature> {
     let mut features = Vec::new();
 
     for item in &file.items {
         match item {
             // `extern "ABI" { … }` block.
             syn::Item::ForeignMod(fm) => {
+                if !include_tests && is_cfg_test(&fm.attrs) {
+                    continue;
+                }
                 let line = fm.span().start().line;
                 let abi = fm
                     .abi
@@ -220,6 +225,9 @@ pub fn detect_module_risks(file: &syn::File, path: &str) -> Vec<RiskFeature> {
             // inner `unsafety` check below. The separate `unsafe impl` arm afterwards
             // therefore only ever sees non-Drop unsafe impls.
             syn::Item::Impl(impl_block) if is_impl_drop(impl_block) => {
+                if !include_tests && is_cfg_test(&impl_block.attrs) {
+                    continue;
+                }
                 let line = impl_block.span().start().line;
                 features.push(RiskFeature {
                     kind: RiskKind::ImplDrop,
@@ -247,6 +255,9 @@ pub fn detect_module_risks(file: &syn::File, path: &str) -> Vec<RiskFeature> {
 
             // `unsafe impl Trait for T { … }` (trait ≠ Drop, already handled above).
             syn::Item::Impl(impl_block) if impl_block.unsafety.is_some() => {
+                if !include_tests && is_cfg_test(&impl_block.attrs) {
+                    continue;
+                }
                 let line = impl_block.span().start().line;
                 features.push(RiskFeature {
                     kind: RiskKind::UnsafeImpl,
