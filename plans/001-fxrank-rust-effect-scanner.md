@@ -157,6 +157,7 @@ fn main() {
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build -p fxrank --no-default-features --features rust   # slim-build gate compiles
+      - run: cargo build -p fxrank --no-default-features                   # no-frontend build still compiles
 ```
 
 (The dogfood `fxrank scan crates/` step is added in Task 18 once `scan` exists.)
@@ -272,7 +273,7 @@ impl EffectKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RiskKind {
     Transmute, RawPtrDeref, FfiCall, Asm, Volatile, MaybeUninit, FromRaw, GetUnchecked,
-    UnsafeBlock, UnsafeFn, UnsafeImpl, BoxLeak, MemForget, ManuallyDrop, ImplDrop,
+    UnsafeBlock, UnsafeFn, UnsafeImpl, BoxLeak, MemForget, ManuallyDrop, ImplDrop, ExternBlock,
 }
 impl RiskKind {
     pub fn wire(self) -> &'static str {
@@ -283,6 +284,7 @@ impl RiskKind {
             FromRaw => "from.raw", GetUnchecked => "get.unchecked", UnsafeBlock => "unsafe.block",
             UnsafeFn => "unsafe.fn", UnsafeImpl => "unsafe.impl", BoxLeak => "box.leak",
             MemForget => "mem.forget", ManuallyDrop => "manually.drop", ImplDrop => "impl.drop",
+            ExternBlock => "extern.block",
         }
     }
     pub fn class(self) -> u8 {
@@ -292,11 +294,15 @@ impl RiskKind {
             | GetUnchecked => 7,
             UnsafeBlock | UnsafeFn | UnsafeImpl => 5,
             BoxLeak | MemForget | ManuallyDrop => 4,
-            ImplDrop => 2,
+            ImplDrop | ExternBlock => 2,
         }
     }
 }
+```
 
+> **`FfiCall` is deferred.** Detecting that a *call site* targets an `extern "C"` function needs name resolution (linking the call to its declaration); a syntactic pass cannot. Milestone A detects the **`extern` block** (`ExternBlock`, module-level) and leaves `FfiCall` in the enum for the future semantic pass — no task implements call-site FFI detection now.
+
+```rust
 #[derive(Debug, Clone, Serialize)]
 pub struct Effect {
     #[serde(serialize_with = "ser_kind")]
@@ -416,6 +422,12 @@ fn hot(id: &str, max_class: u8, own_score: f64, conf: f64) -> Hotspot {
         async_boundary: false, await_count: 0, effects: vec![], risk_features: vec![],
     }
 }
+fn risk(kind: RiskKind, path: &str, line: usize) -> RiskFeature {
+    RiskFeature {
+        kind, class: kind.class(), weight: weight_for_class(kind.class()),
+        path: path.into(), line, evidence: kind.wire().into(), tier: Tier::Exact,
+    }
+}
 #[test]
 fn summary_takes_max_and_min_over_two_hotspots() {
     let report = Report::build(
@@ -441,6 +453,17 @@ fn zero_hotspots_defaults() {
     assert_eq!(report.summary.own_score, 0.0);
     assert_eq!(report.summary.confidence, 1.0);
     assert_eq!(report.summary.max_class, 0);
+}
+#[test]
+fn scope_risk_feeds_summary_even_with_zero_hotspots() {
+    // a file whose only risk is a module-level impl Drop (class 2) -> summary reflects it
+    let scope = Scope {
+        input: "f.rs".into(), files: 1, parsed: 1, functions: 0,
+        risk_features: vec![risk(RiskKind::ImplDrop, "f.rs", 3)],   // class 2, weight 2
+    };
+    let report = Report::build(scope, vec![], vec![], None);
+    assert_eq!(report.summary.max_class, 2);     // from scope risk, not a hotspot
+    assert_eq!(report.summary.risk_weight, 2);
 }
 ```
 
@@ -509,6 +532,8 @@ fn collects_expected_function_units() {
   - `env.write`: `set_var`, `remove_var`, `set_current_dir` → 6. `env.read`: `var`, `vars`, `args`, `current_dir`, `current_exe`, `temp_dir` → 4.
   - `concurrency`: `thread::spawn`, `tokio::spawn`, `rayon::join`, `JoinSet::spawn`, `thread::sleep`, channel `.send()`/`.recv()` (heuristic) → 6.
   - `time.read`: `Instant::now`, `SystemTime::now` → 5. `random`: `rand::random`, `thread_rng` → 5.
+  - `ambient.read`: a read of a `static CONFIG` value and `SOME_ATOMIC.load(..)` → class 2 (heuristic for the `.load()` method-name).
+  - `panic` (heuristic): `x.unwrap()` and `x.expect("..")` → `panic` class 4, tier `heuristic`, detection confidence `0.6` (can't tell `Option`/`Result` from a graceful user `.unwrap()`).
   Each asserts `kind`, `class`, `tier`, and `evidence`.
 - [ ] **Step 2: Red.**
 - [ ] **Step 3: Implement** a `Visit` walker. `ExprCall` with a path → resolve via the import table, match the path lists → `path`-tier effect. `ExprMethodCall` → match heuristic method names → `heuristic`-tier effect. **Constructors (`Command::new`, `OpenOptions::new`) are not effects** — only terminal effectful calls/methods are. Record `line` + `evidence` (called path/method). Detectors are **pure** (return `Vec<(Effect, /*detection conf inputs*/)>`); `detect/mod.rs` owns assembly (Task 15).
@@ -566,7 +591,7 @@ fn collects_expected_function_units() {
 
 **Files:** Create `detect/risk.rs`, fixtures.
 
-- [ ] **Step 1: Fixtures + failing tests for every `RiskKind`:** `unsafe {}`/`unsafe fn`/`unsafe impl` → class 5; `transmute`, a raw-pointer deref `*p`, `get_unchecked`, `MaybeUninit::uninit`, `*::from_raw`, `asm!`, `ptr::write`/`read`/`copy_nonoverlapping` (volatile) → class 7; `Box::leak`, `mem::forget`, `ManuallyDrop::new` → class 4; module-level `impl Drop for T` and an `extern "C" {}` block → `FrontendOutput.module_risks` (class 2 / per their kind) with `path` set, **not** attached to a function. Assert a function whose only effect is `mem::forget` gets `max_class == 4` (risk feeds max_class).
+- [ ] **Step 1: Fixtures + failing tests for every `RiskKind`:** `unsafe {}`/`unsafe fn`/`unsafe impl` → class 5; `transmute`, a raw-pointer deref `*p`, `get_unchecked`, `MaybeUninit::uninit`, `*::from_raw`, `asm!`, `ptr::write`/`read`/`copy_nonoverlapping` (volatile) → class 7; `Box::leak`, `mem::forget`, `ManuallyDrop::new` → class 4; module-level `impl Drop for T` (`ImplDrop`) and an `extern "C" {}` block (`ExternBlock`) → `FrontendOutput.module_risks` (class 2) with `path` set, **not** attached to a function. Assert a function whose only effect is `mem::forget` gets `max_class == 4` (risk feeds max_class). **Edition-2024 composition:** `unsafe { std::env::set_var("K", "v"); }` → both an `env.write` effect (class 6) **and** an `unsafe.block` risk feature (class 5) on the same function.
 - [ ] **Step 2: Red. Step 3: Implement** detection per `RiskKind` (Task 2 classes); body risks attach to the function (feed `risk_class`/`risk_weight`); item-level `impl Drop`/`extern` blocks go to `module_risks` with the file `path`.
 - [ ] **Step 4: Green. Step 5: Commit** — `git add crates/fxrank-lang-rust/src/detect/risk.rs crates/fxrank-lang-rust/tests/ && git commit -m "feat(rust): risk_features + module-level risk"`
 
