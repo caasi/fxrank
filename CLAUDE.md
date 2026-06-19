@@ -31,6 +31,11 @@ A Cargo workspace, one shipped binary, language frontends feature-gated:
 - **`crates/fxrank-lang-rust`** — the `syn`-based Rust frontend (behind the `rust`
   feature). `functions` (function-unit collection), `imports` (a `use` table), and
   `detect/{calls,macros,mutation,risk}` detectors orchestrated by `detect::analyze_unit`.
+- **`crates/fxrank-lang-ts`** — the `swc`-based JS/TS frontend (behind the `ts` feature).
+  `functions` (function-unit collection incl. arrows/methods/getters), `imports` (ES
+  `import` + `require` table), `coverage` (signature typed-slot coverage for the boundary
+  discount), and `detect/{calls,mutation,risk}` orchestrated by `detect::analyze_unit`.
+  Parses with swc, runs no type-checker (syntactic, like the Rust frontend).
 - **`crates/fxrank-cli`** (package/binary `fxrank`) — args (clap), file discovery,
   feature-gated dispatch, compact JSON to stdout.
 
@@ -42,15 +47,18 @@ cargo test --workspace                                   # all tests (~90)
 cargo test -p fxrank-core own_score_damps_non_max_weights # one test by name
 cargo fmt --check                                        # CI gate
 cargo clippy --workspace --all-targets -- -D warnings    # CI gate — warnings are hard errors
-cargo build -p fxrank --no-default-features --features rust  # slim build (feature gate compiles)
+cargo build -p fxrank --no-default-features --features rust  # slim Rust-only build
+cargo build -p fxrank --no-default-features --features ts    # slim TS-only build
 cargo run -p fxrank -- scan <path>                       # run the tool
 cargo run -p fxrank -- scan crates/ | jq                 # dogfood on our own source
+echo 'function f(): void {}' | cargo run -p fxrank -- scan --lang ts -  # scan a TS fragment from stdin
 cargo insta review                                       # accept snapshot test changes (insta)
 ```
 
 CI (`.github/workflows/ci.yml`) gates `fmt --check`, `clippy --workspace --all-targets -D
-warnings`, `test --workspace`, both slim builds, and a dogfood `scan crates/`. Run the
-first three locally before pushing.
+warnings`, `test --workspace`, all slim builds (`--features rust`, `--features ts`,
+no-features), a Rust dogfood `scan crates/`, and a TS dogfood scan over the committed
+fixtures. Run the first three locally before pushing.
 
 ## Architecture: how a scan flows
 

@@ -780,6 +780,13 @@ fn detects_risks() {
 
 - [ ] **Step 4: Implement** a `Visit` walker returning `Vec<RiskFeature>` (path-carrying, like the Rust `risk.rs`): `eval`/`new Function`/`with` → `DynamicCode`; `Object.setPrototypeOf` and `__proto__` assignment → `ProtoPollution`; assignment to `.innerHTML`/`.outerHTML` and `.insertAdjacentHTML`/`document.write` calls → `HtmlInjection`; `as any` / `: any` / `as unknown as` / non-null `!` (`TsNonNull`) → `TypeEscape`. **Dedupe with Task 9:** `analyze_unit` already emits one `type.escape` when `has_any`; let `coverage.has_any` own the `as any`/`: any` signal and let this detector own `!` and the non-`any` risks, OR emit here and dedupe in `analyze_unit` by `(kind, line)`. Pick one and note it in a comment.
 
+  > **Implemented dedup strategy (recorded post-implementation):** `coverage` owns the
+  > `any`-family `type.escape` (from `as any`, `: any` in sig/body); `risk::detect` owns
+  > the non-null `!` (`TsNonNull`) and the non-`any` dangers (`dynamic.code`,
+  > `proto.pollution`, `html.injection`). The test fixture functions are `nonNull` (for
+  > `!`) and `pureAsAny` (asserting `risk::detect` does NOT double-emit `type.escape` for
+  > `as any` — that is `coverage`'s job), not the plan's original `cast`.
+
 - [ ] **Step 5: Wire into `analyze_unit`'s risk assembly, run — expect PASS.**
 
 - [ ] **Step 6: Commit**
