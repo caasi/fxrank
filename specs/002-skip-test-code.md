@@ -18,8 +18,9 @@ In scope:
 
 - Detect test functions **syntactically** (attribute-based) and exclude them from
   scoring by default.
-- Exclude test-only **top-level** module-risk features (a `#[cfg(test)]`-attributed
-  top-level `impl Drop` / `extern` block) by default.
+- Exclude test-only **top-level** module-risk features — any top-level item that
+  `detect_module_risks` reports (a `#[cfg(test)]`-attributed `impl Drop`,
+  `unsafe impl`, or `extern` block) — by default.
 - Report the excluded function count (`scope.skipped_tests`) — never a silent drop.
 - A `--include-tests` flag to score test code (and include test-only module risks).
 
@@ -44,7 +45,11 @@ A function is **test code** if any of:
 - it carries a `#[test]` or `#[bench]` attribute; **or**
 - it is declared inside a module annotated `#[cfg(test)]` (an `Item::Mod` whose
   attributes include `#[cfg(test)]`), recursively — functions in modules nested
-  inside a `#[cfg(test)]` module are also test code.
+  inside a `#[cfg(test)]` module are also test code. This applies to **inline**
+  module bodies present in the parsed file; an out-of-line `#[cfg(test)] mod tests;`
+  declares a separate file that `collect` does not descend into (it already skips
+  `mod foo;` declarations), so that file is scanned on its own without the declaring
+  `#[cfg(test)]` context — out-of-line test modules are a deferred refinement.
 
 Detection reads attributes from the parsed AST, so it needs no type information and
 is **`exact` for the recognized syntactic forms** (it intentionally does *not* catch
@@ -101,8 +106,10 @@ Detection keys off attributes, **independent of the file path**.
 - **`RustFrontend::analyze`:** when `!self.include_tests`, drop the `is_test`
   `FnUnit`s before scoring and accumulate their count into
   **`FrontendOutput.skipped_tests: usize`** (added next to `functions`).
-  `detect_module_risks` likewise skips a top-level item carrying `#[cfg(test)]` when
-  `!include_tests`.
+  `detect_module_risks` gains an `include_tests: bool` parameter and, when
+  `!include_tests`, skips any top-level item it would report (`impl Drop`,
+  `unsafe impl`, `extern` block) that carries a `#[cfg(test)]` attribute — a per-item
+  attr check on the `file.items` it already iterates.
 - **Core:** `Scope` gains a `skipped_tests: usize` field, **declared between
   `functions` and `risk_features`** so the serialized order matches the schema below
   (serde emits fields in declaration order).
