@@ -403,7 +403,7 @@ the `hidden` flag and the lower `confidence` of a heuristic detection:
 {
   "id": "src/store.rs:10:set_name",
   "symbol": "Store::set_name",
-  "line": 10, "max_class": 3, "own_score": 3, "risk_weight": 0, "confidence": 0.6,
+  "line": 10, "max_class": 3, "own_score": 3.0, "risk_weight": 0, "confidence": 0.6,
   "effects": [
     { "kind": "hidden.mutation", "class": 3, "weight": 3, "line": 11,
       "tier": "heuristic", "hidden": true,
@@ -423,8 +423,12 @@ the `hidden` flag and the lower `confidence` of a heuristic detection:
   and `scope.*` are computed over **all** scanned functions; `--limit N` truncates
   only the `hotspots` array, not the summary.
 - **Zero hotspots** (empty input, or a file with only module-level risks):
-  `own_score: 0`, `confidence: 1.0`, and `max_class` / `risk_weight` are the max of
-  the `scope.risk_features` (or `0` if there are none).
+  `own_score: 0.0`, `confidence: 1.0`, and `max_class` / `risk_weight` are the max
+  of the `scope.risk_features` (or `0` if there are none).
+- `own_score` is a JSON number derived from `f64`; whole values render with a
+  trailing `.0` (e.g. `3.0`). Per-effect `confidence` is **not** in the wire format —
+  confidence is computed per detection but only surfaced at the function level
+  (`hotspots[].confidence`, the min); `effects[]` carry no `confidence` field.
 - `effects[].weight` reflects the **post-discount** class (`discounted_to` when a
   discount applies, else `class`).
 - `effects[].discount` / `discounted_to` / `tier` explain *why a score is what it
@@ -495,6 +499,9 @@ correctness:
   receiver method-name effects, and `&mut` write-through all need name/type
   resolution FxRank does not compute; they carry a confidence penalty and may
   misfire. A semantic pass that upgrades them is a separate, later milestone.
+- **`global.mutation` module-private downgrade is deferred.** Deciding "no visible
+  public mutating accessor" needs whole-module analysis; Milestone A scores all
+  detected global mutation at class 6 (the class-4 case lands with that analysis).
 
 ## Decisions
 
