@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(name = "fxrank", about = "Effect-rank your Rust codebase")]
+#[command(
+    name = "fxrank",
+    about = "Effect-rank your Rust and TypeScript/JavaScript codebase"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -90,6 +93,13 @@ fn run_scan(
         None => true,
         Some(p) => p.as_os_str() == "-",
     };
+
+    // `--lang` is only valid for stdin; for a real file/dir the extension decides.
+    if lang.is_some() && !is_stdin {
+        return Err(
+            "--lang is only valid when reading from stdin; for files the extension determines the language".into()
+        );
+    }
 
     let (input_label, routed) = if is_stdin {
         // Read all of stdin into one synthetic SourceFile.
@@ -197,6 +207,7 @@ fn collect_source_files(
     sources
 }
 
+/// Recursively collects routable source files under `dir`, skipping symlinks.
 fn walk_dir(
     dir: &std::path::Path,
     sources: &mut Vec<RoutedSource>,
@@ -339,7 +350,9 @@ fn dispatch_ts(sources: Vec<(String, SourceFile)>, include_tests: bool) -> Front
     let mut groups: HashMap<Lang, Vec<SourceFile>> = HashMap::new();
     for (ext, source) in sources {
         // Every collected extension is one `Lang::from_extension` recognizes.
-        let lang = Lang::from_extension(&ext).unwrap_or(Lang::Ts);
+        let lang = Lang::from_extension(&ext).unwrap_or_else(|| {
+            unreachable!("route_for_path only routes extensions from_extension recognizes")
+        });
         groups.entry(lang).or_default().push(source);
     }
 

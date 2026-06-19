@@ -8,7 +8,6 @@ pub enum Lang {
     Ts,
     Tsx,
     Js,
-    Jsx,
 }
 
 impl Lang {
@@ -25,17 +24,6 @@ impl Lang {
         }
     }
 
-    /// Parse a `--lang` flag value.
-    pub fn from_flag(s: &str) -> Option<Lang> {
-        match s {
-            "ts" => Some(Lang::Ts),
-            "tsx" => Some(Lang::Tsx),
-            "js" => Some(Lang::Js),
-            "jsx" => Some(Lang::Jsx),
-            _ => None,
-        }
-    }
-
     /// Return the swc `Syntax` for this language.
     pub fn syntax(self) -> Syntax {
         match self {
@@ -48,10 +36,6 @@ impl Lang {
                 ..Default::default()
             }),
             Lang::Js => Syntax::Es(EsSyntax {
-                jsx: true,
-                ..Default::default()
-            }),
-            Lang::Jsx => Syntax::Es(EsSyntax {
                 jsx: true,
                 ..Default::default()
             }),

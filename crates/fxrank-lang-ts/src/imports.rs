@@ -65,12 +65,8 @@ impl ImportTable {
         for decl in &var.decls {
             let Some(init) = &decl.init else { continue };
 
-            // Look for `require(...)` calls.
+            // Look for `require(...)` calls; only `Expr::Call` shapes are relevant.
             let Expr::Call(call) = init.as_ref() else {
-                // Also catch dynamic `import(expr)` expressions at top-level.
-                if let Expr::Call(call) = init.as_ref() {
-                    self.check_dynamic_import(call);
-                }
                 continue;
             };
 

@@ -391,6 +391,63 @@ fn cli_stdin_without_lang_is_rust() {
     );
 }
 
+// ── Test 13: --lang on a real path → error (only valid for stdin) ──
+
+#[test]
+fn lang_flag_on_file_path_is_rejected() {
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("fxrank_lang_on_path_{}.rs", std::process::id()));
+    std::fs::write(&tmp, "fn f() {}").expect("write temp file");
+
+    let output = fxrank()
+        .args(["scan", "--lang", "ts"])
+        .arg(&tmp)
+        .output()
+        .expect("process ran");
+
+    std::fs::remove_file(&tmp).ok();
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit when --lang is combined with a file path"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("expected JSON error object on stdout");
+    let error_msg = json["error"].as_str().unwrap_or("");
+    assert!(
+        error_msg.contains("--lang is only valid when reading from stdin"),
+        "error message should mention stdin restriction; got: {error_msg:?}"
+    );
+}
+
+#[test]
+fn lang_flag_on_directory_path_is_rejected() {
+    let dir = std::env::temp_dir().join(format!("fxrank_lang_on_dir_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create dir");
+
+    let output = fxrank()
+        .args(["scan", "--lang", "ts"])
+        .arg(&dir)
+        .output()
+        .expect("process ran");
+
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit when --lang is combined with a directory path"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("expected JSON error object on stdout");
+    let error_msg = json["error"].as_str().unwrap_or("");
+    assert!(
+        error_msg.contains("--lang is only valid when reading from stdin"),
+        "error message should mention stdin restriction; got: {error_msg:?}"
+    );
+}
+
 // ── Test 6: --limit 1 on ≥2 functions → hotspots length 1, summary over all ──
 
 #[test]
