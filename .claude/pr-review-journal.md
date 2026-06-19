@@ -34,3 +34,31 @@ accepted + documented until call-graph propagation lands.
 
 Convention candidate: "constructor is not the effect; the terminal effectful call
 is" — worth carrying into the JS/TS catalog when that frontend is specced.
+
+## plans/001-fxrank-rust-effect-scanner.md (local docs-to-main, no PR)
+
+Reviewers: local Claude subagent (ran a live `rustc 1.96`/`cargo` toolchain to verify
+serde f64 output, syn 2.x spans, `parse_file` error shape) + Codex (resume of the
+spec session, so it carried full spec knowledge).
+
+- **Round 1** — Claude: *needs-rework* (two real source-of-truth conflicts: per-effect
+  `confidence` in the struct but not the spec JSON; whole `own_score` serializes as
+  `3.0` not `3`). Codex: feature-gate missing, `syn` `visit` feature missing,
+  `GlobalMutation` base class 3≠6, `RiskFeature` missing `path`, `Hotspot` missing
+  `await_count`, Task 7 test not runnable, `commit -am` drops new files, no CI task,
+  Task 13 too big. → all fixed; spec adjusted (own_score `.0`, no per-effect
+  confidence, defer global.mutation class-4).
+- **Round 2** (Codex) — coverage gaps: `ambient.read`, heuristic `unwrap`/`expect`,
+  `ExternBlock` risk kind, scope-risk roll-up test, no-feature CLI build,
+  env.write+unsafe fixture. → fixed.
+- **Round 3** (Codex) — two spec/plan mismatches surfaced (spec still required FFI
+  call-site; spec's `unknown.macro` example still serialized `confidence`) + a Task 11
+  prose gap. → reconciled in the spec; FFI call-site deferred.
+- **Round 4** (Codex) — **clean**: "no remaining implementation-blockers; the spec
+  and plan are now clean enough to implement."
+
+T3 decisions: feature-gated frontend (optional dep + `[features]`), single binary;
+`RiskKind` enum centralizes wire-strings/classes; FFI call-site + global.mutation
+class-4 + a semantic pass all deferred to a later milestone. The live-toolchain
+Claude pass was the highest-value reviewer — it caught serialization facts a static
+read would miss.
