@@ -22,14 +22,19 @@
 //! | `globalThis` / `window` / imported binding | `global.mutation`| 6     | no        | no     |
 //! | otherwise (captured outer / module-level)  | `hidden.mutation`| 3     | no        | **yes**|
 //!
+//! Note: only `globalThis`, `window`, and imported bindings are recognised as
+//! `global.mutation`; other host globals (`document`, `navigator`, …) currently
+//! fall through to `hidden.mutation` (full DOM coverage is a deferred Milestone-B item).
+//!
 //! The `contained` bool is returned alongside each `Effect`; Task 9's
 //! boundary-containment discount is its sole consumer. Per spec Deferred #3 a
 //! captured enclosing-local and a module-level binding are *both*
 //! `hidden.mutation` here — we do not distinguish them in Milestone A.
 //!
 //! Write sites we recognise: `=` and compound assignments (`AssignExpr`),
-//! `++`/`--` (`UpdateExpr`), and mutating method calls
-//! (`xs.push(…)`, `m.set(…)`, …) where the receiver's base is taken as written.
+//! `++`/`--` (`UpdateExpr`), the `delete` unary operator (`UnaryExpr`), and
+//! mutating method calls (`xs.push(…)`, `m.set(…)`, …) where the receiver's
+//! base is taken as written.
 
 use fxrank_core::confidence::detection_confidence;
 use fxrank_core::effect::{Effect, EffectKind, Tier};
@@ -37,7 +42,7 @@ use fxrank_core::score::weight_for_class;
 use std::collections::HashSet;
 use swc_ecma_ast::{
     AssignExpr, AssignTarget, BindingIdent, Callee, Expr, MemberExpr, MemberProp, ObjectPatProp,
-    Pat, SimpleAssignTarget, UpdateExpr, VarDeclarator,
+    Pat, SimpleAssignTarget, UnaryExpr, UnaryOp, UpdateExpr, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -66,6 +71,11 @@ struct MutationWalker<'a> {
     params: HashSet<String>,
     /// Idents introduced by `const`/`let`/`var` in the body (populated while
     /// walking; a flat function-scoped set, the Milestone-A approximation).
+    ///
+    /// Ordering note: a write to a `var`-declared binding that appears BEFORE
+    /// its declarator in source order is classified as `hidden.mutation` rather
+    /// than `local.mutation` (TDZ makes this a runtime error for `let`/`const`,
+    /// so practical impact is limited to `var` hoisting).
     locals: HashSet<String>,
     /// True when this unit is a class constructor (so `this.x = …` is local init).
     is_constructor: bool,
@@ -198,6 +208,15 @@ impl Visit for MutationWalker<'_> {
         node.visit_children_with(self);
     }
 
+    fn visit_unary_expr(&mut self, node: &UnaryExpr) {
+        // `delete obj.key` writes to (deletes a property of) the operand's base.
+        if node.op == UnaryOp::Delete {
+            let line = self.lines.line(node.span);
+            self.record_write(&node.arg, line, "delete on");
+        }
+        node.visit_children_with(self);
+    }
+
     fn visit_call_expr(&mut self, node: &swc_ecma_ast::CallExpr) {
         // A mutating method call (`xs.push(…)`) writes to the receiver's base.
         if let Callee::Expr(callee) = &node.callee
@@ -215,8 +234,10 @@ impl Visit for MutationWalker<'_> {
 /// Reconstruct the base place expression of an `AssignTarget`.
 ///
 /// `Simple(Ident)` → the bound ident; `Simple(Member)` → recurse into the
-/// member object via `base_ident`. Destructuring targets (`[a] = …`,
-/// `{a} = …`) and TS-wrapper targets are best-effort `None` for now.
+/// member object via `base_ident`. TS-wrapper targets (`TsAs`, `TsNonNull`,
+/// `TsSatisfies`, `TsTypeAssertion`) unwrap their inner expression and resolve
+/// the base via `base_ident`, symmetric with the `Expr::Ts*` arms there.
+/// Destructuring targets (`[a] = …`, `{a} = …`) are best-effort `None`.
 fn assign_target_base(target: &AssignTarget) -> Option<Expr> {
     match target {
         AssignTarget::Simple(SimpleAssignTarget::Ident(BindingIdent { id, .. })) => {
@@ -224,6 +245,12 @@ fn assign_target_base(target: &AssignTarget) -> Option<Expr> {
         }
         AssignTarget::Simple(SimpleAssignTarget::Member(m)) => Some(Expr::Member(m.clone())),
         AssignTarget::Simple(SimpleAssignTarget::Paren(p)) => Some((*p.expr).clone()),
+        // TS-only wrappers: unwrap the inner expression, symmetric with the
+        // `Expr::Ts*` arms in `base_ident`.
+        AssignTarget::Simple(SimpleAssignTarget::TsAs(e)) => Some((*e.expr).clone()),
+        AssignTarget::Simple(SimpleAssignTarget::TsNonNull(e)) => Some((*e.expr).clone()),
+        AssignTarget::Simple(SimpleAssignTarget::TsSatisfies(e)) => Some((*e.expr).clone()),
+        AssignTarget::Simple(SimpleAssignTarget::TsTypeAssertion(e)) => Some((*e.expr).clone()),
         _ => None,
     }
 }

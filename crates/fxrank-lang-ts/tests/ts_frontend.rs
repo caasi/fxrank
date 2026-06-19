@@ -142,7 +142,7 @@ fn mutation_effects(fixture: &str, fn_name: &str) -> Vec<(String, bool)> {
 }
 
 /// Just the wire kinds of a unit's mutation effects.
-fn kinds(fixture: &str, fn_name: &str) -> Vec<String> {
+fn mutation_kinds(fixture: &str, fn_name: &str) -> Vec<String> {
     mutation_effects(fixture, fn_name)
         .into_iter()
         .map(|(k, _)| k)
@@ -151,11 +151,11 @@ fn kinds(fixture: &str, fn_name: &str) -> Vec<String> {
 
 #[test]
 fn classifies_mutation_by_escape() {
-    assert!(kinds("mutation.ts", "buildLocal").contains(&"local.mutation".into()));
-    assert!(kinds("mutation.ts", "mutParam").contains(&"param.mutation".into()));
-    assert!(kinds("mutation.ts", "viaClosure").contains(&"hidden.mutation".into()));
-    assert!(kinds("mutation.ts", "Box.set").contains(&"this.mutation".into()));
-    assert!(kinds("mutation.ts", "viaGlobal").contains(&"global.mutation".into()));
+    assert!(mutation_kinds("mutation.ts", "buildLocal").contains(&"local.mutation".into()));
+    assert!(mutation_kinds("mutation.ts", "mutParam").contains(&"param.mutation".into()));
+    assert!(mutation_kinds("mutation.ts", "viaClosure").contains(&"hidden.mutation".into()));
+    assert!(mutation_kinds("mutation.ts", "Box.set").contains(&"this.mutation".into()));
+    assert!(mutation_kinds("mutation.ts", "viaGlobal").contains(&"global.mutation".into()));
 }
 
 #[test]
@@ -185,6 +185,20 @@ fn contained_flag_tracks_escape() {
     assert!(
         ctor_mut.1,
         "constructor this.x init must be local.mutation, contained == true"
+    );
+}
+
+#[test]
+fn delete_operator_detected_as_mutation() {
+    // `delete o.a` where `o` is a body-local → local.mutation
+    assert!(
+        mutation_kinds("mutation.ts", "delLocal").contains(&"local.mutation".into()),
+        "delLocal: delete on local should yield local.mutation"
+    );
+    // `delete o.x` where `o` is a param → param.mutation
+    assert!(
+        mutation_kinds("mutation.ts", "delParam").contains(&"param.mutation".into()),
+        "delParam: delete on param should yield param.mutation"
     );
 }
 
