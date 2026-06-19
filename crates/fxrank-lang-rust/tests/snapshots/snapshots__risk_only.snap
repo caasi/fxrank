@@ -1,0 +1,20 @@
+---
+source: crates/fxrank-lang-rust/tests/snapshots.rs
+expression: summarize(hs)
+---
+{
+  "async_boundary": false,
+  "await_count": 0,
+  "confidence": 1.0,
+  "effects": [],
+  "max_class": 4,
+  "own_score": 0.0,
+  "risk_features": [
+    {
+      "class": 4,
+      "kind": "mem.forget"
+    }
+  ],
+  "risk_weight": 5,
+  "symbol": "risk_only"
+}

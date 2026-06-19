@@ -1,0 +1,74 @@
+//! Rust language frontend for fxrank — walks syn ASTs and emits effect reports.
+
+pub mod detect;
+pub mod functions;
+pub mod imports;
+
+use fxrank_core::frontend::{Frontend, FrontendOutput, Language, SourceFile};
+use fxrank_core::model::Diagnostic;
+use imports::ImportTable;
+use std::collections::HashSet;
+
+/// The Rust language frontend.
+///
+/// `RustFrontend.analyze()` parses each `SourceFile` with `syn::parse_file`,
+/// builds an `ImportTable`, collects the set of top-level `static` item names
+/// (for `ambient.read` detection), runs `functions::collect` to find all
+/// concrete function units, and maps each `FnUnit` to a scored `Hotspot` via
+/// `detect::analyze_unit`. The call-effect detector (T11) is wired today;
+/// detector tasks T12–T15 plug into `detect::analyze_unit`'s gather step.
+pub struct RustFrontend;
+
+impl Frontend for RustFrontend {
+    fn language(&self) -> Language {
+        Language::Rust
+    }
+
+    fn analyze(&self, files: &[SourceFile]) -> FrontendOutput {
+        let mut output = FrontendOutput::default();
+
+        for source in files {
+            match syn::parse_file(&source.text) {
+                Err(e) => {
+                    output.diagnostics.push(Diagnostic {
+                        path: source.path.clone(),
+                        parsed: false,
+                        error: format!("{e}"),
+                    });
+                }
+                Ok(parsed) => {
+                    let imports = ImportTable::from_file(&parsed);
+                    let statics = collect_static_names(&parsed);
+                    let units = functions::collect(&parsed, &source.path);
+                    for unit in &units {
+                        output
+                            .functions
+                            .push(detect::analyze_unit(unit, &imports, &statics));
+                    }
+                    output
+                        .module_risks
+                        .extend(detect::risk::detect_module_risks(&parsed, &source.path));
+                }
+            }
+        }
+
+        output
+    }
+}
+
+/// Collect the names of all top-level `static` items in a parsed file.
+///
+/// Only `static` items represent ambient runtime state whose bare-name reads
+/// should be flagged. `const` items are compile-time copies and are excluded.
+fn collect_static_names(file: &syn::File) -> HashSet<String> {
+    file.items
+        .iter()
+        .filter_map(|item| {
+            if let syn::Item::Static(s) = item {
+                Some(s.ident.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}

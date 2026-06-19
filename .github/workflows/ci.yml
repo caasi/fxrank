@@ -13,5 +13,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build -p fxrank --no-default-features --features rust   # slim-build gate compiles
+      - run: cargo build -p fxrank --no-default-features                   # no-frontend build still compiles
+      - run: cargo run -p fxrank -- scan crates/ > /dev/null               # dogfood: tool runs over its own source

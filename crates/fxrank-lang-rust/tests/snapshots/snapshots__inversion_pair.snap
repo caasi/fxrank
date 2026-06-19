@@ -1,0 +1,44 @@
+---
+source: crates/fxrank-lang-rust/tests/snapshots.rs
+expression: summary
+---
+{
+  "declared_set_name": {
+    "async_boundary": false,
+    "await_count": 0,
+    "confidence": 0.6,
+    "effects": [
+      {
+        "class": 3,
+        "discounted_to": 2,
+        "hidden": false,
+        "kind": "param.mutation",
+        "tier": "heuristic"
+      }
+    ],
+    "max_class": 2,
+    "own_score": 2.0,
+    "risk_features": [],
+    "risk_weight": 0,
+    "symbol": "Store::set_name"
+  },
+  "hidden_set": {
+    "async_boundary": false,
+    "await_count": 0,
+    "confidence": 0.6,
+    "effects": [
+      {
+        "class": 3,
+        "discounted_to": null,
+        "hidden": true,
+        "kind": "hidden.mutation",
+        "tier": "heuristic"
+      }
+    ],
+    "max_class": 3,
+    "own_score": 3.0,
+    "risk_features": [],
+    "risk_weight": 0,
+    "symbol": "Store::set"
+  }
+}
