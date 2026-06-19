@@ -1,7 +1,7 @@
 //! Integration tests for the swc-based TypeScript frontend.
 
 use fxrank_core::model::Hotspot;
-use fxrank_lang_ts::detect::{self, calls, mutation};
+use fxrank_lang_ts::detect::{self, calls, mutation, risk};
 use fxrank_lang_ts::functions;
 use fxrank_lang_ts::imports::ImportTable;
 use fxrank_lang_ts::source::{Lang, SpanLines};
@@ -304,4 +304,87 @@ fn analyze_unit_pure_fn_scores_zero() {
     assert_eq!(h.own_score, 0.0);
     assert!(h.effects.is_empty());
     assert!(!h.async_boundary);
+}
+
+// ── Task 10: risk detection ──────────────────────────────────────────────────
+
+/// Parse a fixture, find the unit named `fn_name`, run `risk::detect` directly,
+/// and return the wire kinds of the risk features found.
+fn risk_kinds(fixture: &str, fn_name: &str) -> Vec<String> {
+    let path = format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(&path).expect("read fixture");
+    let (module, cm) = functions::parse_module(&src, fixture, Lang::Ts).expect("parse fixture");
+    let lines = SpanLines::new(cm);
+    let units = functions::collect(&module, fixture, &lines);
+    let unit = units
+        .iter()
+        .find(|u| u.symbol == fn_name)
+        .expect("function unit not found");
+    risk::detect(&unit.body, fixture, &lines)
+        .iter()
+        .map(|r| r.kind.wire().to_string())
+        .collect()
+}
+
+#[test]
+fn detects_risks() {
+    // eval(...) → dynamic.code (exact)
+    assert!(
+        risk_kinds("risk.ts", "dyn").contains(&"dynamic.code".into()),
+        "dyn: eval should yield dynamic.code"
+    );
+    // Object.setPrototypeOf(...) → proto.pollution (path)
+    assert!(
+        risk_kinds("risk.ts", "proto").contains(&"proto.pollution".into()),
+        "proto: Object.setPrototypeOf should yield proto.pollution"
+    );
+    // .innerHTML = ... → html.injection (heuristic)
+    assert!(
+        risk_kinds("risk.ts", "html").contains(&"html.injection".into()),
+        "html: .innerHTML = should yield html.injection"
+    );
+    // x! → type.escape (exact), owned by risk::detect (not coverage)
+    assert!(
+        risk_kinds("risk.ts", "nonNull").contains(&"type.escape".into()),
+        "nonNull: x! should yield type.escape"
+    );
+    // Dedup split: risk::detect must NOT emit type.escape for a pure `as any`.
+    // Coverage owns that; risk detecting it here would double-count.
+    assert!(
+        !risk_kinds("risk.ts", "pureAsAny").contains(&"type.escape".into()),
+        "pureAsAny: risk::detect must NOT emit type.escape for `as any` (coverage owns it)"
+    );
+}
+
+#[test]
+fn dyn_hotspot_has_dynamic_code_and_max_class_7() {
+    // End-to-end: risk folds into the hotspot score.
+    // dyn() calls eval() → DynamicCode (class 7) → max_class 7.
+    let h = analyze_fixture_unit("risk.ts", "dyn");
+    assert!(
+        h.risk_features
+            .iter()
+            .any(|r| r.kind.wire() == "dynamic.code"),
+        "dyn hotspot must carry a dynamic.code risk feature"
+    );
+    assert_eq!(
+        h.max_class, 7,
+        "dynamic.code (class 7) must dominate max_class"
+    );
+}
+
+#[test]
+fn pure_as_any_has_exactly_one_type_escape() {
+    // pureAsAny uses `as any` but no `x!`. Coverage emits one type.escape;
+    // risk::detect must NOT add a second one.
+    let h = analyze_fixture_unit("risk.ts", "pureAsAny");
+    let count = h
+        .risk_features
+        .iter()
+        .filter(|r| r.kind.wire() == "type.escape")
+        .count();
+    assert_eq!(
+        count, 1,
+        "pureAsAny must have exactly one type.escape (from coverage, not doubled by risk)"
+    );
 }

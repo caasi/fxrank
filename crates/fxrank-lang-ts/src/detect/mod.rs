@@ -9,6 +9,7 @@
 
 pub mod calls;
 pub mod mutation;
+pub mod risk;
 
 use crate::coverage;
 use crate::functions::{FnBodyOwned, FnUnit};
@@ -63,10 +64,9 @@ pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines) -> 
         })
         .collect();
 
-    // The coverage gate owns the `any`-family `type.escape` risk. Task 10's risk
+    // The coverage gate owns the `any`-family `type.escape` risk. The risk
     // detector owns `!` / dynamic.code / proto.pollution / html.injection and
-    // will NOT re-detect `any`.
-    // TODO(Task 10): merge with risk::detect (any-family owned here; ! and others owned there)
+    // does NOT re-detect `any` (dedup split).
     let mut risks: Vec<RiskFeature> = Vec::new();
     if cov.has_any {
         let class = RiskKind::TypeEscape.class();
@@ -80,6 +80,9 @@ pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines) -> 
             tier: Tier::Heuristic,
         });
     }
+
+    // Extend with per-body risks: non-null assertion, dynamic.code, proto.pollution, html.injection.
+    risks.extend(risk::detect(&unit.body, &unit.path, lines));
 
     let await_count = count_awaits(&unit.body);
     let async_boundary = unit.is_async || await_count > 0;
@@ -141,7 +144,6 @@ fn gather(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines) -> Vec<(Effec
         lines,
         imports,
     ));
-    // TODO(Task 10): risk::detect — risk features (unsafe, etc.).
     effects
 }
 
