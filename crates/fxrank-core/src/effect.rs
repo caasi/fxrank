@@ -119,14 +119,11 @@ impl RiskKind {
         use RiskKind::*;
         match self {
             Transmute | RawPtrDeref | FfiCall | Asm | RawPtrOp | MaybeUninit | FromRaw
-            | GetUnchecked => 7,
-            UnsafeBlock | UnsafeFn | UnsafeImpl => 5,
-            BoxLeak | MemForget | ManuallyDrop => 4,
-            ImplDrop | ExternBlock => 2,
+            | GetUnchecked | DynamicCode => 7,
+            UnsafeBlock | UnsafeFn | UnsafeImpl | HtmlInjection => 5,
+            BoxLeak | MemForget | ManuallyDrop | ProtoPollution => 4,
             TypeEscape => 3,
-            DynamicCode => 7,
-            ProtoPollution => 4,
-            HtmlInjection => 5,
+            ImplDrop | ExternBlock => 2,
         }
     }
 }

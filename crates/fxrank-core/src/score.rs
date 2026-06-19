@@ -135,9 +135,9 @@ mod tests {
     fn boundary_discount_floors_contained_at_zero() {
         use BoundaryCoverage::*;
         // contained effects: floor 0 (unlike apply_discount's floor 1)
-        assert_eq!(apply_boundary_discount(1, Partial, true), 0); // local.mutation, some typing -> free
+        assert_eq!(apply_boundary_discount(1, Partial, true), 0); // some typing -> free
         assert_eq!(apply_boundary_discount(1, Full, true), 0);
-        assert_eq!(apply_boundary_discount(1, None, true), 1);    // no typing -> unchanged
+        assert_eq!(apply_boundary_discount(1, None, true), 1); // no typing -> unchanged
         // the latent gradient: only visible on class >= 2 contained inputs
         assert_eq!(apply_boundary_discount(3, Partial, true), 2);
         assert_eq!(apply_boundary_discount(3, Full, true), 1);
