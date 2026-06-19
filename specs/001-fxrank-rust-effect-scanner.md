@@ -131,9 +131,11 @@ not the base class. Shifts are per-kind, clamped, and never cross a kind boundar
   containment lowers *mutation opacity*; it never discounts a sibling IO or panic
   effect in the same function body.
 - An externally observable effect never discounts below **class 1**.
-- `unsafe` **in the same function body as the discounted mutation** cancels that
-  mutation's discount (the code has stepped outside the guarantees the discount
-  assumes). It does not cancel discounts on unrelated channels.
+- `unsafe` cancels a discount **lexically**: an `unsafe` block that lexically
+  encloses the discounted mutation cancels *that mutation's* discount, and an
+  `unsafe fn` cancels discounts throughout its body. An `unsafe` block elsewhere in
+  the function (not enclosing the mutation) does not cancel it, and no `unsafe`
+  cancels discounts on unrelated channels.
 
 ### Three channels (score / confidence / risk)
 
@@ -148,10 +150,10 @@ The model never forces every nuance into one scalar:
 
    | risk feature | class |
    | --- | --- |
-   | `transmute`, raw pointer deref, FFI `extern` call, `asm!`, volatile read/write, `ptr::{read,write,copy_nonoverlapping}` | 7 |
+   | `transmute`, raw pointer deref, FFI `extern` call, `asm!`, volatile / `ptr::{read,write,copy_nonoverlapping}`, `MaybeUninit`, `*::from_raw`, `get_unchecked` | 7 |
    | generic `unsafe` block / `unsafe fn` / `unsafe impl` | 5 |
    | `Box::leak`, `mem::forget`, `ManuallyDrop` | 4 |
-   | module-level `impl Drop` (informational) | 2 |
+   | module-level `impl Drop` (informational; see *Module-level risk*) | 2 |
 
    `risk_class` = the highest risk class present; `risk_weight` = the Fibonacci
    weight of `risk_class` (mirrors `max_weight` for effects).
@@ -205,16 +207,24 @@ that necessarily reaches for some type-level facts:
   mutates an `&mut` parameter). **Always carries a confidence penalty** and may
   produce false positives/negatives.
 
-A function's `confidence` is the minimum of its effects' per-detection confidence,
-further lowered by:
+**Numeric confidence.** Each detection starts at a base set by its tier — `exact` =
+`1.0`, `path` = `0.9`, `heuristic` = `0.6` — multiplied by penalties where they
+apply: an unresolved call `×0.8`, an alias/glob-shadowed path `×0.9`. A function's
+`confidence` is the **minimum** over its effects' per-detection confidence and over
+any `unknown.macro` / unresolved-await evidence items it carries. `summary.confidence`
+is the **minimum across hotspots**; parse coverage is **not** folded into it —
+it is reported separately as `scope.parsed` / `scope.files`.
+
+Further lowered by:
 
 - Unresolved calls (target not determinable syntactically).
-- Unknown macro invocations (recorded as an `unknown.macro` evidence item at low
-  confidence; note that the macro's *expansion* is invisible to `syn`, so effects
-  generated inside it are not seen at all — see *Known Limitations*).
+- Unknown macro invocations — recorded as an `unknown.macro` **effect at class 2**
+  (a rank floor, so effects laundered into a local macro are not free) that also
+  lowers confidence. Known-pure macros (`vec!`, `format!`, `matches!`, …) are
+  whitelisted and exempt. Note the macro's *expansion* is invisible to `syn`, so
+  effects generated inside it are not seen at all — see *Known Limitations*.
 - `async_boundary: true` with awaited calls whose targets are unresolved (an async
   shell may hide IO).
-- Files that fail to parse (lowers scope confidence; see *Error Handling*).
 
 ## What Counts as a Function
 
@@ -230,9 +240,10 @@ The scored unit is, precisely:
 - **Macro-generated items are invisible** (`syn` sees unexpanded macro
   invocations); a known limitation, not silently treated as pure.
 
-`id` is `path:line:symbol`, where `line` disambiguates same-named methods across
-different `impl` blocks and `symbol` includes the `impl` type where available
-(`User::new`). This keeps ids collision-proof.
+`id` is `path:line:symbol`. `symbol` includes the `impl` type where available
+(`User::new`), and for **trait-impl** methods the trait path too
+(`<User as Display>::fmt`), so two trait impls of the same method on one type do not
+collide. `line` is the final tiebreak, making ids collision-resistant.
 
 ## Occurrence Counting
 
@@ -253,18 +264,19 @@ Fibonacci map.
 | `net.fs.db` | `std::fs` (`read`/`write`/`File::open`/`create`/`remove_*`/`rename`/`create_dir*`/`metadata`), `std::net`, `tokio::fs`; `std::io` `Read`/`Write`, `stdin/stdout/stderr`; `write!`/`writeln!`; `reqwest`, `sqlx` | 7 | — | path; method calls + `write!` target are `heuristic` |
 | `process.control` | `std::process::exit`/`abort`; `Command` `spawn`/`status`/`output` (**not** `Command::new`, which is builder setup); `Child::kill` | 6 | — | path / `heuristic` |
 | `env.write` | `std::env::set_var`/`remove_var`/`set_current_dir` | 6 | — | path |
+| `env.write` note | In edition 2024 `set_var`/`remove_var` require `unsafe`; the `env.write` effect and the enclosing `unsafe` risk feature **compose** (both recorded). | | | |
 | `concurrency` | `thread::spawn`, `tokio::spawn`, `rayon::*`, `JoinSet`; channel `send`/`recv` (`mpsc`/`oneshot`/`broadcast`/`watch`/`crossbeam`/`flume`); `thread::sleep` / blocking inside `async` | 6 | — | path / `heuristic` (channel methods) |
 | `time.read` | `Instant::now`, `SystemTime::now` | 5 | — | path |
 | `random` | `rand::*`, `thread_rng` | 5 | — | path |
 | `env.read` | `std::env::var`/`vars`/`args`/`current_dir`/`current_exe`/`temp_dir` | 4 | — | path |
 | `logging` | `println!`/`eprintln!`/`print!`/`eprint!`/`dbg!`; `log::*`, `tracing::*` | 4 | — | exact (macros) / path |
-| `panic` | confident: `panic!`/`unreachable!`/`todo!`/`unimplemented!` | 4 | — | exact |
-| `panic` (heuristic) | `unwrap`/`expect` (method name — cannot tell `Option`/`Result` from a graceful user `.unwrap()`); `assert!`/`assert_eq!`/`assert_ne!`/`debug_assert*!` are conditional | 4 | — | `heuristic` |
+| `panic` | macros `panic!`/`unreachable!`/`todo!`/`unimplemented!`/`assert!`/`assert_eq!`/`assert_ne!` (conditionally panicking, like any guarded `panic!`); `debug_assert*!` is debug-profile-only (`cfg`-dependent) | 4 | — | exact |
+| `panic` (heuristic) | `unwrap`/`expect` — method name; cannot tell `Option`/`Result` from a graceful user `.unwrap()` | 4 | — | `heuristic` |
 | `global.mutation` | write to `static mut`; mutation of a `static` interior-mut value | **6 by default**; **4** only when clearly module-private (private `static` with no visible public mutating accessor) | — | path / `heuristic` |
 | `hidden.mutation` | interior-mutability mutation reached through **any shared `&` reference** (`&self`, `&Context`, `&Arc<Mutex<T>>`, …): `RefCell::borrow_mut`, `Cell::set`/`replace`, `Atomic*::store`/`swap`/`fetch_*`, a write through a `Mutex`/`RwLock` guard (std, `parking_lot`, `tokio::sync`) | 3 | **none** (flag `hidden: true`) | `heuristic` |
 | `param.mutation` | write through an explicit `&mut` parameter or `&mut self` | 3 | `&mut param`: **down 2 → class 1**; `&mut self`: **down 1 → class 2** | binding is `exact`; the *write-through* is `heuristic` |
 | `ambient.read` | read of a `static` / global config value; `Atomic*::load` | 2 | — | path / `heuristic` |
-| `local.mutation` | `let mut` local variable mutation | 1 | **none** (kept as signal) | exact |
+| `local.mutation` | a **write** (assignment, compound-assignment, or `&mut` borrow) to a binding introduced by `let mut` in the same function; the `let mut` declaration alone is not scored, and counted once per write site | 1 | **none** (kept as signal) | exact (within-function lexical binding tracking — no cross-item resolution) |
 
 `risk_features` (flags; each carries a severity class per *Three channels*, so they
 feed `max_class` and `risk_weight`): `unsafe` block / `unsafe fn` / `unsafe impl`,
@@ -272,6 +284,12 @@ raw pointer deref, `transmute`, `MaybeUninit`, `*::from_raw`, `get_unchecked`, F
 `extern` block / `extern "C"` call, `asm!`, volatile / `ptr::{read,write,
 copy_nonoverlapping}`, `Box::leak`, `mem::forget`, `ManuallyDrop`, module-level
 `impl Drop`.
+
+**Module-level risk.** Risk features that belong to an item rather than a function
+body — `impl Drop`, `extern` blocks (declarations, not call sites) — are **not**
+attributed to individual functions in Milestone A. They are reported in a
+`scope.risk_features` list. Linking a `Drop` to the functions that construct the
+value needs type resolution and is deferred.
 
 `async_boundary` (informational flag, not an effect): set on `async fn` / functions
 containing `.await`, with `await_count`. Lowers confidence when awaited targets are
@@ -335,8 +353,8 @@ One compact JSON object on stdout (shown expanded here for readability):
 
 ```json
 {
-  "scope":   { "input": "crates/fxrank-core/src", "files": 2, "functions": 4 },
-  "summary": { "own_score": 25.5, "max_class": 7, "confidence": 0.78 },
+  "scope":   { "input": "crates/fxrank-core/src", "files": 2, "parsed": 1, "functions": 4, "risk_features": [] },
+  "summary": { "own_score": 25.5, "max_class": 7, "risk_weight": 0, "confidence": 0.6 },
   "hotspots": [
     {
       "id": "src/user.rs:42:save_user",
@@ -346,7 +364,7 @@ One compact JSON object on stdout (shown expanded here for readability):
       "max_class": 7,
       "own_score": 25.5,
       "risk_weight": 0,
-      "confidence": 0.9,
+      "confidence": 0.6,
       "async_boundary": false,
       "effects": [
         { "kind": "net.fs.db", "class": 7, "weight": 21, "line": 44,
@@ -384,10 +402,13 @@ the `hidden` flag and the lower `confidence` of a heuristic detection:
 ```
 
 - `hotspots` is sorted by the rank key (descending severity).
-- `scope.files` counts **all** files seen (parsed + diagnostics); `scope.functions`
-  counts only functions in successfully parsed files.
-- `summary.own_score` is the **max** hotspot `own_score`; `summary.max_class` the
-  max; `summary.confidence` the **min** (weakest-link) across hotspots.
+- `scope.files` counts **all** files seen; `scope.parsed` the successfully parsed
+  subset (parse coverage = `parsed / files`); `scope.functions` counts only
+  functions in parsed files; `scope.risk_features` carries module-level risks.
+- `summary.own_score` is the **max** hotspot `own_score`; `summary.max_class` and
+  `summary.risk_weight` the max; `summary.confidence` the **min** (weakest-link)
+  across hotspots. All `summary.*` and `scope.*` are computed over **all** scanned
+  functions; `--limit N` truncates only the `hotspots` array, not the summary.
 - `effects[].weight` reflects the **post-discount** class (`discounted_to` when a
   discount applies, else `class`).
 - `effects[].discount` / `discounted_to` / `tier` explain *why a score is what it
