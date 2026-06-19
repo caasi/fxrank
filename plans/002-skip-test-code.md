@@ -54,15 +54,17 @@ fn scope_serializes_skipped_tests_between_functions_and_risk_features() {
 
 - [ ] **Step 2: Run red** — `cargo test -p fxrank-core scope_serializes_skipped_tests` → FAIL (missing field).
 
-- [ ] **Step 3: Implement** — add `pub skipped_tests: usize` to `Scope`, declared **between `functions` and `risk_features`** (serde emits in declaration order). Set it to `0` in `Scope::empty`. Add `pub skipped_tests: usize` to `FrontendOutput` in `frontend.rs` (it derives `Default`, so `0`). Update every `Scope { .. }` literal in existing `model.rs` tests to include `skipped_tests: 0`.
+- [ ] **Step 3: Implement** — add `pub skipped_tests: usize` to `Scope`, declared **between `functions` and `risk_features`** (serde emits in declaration order). Set it to `0` in `Scope::empty`. Add `pub skipped_tests: usize` to `FrontendOutput` in `frontend.rs` (it derives `Default`, so `0`). **Update every `Scope { .. }` named-field literal across the workspace** — they all stop compiling otherwise:
+  - `crates/fxrank-core/src/model.rs`: the literals in `Scope::empty` and the test helpers/tests (`~lines 168, 208, 223, 238`) → add `skipped_tests: 0`.
+  - `crates/fxrank-cli/src/main.rs:~96`: the report's `Scope { .. }` → add `skipped_tests: output.skipped_tests`. (`output` is the `FrontendOutput`; its `skipped_tests` is `0` until Task 3 populates it — no behavior change now, and this wires the CLI field once so later tasks don't re-touch it.)
 
-- [ ] **Step 4: Run green** — `cargo test -p fxrank-core` → PASS (all model tests).
+- [ ] **Step 4: Run green** — `cargo test --workspace` → PASS (whole workspace must compile, not just `fxrank-core` — the CLI literal change is why).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/fxrank-core/src/model.rs crates/fxrank-core/src/frontend.rs
-git commit -m "feat(core): add scope.skipped_tests / FrontendOutput.skipped_tests"
+git add crates/fxrank-core/src/model.rs crates/fxrank-core/src/frontend.rs crates/fxrank-cli/src/main.rs
+git commit -m "feat: add scope.skipped_tests wire field (wired through the CLI, 0 until populated)"
 ```
 
 ---
@@ -161,28 +163,37 @@ fn include_tests_keeps_everything() {
     assert!(out.functions.iter().any(|f| f.symbol == "free_test"));
 }
 ```
-(Provide a `source_of(name)` helper, or reuse the fixture-loading the existing helper uses.)
+Extract a `source_of` helper from the existing `analyze_fixture` (same fixture-loading, but returns the `SourceFile` instead of analyzing), and have `analyze_fixture` call it:
+```rust
+fn source_of(name: &str) -> SourceFile {
+    let path = format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name);
+    let text = std::fs::read_to_string(&path).expect("fixture exists");
+    SourceFile { path: name.into(), text }
+}
+```
 
 - [ ] **Step 2: Run red** — fails to compile first (struct change), which drives Step 3's migration.
 
-- [ ] **Step 3: Migrate `RustFrontend` + implement the filter.**
-  - In `lib.rs`: `#[derive(Default)] pub struct RustFrontend { pub include_tests: bool }`.
-  - **Migrate every call site** (`RustFrontend` is currently a unit struct used as a bare value, so these are now compile errors):
-    - `crates/fxrank-cli/src/main.rs`: `RustFrontend.analyze(...)` → `RustFrontend { include_tests }.analyze(...)` (the flag arrives in Task 4; for now `RustFrontend::default()` is fine and Task 4 wires the real flag).
-    - `crates/fxrank-lang-rust/tests/rust_frontend.rs`: the `analyze_fixture` helper's `RustFrontend.analyze(...)` → `RustFrontend::default().analyze(...)`. Grep for any other `RustFrontend.` usages and migrate them too.
-  - In `analyze`: after `functions::collect`, when `!self.include_tests`, partition out `is_test` units, set `output.skipped_tests += <count skipped>`, and score only the rest; when `self.include_tests`, score all and leave `skipped_tests = 0`.
-  - Pass `self.include_tests` into `detect_module_risks(&file, &f.path, self.include_tests)`.
+- [ ] **Step 3: Migrate `RustFrontend` + implement the filter (one atomic edit — must compile as a unit).**
+  - In `lib.rs`: `#[derive(Default)] pub struct RustFrontend { pub include_tests: bool }`; and fix the doc comment that mentions `` `RustFrontend.analyze()` `` (`~lib.rs:14`) to `RustFrontend::default().analyze()`.
+  - **Migrate all FOUR bare `RustFrontend.analyze(...)` call sites** (`RustFrontend` is a unit struct used as a value, so each becomes a compile error once it has a field — verified by grep, do not rely on "grep for others"):
+    1. `crates/fxrank-cli/src/main.rs:~192` (in `dispatch()`) → `RustFrontend::default().analyze(...)` (Task 4 swaps in the real `RustFrontend { include_tests }`).
+    2. `crates/fxrank-lang-rust/tests/rust_frontend.rs:~8` (the `analyze_fixture` helper) → `RustFrontend::default().analyze(...)`.
+    3. `crates/fxrank-lang-rust/tests/rust_frontend.rs:~1092` (a **direct** call in `unparseable_file_becomes_a_diagnostic_not_a_panic`, not via the helper) → `RustFrontend::default().analyze(...)`.
+    4. `crates/fxrank-lang-rust/tests/snapshots.rs:~16` (the `analyze_worked_cases` helper) → `RustFrontend::default().analyze(...)`.
+  - In `analyze`: after `functions::collect`, when `!self.include_tests`, partition out the `is_test` units, set `output.skipped_tests += <count skipped>`, and score only the rest; when `self.include_tests`, score all and leave `skipped_tests = 0`.
+  - **Same atomic edit:** change `detect_module_risks`'s signature to take `include_tests: bool` AND update its one call site in `lib.rs:~50` together — `detect::risk::detect_module_risks(&parsed, &source.path, self.include_tests)` (note the real loop variables are `parsed` and `source`, not `file`/`f`).
 
-- [ ] **Step 4: Module-risk skip** — in `detect/risk.rs`, change `detect_module_risks(file, path)` → `detect_module_risks(file, path, include_tests: bool)`; for each top-level item it would report (`impl Drop`, `unsafe impl`, `extern` block), skip it when `!include_tests && is_cfg_test(&item_attrs)`. (Reuse / mirror the `is_cfg_test` check; each `syn::Item::{Impl,ForeignMod}` has `.attrs`.) Add a test:
+- [ ] **Step 4: Module-risk skip** — implement the body of the now-3-arg `detect_module_risks` (signature + call site already changed atomically in Step 3): for each top-level item it would report (`impl Drop`, `unsafe impl`, `extern` block — all carry `.attrs` on `syn::Item::{Impl,ForeignMod}`), skip it when `!include_tests && is_cfg_test(&item.attrs)`. Reuse the `is_cfg_test` helper from Task 2 — make it `pub(crate)` in `functions.rs` and import it (don't duplicate the logic; `parse_args::<syn::Path>()` matching only the literal `#[cfg(test)]` is **intentional**, matching the spec's "literal-only" decision). Add a test covering all three risk kinds:
 
 ```rust
 #[test]
 fn cfg_test_module_risks_skipped_by_default() {
-    let src = "#[cfg(test)] impl Drop for T {} \n #[cfg(test)] unsafe impl Send for T {}";
+    let src = "#[cfg(test)] impl Drop for T {}\n#[cfg(test)] unsafe impl Send for T {}\n#[cfg(test)] extern \"C\" { fn x(); }";
     let def = RustFrontend::default().analyze(&[SourceFile { path: "m.rs".into(), text: src.into() }]);
     assert!(def.module_risks.is_empty());
     let inc = RustFrontend { include_tests: true }.analyze(&[SourceFile { path: "m.rs".into(), text: src.into() }]);
-    assert_eq!(inc.module_risks.len(), 2);
+    assert_eq!(inc.module_risks.len(), 3);   // ImplDrop + UnsafeImpl + ExternBlock
 }
 ```
 
@@ -192,7 +203,8 @@ fn cfg_test_module_risks_skipped_by_default() {
 
 ```bash
 git add crates/fxrank-lang-rust/src/lib.rs crates/fxrank-lang-rust/src/detect/risk.rs \
-        crates/fxrank-cli/src/main.rs crates/fxrank-lang-rust/tests/rust_frontend.rs
+        crates/fxrank-cli/src/main.rs crates/fxrank-lang-rust/tests/rust_frontend.rs \
+        crates/fxrank-lang-rust/tests/snapshots.rs
 git commit -m "feat(rust): skip test code by default; RustFrontend.include_tests; module-risk skip"
 ```
 
@@ -208,7 +220,7 @@ git commit -m "feat(rust): skip test code by default; RustFrontend.include_tests
 
 - [ ] **Step 2: Run red.**
 
-- [ ] **Step 3: Implement** — add `#[arg(long)] include_tests: bool` to the `Cmd::Scan` variant; build `RustFrontend { include_tests }`; set `Scope { ..., skipped_tests: output.skipped_tests, .. }` when constructing the report. (For the `#[cfg(not(feature = "rust"))]` branch, `skipped_tests` stays `0`.)
+- [ ] **Step 3: Implement** — add `#[arg(long)] include_tests: bool` to the `Cmd::Scan` variant, thread it down, and **swap** the `RustFrontend::default()` from Task 3 (in `dispatch()`) for `RustFrontend { include_tests }`. The `Scope { .., skipped_tests: output.skipped_tests, .. }` wiring is already in place (done in Task 1); now that `analyze` actually populates `output.skipped_tests`, the value flows through unchanged. (The `#[cfg(not(feature = "rust"))]` branch returns `FrontendOutput::default()`, so `skipped_tests` is `0` — no change needed.)
 
 - [ ] **Step 4: Run green** — `cargo test -p fxrank`.
 
