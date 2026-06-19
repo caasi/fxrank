@@ -10,13 +10,16 @@
 pub mod calls;
 pub mod mutation;
 
+use crate::coverage;
 use crate::functions::{FnBodyOwned, FnUnit};
 use crate::imports::ImportTable;
 use crate::source::SpanLines;
 use fxrank_core::confidence::function_confidence;
-use fxrank_core::effect::Effect;
+use fxrank_core::effect::{Effect, RiskFeature, RiskKind, Tier};
 use fxrank_core::model::Hotspot;
-use fxrank_core::score::{max_class, own_score};
+use fxrank_core::score::{
+    BoundaryCoverage, apply_boundary_discount, max_class, own_score, weight_for_class,
+};
 use swc_ecma_ast::AwaitExpr;
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -29,11 +32,50 @@ use swc_ecma_visit::{Visit, VisitWith};
 pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines) -> Hotspot {
     let gathered: Vec<(Effect, bool)> = gather(unit, imports, lines);
 
-    // TODO(Task 9): boundary-containment discount applied here, before the flag
-    // is stripped — each effect's `contained` bool (the second tuple element)
-    // decides whether the mutation channel is discounted (a declared, bounded
-    // write) or left at full class (an escaping write).
-    let effects: Vec<Effect> = gathered.into_iter().map(|(e, _contained)| e).collect();
+    // The project thesis: types lower the score. Measure how typed the
+    // signature is, then discount CONTAINED effects by the boundary tier — a
+    // contained write behind a fully-typed boundary floors to class 0 (free),
+    // while an `any` anywhere voids the gate (`tier == None`, no shift).
+    let cov = coverage::analyze(&unit.sig, unit.is_constructor, &unit.body);
+
+    let effects: Vec<Effect> = gathered
+        .into_iter()
+        .map(|(mut effect, contained)| {
+            if contained && cov.tier != BoundaryCoverage::None {
+                effect.discounted_to =
+                    Some(apply_boundary_discount(effect.class, cov.tier, contained));
+                let label = if cov.tier == BoundaryCoverage::Full {
+                    "fully-typed"
+                } else {
+                    "typed"
+                };
+                effect.discount = Some(format!(
+                    "contained by {label} boundary (coverage {}/{})",
+                    cov.typed_slots, cov.total_slots
+                ));
+                effect.sync_weight();
+            }
+            effect
+        })
+        .collect();
+
+    // The coverage gate owns the `any`-family `type.escape` risk. Task 10's risk
+    // detector owns `!` / dynamic.code / proto.pollution / html.injection and
+    // will NOT re-detect `any`.
+    // TODO(Task 10): merge with risk::detect (any-family owned here; ! and others owned there)
+    let mut risks: Vec<RiskFeature> = Vec::new();
+    if cov.has_any {
+        let class = RiskKind::TypeEscape.class();
+        risks.push(RiskFeature {
+            kind: RiskKind::TypeEscape,
+            class,
+            weight: weight_for_class(class),
+            path: unit.path.clone(),
+            line: unit.line,
+            evidence: "any in signature or body".into(),
+            tier: Tier::Heuristic,
+        });
+    }
 
     let await_count = count_awaits(&unit.body);
     let async_boundary = unit.is_async || await_count > 0;
@@ -50,9 +92,13 @@ pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines) -> 
         confidences.push(0.8);
     }
 
-    // TODO(Task 10): risk::detect_fn_risks; for now risk_class and risk_weight are 0.
-    let risk_class: u8 = 0;
-    let risk_weight: u32 = 0;
+    // Fold risks into scoring, mirroring the Rust `analyze_unit`.
+    let risk_class = risks.iter().map(|r| r.class).max().unwrap_or(0);
+    let risk_weight = if risks.is_empty() {
+        0
+    } else {
+        weight_for_class(risk_class)
+    };
 
     Hotspot {
         id: unit.id.clone(),
@@ -66,8 +112,7 @@ pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines) -> 
         async_boundary,
         await_count,
         effects,
-        // TODO(Task 10): risk_features from risk::detect_fn_risks.
-        risk_features: vec![],
+        risk_features: risks,
     }
 }
 

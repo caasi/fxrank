@@ -1,5 +1,6 @@
 // fxrank-lang-ts: TypeScript frontend for FxRank (swc-based)
 
+pub mod coverage;
 pub mod detect;
 pub mod functions;
 pub mod imports;

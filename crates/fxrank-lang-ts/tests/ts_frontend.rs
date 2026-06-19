@@ -202,6 +202,94 @@ fn delete_operator_detected_as_mutation() {
     );
 }
 
+// ── Task 9: signature coverage + boundary-containment discount ──
+
+use fxrank_core::score::BoundaryCoverage;
+use fxrank_lang_ts::coverage;
+
+/// Run `coverage::analyze` on a named unit of a fixture.
+fn coverage_of(fixture: &str, fn_name: &str) -> coverage::Coverage {
+    let path = format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(&path).expect("read fixture");
+    let units = functions::parse_and_collect(&src, fixture, Lang::Ts).expect("parse fixture");
+    let unit = units
+        .iter()
+        .find(|u| u.symbol == fn_name)
+        .expect("function unit not found");
+    coverage::analyze(&unit.sig, unit.is_constructor, &unit.body)
+}
+
+#[test]
+fn coverage_counts_typed_slots_and_any() {
+    let full = coverage_of("coverage.ts", "fullyTyped");
+    assert_eq!(full.tier, BoundaryCoverage::Full);
+    assert!(!full.has_any);
+
+    let partial = coverage_of("coverage.ts", "partlyTyped");
+    assert_eq!(partial.tier, BoundaryCoverage::Partial);
+    assert!(!partial.has_any);
+
+    let none = coverage_of("coverage.ts", "untyped");
+    assert_eq!(none.tier, BoundaryCoverage::None);
+    assert!(!none.has_any);
+
+    let poisoned = coverage_of("coverage.ts", "poisoned");
+    assert!(poisoned.has_any, "poisoned has `as any` in body");
+    assert_eq!(poisoned.tier, BoundaryCoverage::None);
+}
+
+#[test]
+fn boundary_discount_zeros_contained_local_mutation() {
+    // fullyTyped: the local.mutation (a.push) is contained; Full coverage
+    // discounts it to class 0 / weight 0 → own_score contribution 0.
+    let full = analyze_fixture_unit("coverage.ts", "fullyTyped");
+    let lm = full
+        .effects
+        .iter()
+        .find(|e| e.kind.wire() == "local.mutation")
+        .expect("fullyTyped has a local.mutation");
+    assert_eq!(
+        lm.discounted_to,
+        Some(0),
+        "Full coverage floors contained to 0"
+    );
+    assert_eq!(lm.effective_class(), 0);
+    assert_eq!(lm.weight, 0);
+    assert_eq!(full.own_score, 0.0, "the only effect discounts to weight 0");
+
+    // untyped: None coverage → discount voided, local.mutation stays class 1.
+    let untyped = analyze_fixture_unit("coverage.ts", "untyped");
+    let ulm = untyped
+        .effects
+        .iter()
+        .find(|e| e.kind.wire() == "local.mutation")
+        .expect("untyped has a local.mutation");
+    assert_eq!(ulm.discounted_to, None, "no typing → no discount");
+    assert_eq!(ulm.effective_class(), 1);
+
+    // poisoned: `as any` voids the discount AND emits a type.escape (class 3).
+    let poisoned = analyze_fixture_unit("coverage.ts", "poisoned");
+    let plm = poisoned
+        .effects
+        .iter()
+        .find(|e| e.kind.wire() == "local.mutation")
+        .expect("poisoned has a local.mutation");
+    assert_eq!(plm.discounted_to, None, "any voids the boundary discount");
+    assert_eq!(plm.effective_class(), 1);
+    assert!(
+        poisoned
+            .risk_features
+            .iter()
+            .any(|r| r.kind.wire() == "type.escape"),
+        "poisoned must carry a type.escape risk"
+    );
+    assert_eq!(
+        poisoned.max_class, 3,
+        "type.escape (class 3) dominates max_class"
+    );
+    assert_eq!(poisoned.risk_weight, 3, "weight_for_class(3) == 3");
+}
+
 #[test]
 fn analyze_unit_pure_fn_scores_zero() {
     // A function with no effects should have max_class 0, own_score 0.0.
