@@ -221,6 +221,17 @@ definition *not* observable, so the boundary-containment discount floors at **cl
   **escaping**, so it receives **no** boundary shift regardless of coverage — only the
   world-vs-state and existing-discount machinery apply.
 
+**The graduated depth is latent in this milestone.** Every contained effect in JS/TS
+Milestone A is `local.mutation` (class 1), and class 1 with a floor of 0 saturates at
+the first step: both **Partial** (down 1 → 0) and **Full** (down 2 → 0) coverage floor
+it to class 0, so they are **observationally identical here** — only `c = 0` vs `c > 0`
+is distinguishable. The Partial-vs-Full distinction becomes visible only on a contained
+effect of **class ≥ 2**, of which this milestone has none. The graduated model is kept
+in `fxrank-core` (language-neutral) for future contained effects and for the deferred
+Rust application; JS/TS Milestone A simply does not exercise the second step. (So "some
+typing beats none" — the requirement that drove graduation — is fully delivered; the
+finer depth is reserved, not removed.)
+
 This is what makes "I don't care how much mutation is inside, as long as the boundary
 types are right" *measurable*: contained interior mutation goes to 0 under a typed
 boundary, while escaping mutation and world effects stay fully visible.
@@ -319,9 +330,13 @@ Mirrors the Rust frontend: `tests/fixtures/*.{ts,tsx,js}` read by a shared
 - **World vs state:** a function doing `fetch` keeps `net.fs.db` class 7 even with a
   fully-typed boundary; a function with only local mutation behind a fully-typed
   boundary scores 0.
-- **Graduated coverage:** the same locally-mutating function at `c = 0` (class 1),
-  `c` partial (class 0), `c = 1` (class 0); a class-3 contained case (constructor
-  `this`-init) showing partial→2 / full→1 / floor.
+- **Graduated coverage:** the same locally-mutating function at `c = 0` (contained
+  `local.mutation` stays class 1), at partial `c` (floors to class 0), and at `c = 1`
+  (floors to class 0). Since every contained effect in this milestone is class 1,
+  partial and full coverage are **observationally identical** here (both → 0) — the
+  fixtures assert exactly that. The latent Partial=down-1 vs Full=down-2 distinction is
+  covered by a **`fxrank-core` unit test** on a synthetic class-≥2 contained input,
+  since no JS/TS fixture can exercise it.
 - **`any` poison:** a fully-typed boundary with one `as any` in the body → discount
   voided + `type.escape` risk.
 - **Escape discrimination:** local mutation (contained, discounts) vs param /
@@ -356,7 +371,7 @@ Mirrors the Rust frontend: `tests/fixtures/*.{ts,tsx,js}` read by a shared
 | Unifying principle | Types bound the space of variation; `any` re-opens it | Justifies *which* constructs earn a discount: those that provably shrink the reachable-effect set, syntactically. |
 | What a boundary contains | State (and memory), not world | Effect-system truth: a sound boundary encapsulates `ST`-style local state, never `IO`. User's own framing: "mutation or unsafe", not IO. |
 | Discount eligibility | Only contained (non-escaping) effects, behind a typed boundary | Discounting escaping mutation would re-hide the hidden mutation this tool exists to surface (001 anti-Goodhart). |
-| Boundary gate | Graduated by signature coverage `c = t/S` (Full down 2 / Partial down 1 / None) | "Some typing beats none" — each pinned slot removes a dimension of variation. |
+| Boundary gate | Graduated by signature coverage `c = t/S` (Full down 2 / Partial down 1 / None) | "Some typing beats none" — each pinned slot removes a dimension of variation. Depth is latent in M-A (every contained effect is class 1, so Partial=Full=0); kept in core for future/Rust. |
 | `any` handling | Poison: voids the discount anywhere it appears (sig or body) + gentle `type.escape` risk (class 3) | `any ≈ unsafe`; surfaced for agents without shadowing real IO. |
 | Contained-effect floor | Class 0 (not 1) | A contained effect is not observable, so it may discount to truly free — makes "I don't care about internal mutation" measurable. |
 | Explicit vs inferred annotations | Only explicit annotations are credited; inferred are invisible | Honest boundary of a syntactic instrument; rewards type-first/FP style. Two runtime-identical fns (one annotated) get different scores — intended. |
