@@ -18,7 +18,15 @@ fn collects_all_function_forms() {
     assert!(symbols.contains(&"topLevel".to_string()));
     assert!(symbols.contains(&"arrowConst".to_string()));
     assert!(symbols.contains(&"C.method".to_string()));
-    assert!(symbols.contains(&"C.g".to_string()));
+    // Getter renamed: was "C.g", now includes "get " prefix to avoid collisions.
+    assert!(symbols.contains(&"C.get g".to_string()));
     assert!(symbols.contains(&"exported".to_string()));
     assert!(symbols.iter().any(|s| s.starts_with("<arrow@L"))); // the inline x => x
+    // Class D exercises both getter and setter of the same name — must not collide.
+    assert!(symbols.contains(&"D.get v".to_string()));
+    assert!(symbols.contains(&"D.set v".to_string()));
+    // Total count guards against future double-emit regressions.
+    // functions.ts yields: topLevel, arrowConst, C.method, C.get g, exported,
+    //   <arrow@L5> (inline x => x), D.get v, D.set v  — 8 units total.
+    assert_eq!(symbols.len(), 8);
 }

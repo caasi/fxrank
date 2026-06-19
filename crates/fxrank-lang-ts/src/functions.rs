@@ -20,15 +20,16 @@
 //! separate `FnUnit`; child effects are never rolled into the parent.
 //!
 //! **Symbol naming.** Declarations and class/object members use their own name
-//! (`foo`, `C.method`, `C.g`). Arrows and anonymous function expressions take the
+//! (`foo`, `C.method`, `C.get g`, `C.set g`, `C.constructor`). Arrows take the
 //! binding name when assigned directly to a `const`/`let`/`var` declarator
 //! (`const f = () => {}` -> `f`); otherwise they fall back to `<arrow@L{line}>`
-//! (inline callbacks such as `[1].map(x => x)`).
+//! (inline callbacks such as `[1].map(x => x)`). Anonymous function expressions
+//! use `<fn@L{line}>` as their positional fallback.
 
 use swc_ecma_ast::{
-    ArrowExpr, BlockStmtOrExpr, Class, ClassMethod, Decl, Expr, FnDecl, FnExpr, Function,
-    GetterProp, MethodProp, Pat, PrivateMethod, PropName, SetterProp, Stmt, TsTypeAnn,
-    VarDeclarator,
+    ArrowExpr, BlockStmtOrExpr, Class, ClassMethod, Constructor, Decl, Expr, FnDecl, FnExpr,
+    Function, GetterProp, MethodKind, MethodProp, ParamOrTsParamProp, Pat, PrivateMethod, PropName,
+    SetterProp, Stmt, TsTypeAnn, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -66,7 +67,8 @@ pub enum FnBodyOwned {
 /// that can be analysed for effects. `sig` and `body` are owned clones so
 /// detectors can walk them after the source `Module` is dropped.
 pub struct FnUnit {
-    /// Display symbol: `foo`, `f`, `C.method`, `C.g`, or `<arrow@L{line}>`.
+    /// Display symbol: `foo`, `f`, `C.method`, `C.get g`, `C.set g`,
+    /// `C.constructor`, or `<arrow@L{line}>`.
     pub symbol: String,
     /// Collision-resistant id: `path:line:symbol`.
     pub id: String,
@@ -76,6 +78,10 @@ pub struct FnUnit {
     pub line: usize,
     /// Whether this function is `async`.
     pub is_async: bool,
+    /// Whether this is a class constructor. Task 8's mutation detector uses
+    /// this to distinguish contained `this.x = …` (constructor — local init)
+    /// from escaping `this.x = …` (normal method — `this.mutation`).
+    pub is_constructor: bool,
     /// Normalized signature (params + return annotation).
     pub sig: FnSig,
     /// Owned body for detectors to walk.
@@ -139,7 +145,15 @@ struct Collector<'a> {
 }
 
 impl Collector<'_> {
-    fn push(&mut self, symbol: String, line: usize, is_async: bool, sig: FnSig, body: FnBodyOwned) {
+    fn push(
+        &mut self,
+        symbol: String,
+        line: usize,
+        is_async: bool,
+        is_constructor: bool,
+        sig: FnSig,
+        body: FnBodyOwned,
+    ) {
         let id = format!("{}:{}:{}", self.path, line, symbol);
         self.units.push(FnUnit {
             symbol,
@@ -147,6 +161,7 @@ impl Collector<'_> {
             path: self.path.to_string(),
             line,
             is_async,
+            is_constructor,
             sig,
             body,
         });
@@ -166,6 +181,7 @@ fn body_of_function(f: &Function) -> FnBodyOwned {
     }
 }
 
+/// Unwrap an optional boxed `TsTypeAnn` into an owned clone.
 fn return_type_of(rt: &Option<Box<TsTypeAnn>>) -> Option<TsTypeAnn> {
     rt.as_ref().map(|t| (**t).clone())
 }
@@ -175,6 +191,8 @@ fn return_type_of(rt: &Option<Box<TsTypeAnn>>) -> Option<TsTypeAnn> {
 fn prop_name(key: &PropName) -> String {
     match key {
         PropName::Ident(i) => i.sym.to_string(),
+        // `Wtf8Atom` has no `Display`; `to_atom_lossy()` produces a UTF-8 `Atom`
+        // (borrowing if already valid UTF-8, reallocating only for lone surrogates).
         PropName::Str(s) => s.value.to_atom_lossy().to_string(),
         PropName::Num(n) => n.value.to_string(),
         PropName::BigInt(b) => b.value.to_string(),
@@ -191,7 +209,7 @@ impl Visit for Collector<'_> {
             params: params_of_function(f),
             return_type: return_type_of(&f.return_type),
         };
-        self.push(symbol, line, f.is_async, sig, body_of_function(f));
+        self.push(symbol, line, f.is_async, false, sig, body_of_function(f));
         // Recurse into the body so nested functions become their own units.
         node.visit_children_with(self);
     }
@@ -206,12 +224,12 @@ impl Visit for Collector<'_> {
             .as_ref()
             .map(|i| i.sym.to_string())
             .or_else(|| self.pending_name.take())
-            .unwrap_or_else(|| format!("<arrow@L{line}>"));
+            .unwrap_or_else(|| format!("<fn@L{line}>"));
         let sig = FnSig {
             params: params_of_function(f),
             return_type: return_type_of(&f.return_type),
         };
-        self.push(symbol, line, f.is_async, sig, body_of_function(f));
+        self.push(symbol, line, f.is_async, false, sig, body_of_function(f));
         node.visit_children_with(self);
     }
 
@@ -229,7 +247,7 @@ impl Visit for Collector<'_> {
             BlockStmtOrExpr::BlockStmt(block) => FnBodyOwned::Block(block.stmts.clone()),
             BlockStmtOrExpr::Expr(expr) => FnBodyOwned::Expr(expr.clone()),
         };
-        self.push(symbol, line, node.is_async, sig, body);
+        self.push(symbol, line, node.is_async, false, sig, body);
         node.visit_children_with(self);
     }
 
@@ -261,8 +279,16 @@ impl Visit for Collector<'_> {
             .clone()
             .unwrap_or_else(|| "<class>".to_string());
 
+        // Class methods are collected here — not via an overridden
+        // `visit_class_method` — because the `Visit` trait gives
+        // `visit_class_method` no class-name context. The subsequent
+        // `node.visit_children_with(self)` recurses into member BODIES (to
+        // catch nested arrows/fn-exprs inside method bodies) and does NOT
+        // re-emit the method units: the default `visit_class_method` never
+        // calls `visit_fn_decl`/`visit_fn_expr`, so there is no double-emit.
         for member in &node.body {
             match member {
+                swc_ecma_ast::ClassMember::Constructor(c) => self.collect_constructor(&class, c),
                 swc_ecma_ast::ClassMember::Method(m) => self.collect_class_method(&class, m),
                 swc_ecma_ast::ClassMember::PrivateMethod(m) => {
                     self.collect_private_method(&class, m)
@@ -309,13 +335,13 @@ impl Visit for Collector<'_> {
             params: params_of_function(f),
             return_type: return_type_of(&f.return_type),
         };
-        self.push(symbol, line, f.is_async, sig, body_of_function(f));
+        self.push(symbol, line, f.is_async, false, sig, body_of_function(f));
         node.visit_children_with(self);
     }
 
     fn visit_getter_prop(&mut self, node: &GetterProp) {
         let line = self.lines.line(node.span);
-        let symbol = prop_name(&node.key);
+        let symbol = format!("get {}", prop_name(&node.key));
         let sig = FnSig {
             params: Vec::new(),
             return_type: return_type_of(&node.type_ann),
@@ -324,13 +350,13 @@ impl Visit for Collector<'_> {
             Some(block) => FnBodyOwned::Block(block.stmts.clone()),
             None => FnBodyOwned::Block(Vec::new()),
         };
-        self.push(symbol, line, false, sig, body);
+        self.push(symbol, line, false, false, sig, body);
         node.visit_children_with(self);
     }
 
     fn visit_setter_prop(&mut self, node: &SetterProp) {
         let line = self.lines.line(node.span);
-        let symbol = prop_name(&node.key);
+        let symbol = format!("set {}", prop_name(&node.key));
         let sig = FnSig {
             params: vec![(*node.param).clone()],
             return_type: None,
@@ -339,7 +365,7 @@ impl Visit for Collector<'_> {
             Some(block) => FnBodyOwned::Block(block.stmts.clone()),
             None => FnBodyOwned::Block(Vec::new()),
         };
-        self.push(symbol, line, false, sig, body);
+        self.push(symbol, line, false, false, sig, body);
         node.visit_children_with(self);
     }
 }
@@ -348,12 +374,17 @@ impl Collector<'_> {
     fn collect_class_method(&mut self, class: &str, m: &ClassMethod) {
         let f = &m.function;
         let line = self.lines.line(f.span);
-        let symbol = format!("{class}.{}", prop_name(&m.key));
+        let name = prop_name(&m.key);
+        let symbol = match m.kind {
+            MethodKind::Method => format!("{class}.{name}"),
+            MethodKind::Getter => format!("{class}.get {name}"),
+            MethodKind::Setter => format!("{class}.set {name}"),
+        };
         let sig = FnSig {
             params: params_of_function(f),
             return_type: return_type_of(&f.return_type),
         };
-        self.push(symbol, line, f.is_async, sig, body_of_function(f));
+        self.push(symbol, line, f.is_async, false, sig, body_of_function(f));
     }
 
     fn collect_private_method(&mut self, class: &str, m: &PrivateMethod) {
@@ -364,6 +395,33 @@ impl Collector<'_> {
             params: params_of_function(f),
             return_type: return_type_of(&f.return_type),
         };
-        self.push(symbol, line, f.is_async, sig, body_of_function(f));
+        self.push(symbol, line, f.is_async, false, sig, body_of_function(f));
+    }
+
+    fn collect_constructor(&mut self, class: &str, c: &Constructor) {
+        let line = self.lines.line(c.span);
+        let symbol = format!("{class}.constructor");
+        // Constructor params may include TS parameter properties (`public x: T`);
+        // extract the underlying `Pat` from each variant.
+        let params: Vec<Pat> = c
+            .params
+            .iter()
+            .map(|p| match p {
+                ParamOrTsParamProp::Param(param) => param.pat.clone(),
+                ParamOrTsParamProp::TsParamProp(ts) => match &ts.param {
+                    swc_ecma_ast::TsParamPropParam::Ident(b) => Pat::Ident(b.clone()),
+                    swc_ecma_ast::TsParamPropParam::Assign(a) => Pat::Assign(a.clone()),
+                },
+            })
+            .collect();
+        let sig = FnSig {
+            params,
+            return_type: None,
+        };
+        let body = match &c.body {
+            Some(block) => FnBodyOwned::Block(block.stmts.clone()),
+            None => FnBodyOwned::Block(Vec::new()),
+        };
+        self.push(symbol, line, false, true, sig, body);
     }
 }
