@@ -154,8 +154,8 @@ still becomes a `diagnostic` (it contributes nothing to `skipped_tests`).
 - **Impl method inside a `#[cfg(test)]` module:** `#[cfg(test)] mod t { struct S; impl S { fn m(&self){ std::fs::read("z"); } } }`
   → the method is excluded by default (verifies the `collect_from_impl` threading).
 - **Top-level `#[test] fn`** → excluded by default.
-- **Top-level `#[cfg(test)] impl Drop for T {}`** → **not** in `module_risks` by
-  default; present with `--include-tests`.
+- **Top-level `#[cfg(test)] impl Drop for T {}`** and **`#[cfg(test)] unsafe impl Send for T {}`**
+  → **not** in `module_risks` by default; both present with `--include-tests`.
 - **CLI integration:** `fxrank scan <dir>` excludes tests and reports
   `scope.skipped_tests`; `--include-tests` includes them.
 - **Regression:** existing frontend unit tests and `insta` snapshots produce
