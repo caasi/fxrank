@@ -1,0 +1,15 @@
+---
+source: crates/fxrank-lang-rust/tests/snapshots.rs
+expression: summarize(hs)
+---
+{
+  "async_boundary": false,
+  "await_count": 0,
+  "confidence": 1.0,
+  "effects": [],
+  "max_class": 0,
+  "own_score": 0.0,
+  "risk_features": [],
+  "risk_weight": 0,
+  "symbol": "fallible"
+}

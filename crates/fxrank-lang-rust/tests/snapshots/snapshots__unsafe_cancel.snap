@@ -1,0 +1,32 @@
+---
+source: crates/fxrank-lang-rust/tests/snapshots.rs
+expression: summarize(hs)
+---
+{
+  "async_boundary": false,
+  "await_count": 0,
+  "confidence": 0.6,
+  "effects": [
+    {
+      "class": 3,
+      "discounted_to": 3,
+      "hidden": false,
+      "kind": "param.mutation",
+      "tier": "heuristic"
+    }
+  ],
+  "max_class": 7,
+  "own_score": 3.0,
+  "risk_features": [
+    {
+      "class": 5,
+      "kind": "unsafe.block"
+    },
+    {
+      "class": 7,
+      "kind": "raw.ptr.deref"
+    }
+  ],
+  "risk_weight": 21,
+  "symbol": "unsafe_cancel"
+}

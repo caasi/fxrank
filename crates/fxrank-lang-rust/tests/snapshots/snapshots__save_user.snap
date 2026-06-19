@@ -1,0 +1,44 @@
+---
+source: crates/fxrank-lang-rust/tests/snapshots.rs
+expression: summary
+---
+{
+  "async_boundary": false,
+  "await_count": 0,
+  "confidence": 0.6,
+  "effects": [
+    {
+      "class": 4,
+      "discounted_to": null,
+      "hidden": false,
+      "kind": "panic",
+      "tier": "heuristic"
+    },
+    {
+      "class": 7,
+      "discounted_to": null,
+      "hidden": false,
+      "kind": "net.fs.db",
+      "tier": "path"
+    },
+    {
+      "class": 5,
+      "discounted_to": null,
+      "hidden": false,
+      "kind": "time.read",
+      "tier": "path"
+    },
+    {
+      "class": 3,
+      "discounted_to": 1,
+      "hidden": false,
+      "kind": "param.mutation",
+      "tier": "heuristic"
+    }
+  ],
+  "max_class": 7,
+  "own_score": 28.0,
+  "risk_features": [],
+  "risk_weight": 0,
+  "symbol": "save_user"
+}
