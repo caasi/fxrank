@@ -1,0 +1,87 @@
+---
+source: crates/fxrank-lang-ts/tests/snapshots.rs
+expression: snapshot
+---
+{
+  "hotspots": [
+    {
+      "async_boundary": true,
+      "await_count": 1,
+      "confidence": 0.8,
+      "effects": [
+        {
+          "class": 7,
+          "discounted_to": null,
+          "hidden": false,
+          "kind": "net.fs.db",
+          "tier": "path"
+        }
+      ],
+      "max_class": 7,
+      "own_score": 21.0,
+      "risk_features": [],
+      "risk_weight": 0,
+      "symbol": "loadUser"
+    },
+    {
+      "async_boundary": false,
+      "await_count": 0,
+      "confidence": 1.0,
+      "effects": [],
+      "max_class": 3,
+      "own_score": 0.0,
+      "risk_features": [
+        {
+          "class": 3,
+          "kind": "type.escape"
+        }
+      ],
+      "risk_weight": 3,
+      "symbol": "risky"
+    },
+    {
+      "async_boundary": false,
+      "await_count": 0,
+      "confidence": 1.0,
+      "effects": [
+        {
+          "class": 1,
+          "discounted_to": null,
+          "hidden": false,
+          "kind": "local.mutation",
+          "tier": "exact"
+        }
+      ],
+      "max_class": 1,
+      "own_score": 1.0,
+      "risk_features": [],
+      "risk_weight": 0,
+      "symbol": "buildUntyped"
+    },
+    {
+      "async_boundary": false,
+      "await_count": 0,
+      "confidence": 1.0,
+      "effects": [
+        {
+          "class": 1,
+          "discounted_to": 0,
+          "hidden": false,
+          "kind": "local.mutation",
+          "tier": "exact"
+        }
+      ],
+      "max_class": 0,
+      "own_score": 0.0,
+      "risk_features": [],
+      "risk_weight": 0,
+      "symbol": "buildTyped"
+    }
+  ],
+  "summary": {
+    "confidence": 0.8,
+    "max_class": 7,
+    "own_score": 21.0,
+    "risk_weight": 3
+  }
+}
