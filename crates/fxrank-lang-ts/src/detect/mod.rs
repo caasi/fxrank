@@ -44,6 +44,10 @@ pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines) -> 
             if contained && cov.tier != BoundaryCoverage::None {
                 effect.discounted_to =
                     Some(apply_boundary_discount(effect.class, cov.tier, contained));
+                // For class-1 effects (all contained effects in this milestone) Partial and Full
+                // both floor to 0 — the discount value is identical. The label still records which
+                // tier applied; it only separates a contained class->=2 effect (none exist yet).
+                // See apply_boundary_discount / spec 003 "latent gradient".
                 let label = if cov.tier == BoundaryCoverage::Full {
                     "fully-typed"
                 } else {

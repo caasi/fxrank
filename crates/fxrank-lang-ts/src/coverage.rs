@@ -57,7 +57,7 @@ fn is_any(ty: &TsType) -> bool {
 /// Classify a single optional annotation: `(is_typed, is_any)`.
 ///
 /// `is_typed` means present and not `any`; `is_any` means present and `any`.
-fn classify_ann(ann: &Option<TsTypeAnn>) -> (bool, bool) {
+fn classify_ann(ann: Option<&TsTypeAnn>) -> (bool, bool) {
     match ann {
         None => (false, false),
         Some(a) if is_any(&a.type_ann) => (false, true),
@@ -98,6 +98,9 @@ impl Visit for AnyBodyWalker {
     }
 
     fn visit_var_declarator(&mut self, node: &VarDeclarator) {
+        // Only inspects Pat::Ident bindings. Destructured forms like
+        // `const {x}: any` / `const [a]: any[]` are not caught — a
+        // Milestone-A syntactic limit.
         if let swc_ecma_ast::Pat::Ident(b) = &node.name
             && let Some(ann) = b.type_ann.as_deref()
             && is_any(&ann.type_ann)
@@ -123,7 +126,7 @@ pub fn analyze(sig: &FnSig, is_constructor: bool, body: &FnBodyOwned) -> Coverag
     let mut has_any = false;
 
     for pat in &sig.params {
-        let (typed, anyish) = classify_ann(&param_type_ann(pat).cloned());
+        let (typed, anyish) = classify_ann(param_type_ann(pat));
         if typed {
             typed_slots += 1;
         }
@@ -133,7 +136,7 @@ pub fn analyze(sig: &FnSig, is_constructor: bool, body: &FnBodyOwned) -> Coverag
     }
 
     if !is_constructor {
-        let (typed, anyish) = classify_ann(&sig.return_type);
+        let (typed, anyish) = classify_ann(sig.return_type.as_ref());
         if typed {
             typed_slots += 1;
         }
@@ -185,6 +188,8 @@ function fullyTyped(xs: number[]): number[] { const a: number[] = []; a.push(1);
 function partlyTyped(xs: number[]) { const a: number[] = []; a.push(1); return a; }
 function untyped(xs) { const a = []; a.push(1); return a; }
 function poisoned(xs: number[]): number[] { const a = xs as any; a.push(1); return a; }
+function noParams(): number { return 1; }
+class C { constructor(a: number, b: string) {} }
 "#;
 
     #[test]
@@ -234,5 +239,27 @@ function poisoned(xs: number[]): number[] { const a = xs as any; a.push(1); retu
         let src = "function f(x: number): number { const y: any = x; return y; }";
         let c = cov(src, "f");
         assert!(c.has_any, ": any local annotation must set has_any");
+    }
+
+    #[test]
+    fn zero_param_typed_return_is_full() {
+        // A zero-param non-constructor with a typed return has one slot (the
+        // return position), and it is typed — that alone earns Full.
+        let c = cov(FIXTURE, "noParams");
+        assert_eq!(c.tier, BoundaryCoverage::Full);
+        assert!(!c.has_any);
+        assert_eq!(c.typed_slots, 1);
+        assert_eq!(c.total_slots, 1);
+    }
+
+    #[test]
+    fn constructor_all_params_typed_is_full() {
+        // Constructors have no return slot; two typed params → Full coverage.
+        // The collected symbol is `C.constructor` (class-qualified).
+        let c = cov(FIXTURE, "C.constructor");
+        assert_eq!(c.tier, BoundaryCoverage::Full);
+        assert!(!c.has_any);
+        assert_eq!(c.typed_slots, 2);
+        assert_eq!(c.total_slots, 2);
     }
 }
