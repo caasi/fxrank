@@ -8,6 +8,8 @@ use fxrank_core::model::Hotspot;
 
 use crate::functions::FnUnit;
 
+pub mod calls;
+
 /// Build a zero-effect [`Hotspot`] from a [`FnUnit`].
 ///
 /// TODO(Task 7): wire the real gather (call/macro/mutation/risk detectors) and

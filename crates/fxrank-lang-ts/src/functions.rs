@@ -88,17 +88,24 @@ pub struct FnUnit {
     pub body: FnBodyOwned,
 }
 
-/// Parse `src` as `lang` and collect its function units.
+/// Parse `src` as `lang` into a swc `Module`, keeping the `SourceMap` alive.
 ///
-/// A convenience entry point that owns the swc parse plumbing (build a
-/// `SourceMap`, lex, parse a module, resolve lines) and returns the units plus
-/// any parse error. Detector and integration tests use this so they don't have
-/// to repeat the parser setup.
-pub fn parse_and_collect(
+/// swc spans are bare `BytePos` offsets; resolving them to line numbers needs
+/// the `SourceMap` that parsed the file. Returning the `cm` alongside the
+/// `Module` lets callers build a [`SpanLines`] and resolve every node's line
+/// (the syn frontend gets this for free via `span().start().line`, but swc does
+/// not). `parse_and_collect` and detector tests both build on this.
+pub fn parse_module(
     src: &str,
     path: &str,
     lang: crate::source::Lang,
-) -> Result<Vec<FnUnit>, swc_ecma_parser::error::Error> {
+) -> Result<
+    (
+        swc_ecma_ast::Module,
+        swc_common::sync::Lrc<swc_common::SourceMap>,
+    ),
+    swc_ecma_parser::error::Error,
+> {
     use swc_common::{FileName, SourceMap, sync::Lrc};
     use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
 
@@ -112,6 +119,22 @@ pub fn parse_and_collect(
     );
     let mut parser = Parser::new_from(lexer);
     let module = parser.parse_module()?;
+    Ok((module, cm))
+}
+
+/// Parse `src` as `lang` and collect its function units.
+///
+/// A convenience entry point that owns the swc parse plumbing (build a
+/// `SourceMap`, lex, parse a module, resolve lines) and returns the units plus
+/// any parse error. Detector and integration tests use this so they don't have
+/// to repeat the parser setup. Internally it calls [`parse_module`] and then
+/// drops the `Module`/`SourceMap` after collecting (each `FnUnit` owns its data).
+pub fn parse_and_collect(
+    src: &str,
+    path: &str,
+    lang: crate::source::Lang,
+) -> Result<Vec<FnUnit>, swc_ecma_parser::error::Error> {
+    let (module, cm) = parse_module(src, path, lang)?;
     let lines = SpanLines::new(cm);
     Ok(collect(&module, path, &lines))
 }
