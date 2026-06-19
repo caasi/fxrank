@@ -1,7 +1,8 @@
 //! World-effect detection: walks a function body for effectful function and
 //! method calls (`fetch`, `console.log`, `Date.now`, `Math.random`,
 //! `crypto.randomUUID`, `process.exit`, fs reads/writes), env reads
-//! (`process.env.X`), and `throw` statements, emitting an [`Effect`] per signal.
+//! (`process.env.X`), constructor expressions (`new WebSocket(…)`), and `throw`
+//! statements, emitting an [`Effect`] per signal.
 //!
 //! This is the swc analog of `fxrank-lang-rust`'s `detect/calls.rs`. Where syn
 //! resolves a node's line standalone (`span().start().line`), swc spans are bare
@@ -13,11 +14,15 @@
 //! so they match on rendered name alone. `imports` is consulted only to map a
 //! bare imported name (`readFile` from `node:fs`) back to its module for fs/db
 //! classification.
+//!
+//! NOTE: namespace-import member calls (`import * as fs from 'node:fs';
+//! fs.readFile()`) are NOT resolved through `imports` yet — only bare
+//! single-ident imported names are. This is a documented Milestone-A limitation.
 
 use fxrank_core::confidence::detection_confidence;
 use fxrank_core::effect::{Effect, EffectKind, Tier};
 use fxrank_core::score::weight_for_class;
-use swc_ecma_ast::{Callee, Expr, MemberExpr, MemberProp, ThrowStmt};
+use swc_ecma_ast::{Callee, Expr, MemberExpr, MemberProp, NewExpr, ThrowStmt};
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::functions::FnBodyOwned;
@@ -71,6 +76,7 @@ impl Visit for CallWalker<'_> {
         // `process.env.<X>` shape means the inner `process.env` (2 segments)
         // does not also fire, so each read is counted once.
         if let Some(rendered) = render_member(node)
+            // Matches the 3-segment `process . env . VARNAME` access shape exactly.
             && let Some(rest) = rendered.strip_prefix("process.env.")
             && !rest.is_empty()
             && !rest.contains('.')
@@ -84,6 +90,17 @@ impl Visit for CallWalker<'_> {
     fn visit_throw_stmt(&mut self, node: &ThrowStmt) {
         let line = self.lines.line(node.span);
         self.push(EffectKind::Panic, Tier::Exact, line, "throw".to_string());
+        node.visit_children_with(self);
+    }
+
+    fn visit_new_expr(&mut self, node: &NewExpr) {
+        if let Some(name) = render_expr(&node.callee) {
+            let no_args = node.args.as_ref().is_none_or(|a| a.is_empty());
+            if let Some((kind, tier)) = classify_new_expr(&name, no_args) {
+                let line = self.lines.line(node.span);
+                self.push(kind, tier, line, format!("new {name}(…)"));
+            }
+        }
         node.visit_children_with(self);
     }
 }
@@ -120,12 +137,10 @@ impl CallWalker<'_> {
         use EffectKind::*;
 
         // --- Bare global idents (no `.`) -------------------------------------
-        match rendered {
-            // net.fs.db — fetch and the request/socket families.
-            "fetch" | "XMLHttpRequest" | "WebSocket" | "EventSource" => {
-                return Some((NetFsDb, Tier::Path));
-            }
-            _ => {}
+        // net.fs.db — fetch only; XMLHttpRequest/WebSocket/EventSource are
+        // constructors (NewExpr) and are classified in visit_new_expr.
+        if rendered == "fetch" {
+            return Some((NetFsDb, Tier::Path));
         }
 
         // --- `obj.method` member callees ------------------------------------
@@ -135,11 +150,11 @@ impl CallWalker<'_> {
                 return Some((Logging, Tier::Path));
             }
             // `Date.now()` → time.read.
-            if rendered == "Date.now" {
+            if obj == "Date" && method == "now" {
                 return Some((TimeRead, Tier::Path));
             }
             // `Math.random()` → random.
-            if rendered == "Math.random" {
+            if obj == "Math" && method == "random" {
                 return Some((Random, Tier::Path));
             }
             // `crypto.randomUUID` / `crypto.getRandomValues` → random.
@@ -149,6 +164,10 @@ impl CallWalker<'_> {
             // `process.exit` / `process.abort` → process.control.
             if obj == "process" && matches!(method, "exit" | "abort") {
                 return Some((ProcessControl, Tier::Path));
+            }
+            // Unknown receiver — fall back to method-name-only heuristic.
+            if let Some(result) = classify_method_call(method) {
+                return Some(result);
             }
         }
 
@@ -185,6 +204,36 @@ fn render_member(m: &MemberExpr) -> Option<String> {
     let obj = render_expr(&m.obj)?;
     match &m.prop {
         MemberProp::Ident(name) => Some(format!("{obj}.{}", name.sym)),
+        _ => None,
+    }
+}
+
+/// Classify a `new <Name>(…)` constructor expression.
+///
+/// `new Date()` with no arguments is a time read; with arguments it constructs
+/// a specific date and is not classified. Network/worker constructors are always
+/// classified regardless of argument count.
+fn classify_new_expr(name: &str, no_args: bool) -> Option<(EffectKind, Tier)> {
+    use EffectKind::*;
+    match name {
+        // time.read — only no-arg Date() reads the current time.
+        "Date" if no_args => Some((TimeRead, Tier::Path)),
+        // net.fs.db — network constructors.
+        "XMLHttpRequest" | "WebSocket" | "EventSource" => Some((NetFsDb, Tier::Path)),
+        // concurrency — Worker constructor.
+        "Worker" => Some((Concurrency, Tier::Path)),
+        _ => None,
+    }
+}
+
+/// Classify a method call by name alone (receiver type unknown → always
+/// `Tier::Heuristic`). Called as a fallback when the full `obj.method` form
+/// does not match any known-receiver pattern.
+fn classify_method_call(method: &str) -> Option<(EffectKind, Tier)> {
+    use EffectKind::*;
+    match method {
+        // net.fs.db — DB client; receiver type unknown.
+        "query" | "execute" => Some((NetFsDb, Tier::Heuristic)),
         _ => None,
     }
 }

@@ -67,3 +67,19 @@ fn detects_world_effects() {
         assert!(kinds.contains(&k.to_string()), "missing {k}");
     }
 }
+
+#[test]
+fn detects_ctor_and_method_effects() {
+    let kinds = effect_kinds("calls.ts", "ctorsAndMethods");
+    // db.query → net.fs.db (heuristic, unknown-receiver method)
+    // new WebSocket → net.fs.db (constructor)
+    assert!(
+        kinds.contains(&"net.fs.db".to_string()),
+        "expected net.fs.db (query + WebSocket), got: {kinds:?}"
+    );
+    // new Date() with no args → time.read
+    assert!(
+        kinds.contains(&"time.read".to_string()),
+        "expected time.read from new Date(), got: {kinds:?}"
+    );
+}
