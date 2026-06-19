@@ -331,6 +331,49 @@ fn cli_scans_ts_fragment_from_stdin() {
     assert_eq!(json["scope"]["functions"], 1);
 }
 
+// ── Test 12 (Task 7): TS async fn with fetch → hotspot with max_class 7 ──
+
+#[test]
+fn cli_ts_async_fetch_yields_class7_hotspot() {
+    let src = "async function load(): Promise<string> {\n\
+               const r = await fetch('https://x');\n\
+               console.log('done');\n\
+               return r.text();\n\
+               }\n";
+    let mut cmd = Command::cargo_bin("fxrank").unwrap();
+    let assert = cmd
+        .args(["scan", "--lang", "ts", "-"])
+        .write_stdin(src)
+        .assert()
+        .success();
+    let json: serde_json::Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("valid JSON");
+    let hotspots = json["hotspots"].as_array().expect("hotspots array");
+    let load = hotspots
+        .iter()
+        .find(|h| h["symbol"].as_str() == Some("load"))
+        .expect("hotspot for 'load' not found");
+    assert_eq!(
+        load["max_class"].as_u64(),
+        Some(7),
+        "load() should have max_class 7 (net.fs.db from fetch)"
+    );
+    assert!(
+        load["own_score"].as_f64().unwrap_or(0.0) >= 21.0,
+        "own_score should be >= 21.0 (weight_for_class(7) == 21)"
+    );
+    assert_eq!(
+        load["async_boundary"].as_bool(),
+        Some(true),
+        "load() should be an async boundary"
+    );
+    let effects = load["effects"].as_array().expect("effects array");
+    assert!(
+        !effects.is_empty(),
+        "load() should have detected effects, got none"
+    );
+}
+
 // ── Test 11: stdin WITHOUT --lang stays Rust (back-compat) ──
 
 #[test]

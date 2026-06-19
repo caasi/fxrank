@@ -8,14 +8,16 @@ pub mod source;
 use fxrank_core::frontend::{Frontend, FrontendOutput, Language, SourceFile};
 use fxrank_core::model::Diagnostic;
 
-use crate::source::Lang;
+use crate::imports::ImportTable;
+use crate::source::{Lang, SpanLines};
 
 /// The TypeScript/JavaScript language frontend.
 ///
 /// `TsFrontend { lang }.analyze()` parses each `SourceFile` with the configured
-/// `lang` dialect via `functions::parse_and_collect`, then maps each `FnUnit` to
-/// a scored `Hotspot` via `detect::analyze_unit`. Un-parseable files become
-/// `Diagnostic`s, not panics.
+/// `lang` dialect via `functions::parse_module`, builds a `SpanLines` from the
+/// same `SourceMap` used for parsing (so effect-line resolution works), then
+/// maps each `FnUnit` to a scored `Hotspot` via `detect::analyze_unit`.
+/// Un-parseable files become `Diagnostic`s, not panics.
 ///
 /// `lang` is the dialect used for *all* this frontend's sources; the CLI groups
 /// sources by resolved `Lang` so each group gets a `TsFrontend` with the right
@@ -36,17 +38,26 @@ impl Frontend for TsFrontend {
         let mut output = FrontendOutput::default();
 
         for source in files {
-            match functions::parse_and_collect(&source.text, &source.path, self.lang) {
+            match functions::parse_module(&source.text, &source.path, self.lang) {
                 Err(e) => {
+                    // swc's Error has no Display; use Debug for the diagnostic message.
                     output.diagnostics.push(Diagnostic {
                         path: source.path.clone(),
                         parsed: false,
                         error: format!("{e:?}"),
                     });
                 }
-                Ok(units) => {
+                Ok((module, cm)) => {
+                    // Keep the SourceMap alive through detection: swc spans are
+                    // bare BytePos offsets, and SpanLines needs the same cm that
+                    // parsed the file to resolve them to line numbers.
+                    let lines = SpanLines::new(cm);
+                    let imports = ImportTable::from_module(&module);
+                    let units = functions::collect(&module, &source.path, &lines);
                     for unit in &units {
-                        output.functions.push(detect::analyze_unit(unit));
+                        output
+                            .functions
+                            .push(detect::analyze_unit(unit, &imports, &lines));
                     }
                 }
             }
