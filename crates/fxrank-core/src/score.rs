@@ -40,6 +40,37 @@ pub fn max_class(effect_classes: &[u8], risk_class: u8) -> u8 {
         .max(risk_class)
 }
 
+/// How much of a function's signature is explicitly typed (the boundary gate).
+/// `None` = nothing typed (or `any`-poisoned); `Partial` = some slots typed;
+/// `Full` = every slot typed. See spec 003 "The boundary-containment discount".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryCoverage {
+    None,
+    Partial,
+    Full,
+}
+
+/// Boundary-containment discount: a class down-shift applied ONLY to **contained**
+/// (non-escaping) state effects, floored at **class 0** (a contained effect is not
+/// observable, so it may discount to truly free -- unlike `apply_discount`, whose
+/// floor is 1 for externally observable effects).
+///
+/// Escaping effects (`contained == false`) are never shifted. The depth is latent
+/// for class-1 inputs (Partial and Full both floor to 0); it only separates on a
+/// contained input of class >= 2 (none exist in the JS/TS milestone -- kept for
+/// future/Rust use).
+pub fn apply_boundary_discount(base_class: u8, coverage: BoundaryCoverage, contained: bool) -> u8 {
+    if !contained {
+        return base_class;
+    }
+    let shift = match coverage {
+        BoundaryCoverage::Full => 2,
+        BoundaryCoverage::Partial => 1,
+        BoundaryCoverage::None => 0,
+    };
+    base_class.saturating_sub(shift) // floor 0 (no `.max(1)`)
+}
+
 pub fn apply_discount(base_class: u8, discount: Discount, unsafe_enclosed: bool) -> u8 {
     if unsafe_enclosed || discount == Discount::None {
         return base_class;
@@ -98,5 +129,20 @@ mod tests {
         for (class, w) in expected.iter().enumerate() {
             assert_eq!(weight_for_class(class as u8), *w);
         }
+    }
+
+    #[test]
+    fn boundary_discount_floors_contained_at_zero() {
+        use BoundaryCoverage::*;
+        // contained effects: floor 0 (unlike apply_discount's floor 1)
+        assert_eq!(apply_boundary_discount(1, Partial, true), 0); // local.mutation, some typing -> free
+        assert_eq!(apply_boundary_discount(1, Full, true), 0);
+        assert_eq!(apply_boundary_discount(1, None, true), 1);    // no typing -> unchanged
+        // the latent gradient: only visible on class >= 2 contained inputs
+        assert_eq!(apply_boundary_discount(3, Partial, true), 2);
+        assert_eq!(apply_boundary_discount(3, Full, true), 1);
+        // escaping effects: never shifted, regardless of coverage
+        assert_eq!(apply_boundary_discount(3, Full, false), 3);
+        assert_eq!(apply_boundary_discount(1, Full, false), 1);
     }
 }

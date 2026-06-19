@@ -26,6 +26,7 @@ pub enum EffectKind {
     AmbientRead,
     LocalMutation,
     UnknownMacro,
+    ThisMutation,
 }
 impl EffectKind {
     pub fn wire(self) -> &'static str {
@@ -46,6 +47,7 @@ impl EffectKind {
             AmbientRead => "ambient.read",
             LocalMutation => "local.mutation",
             UnknownMacro => "unknown.macro",
+            ThisMutation => "this.mutation",
         }
     }
     pub fn base_class(self) -> u8 {
@@ -59,6 +61,7 @@ impl EffectKind {
             HiddenMutation | ParamMutation => 3,
             AmbientRead | UnknownMacro => 2,
             LocalMutation => 1,
+            ThisMutation => 3,
         }
     }
 }
@@ -81,6 +84,10 @@ pub enum RiskKind {
     ManuallyDrop,
     ImplDrop,
     ExternBlock,
+    TypeEscape,
+    DynamicCode,
+    ProtoPollution,
+    HtmlInjection,
 }
 impl RiskKind {
     pub fn wire(self) -> &'static str {
@@ -102,6 +109,10 @@ impl RiskKind {
             ManuallyDrop => "manually.drop",
             ImplDrop => "impl.drop",
             ExternBlock => "extern.block",
+            TypeEscape => "type.escape",
+            DynamicCode => "dynamic.code",
+            ProtoPollution => "proto.pollution",
+            HtmlInjection => "html.injection",
         }
     }
     pub fn class(self) -> u8 {
@@ -112,6 +123,10 @@ impl RiskKind {
             UnsafeBlock | UnsafeFn | UnsafeImpl => 5,
             BoxLeak | MemForget | ManuallyDrop => 4,
             ImplDrop | ExternBlock => 2,
+            TypeEscape => 3,
+            DynamicCode => 7,
+            ProtoPollution => 4,
+            HtmlInjection => 5,
         }
     }
 }
@@ -179,5 +194,16 @@ mod tests {
         assert_eq!(RiskKind::Transmute.class(), 7);
         assert_eq!(RiskKind::MemForget.wire(), "mem.forget");
         assert_eq!(RiskKind::ImplDrop.class(), 2);
+    }
+
+    #[test]
+    fn ts_vocabulary_metadata() {
+        assert_eq!(EffectKind::ThisMutation.wire(), "this.mutation");
+        assert_eq!(EffectKind::ThisMutation.base_class(), 3);
+        assert_eq!(RiskKind::TypeEscape.wire(), "type.escape");
+        assert_eq!(RiskKind::TypeEscape.class(), 3);
+        assert_eq!(RiskKind::DynamicCode.class(), 7);
+        assert_eq!(RiskKind::ProtoPollution.class(), 4);
+        assert_eq!(RiskKind::HtmlInjection.class(), 5);
     }
 }
