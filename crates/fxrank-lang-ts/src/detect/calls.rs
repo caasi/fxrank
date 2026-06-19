@@ -41,14 +41,7 @@ pub fn detect(body: &FnBodyOwned, imports: &ImportTable, lines: &SpanLines) -> V
         lines,
         effects: Vec::new(),
     };
-    match body {
-        FnBodyOwned::Block(stmts) => {
-            for s in stmts {
-                s.visit_with(&mut walker);
-            }
-        }
-        FnBodyOwned::Expr(e) => e.visit_with(&mut walker),
-    }
+    body.walk_with(&mut walker);
     walker.effects
 }
 

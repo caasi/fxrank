@@ -8,6 +8,7 @@
 //! Adding a detector is a one-line addition to the `gather` step.
 
 pub mod calls;
+pub mod mutation;
 
 use crate::functions::{FnBodyOwned, FnUnit};
 use crate::imports::ImportTable;
@@ -26,7 +27,13 @@ use swc_ecma_visit::{Visit, VisitWith};
 /// calling `TsFrontend::analyze`, which keeps the `SourceMap` alive so spans
 /// can be resolved.
 pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines) -> Hotspot {
-    let effects: Vec<Effect> = gather(unit, imports, lines);
+    let gathered: Vec<(Effect, bool)> = gather(unit, imports, lines);
+
+    // TODO(Task 9): boundary-containment discount applied here, before the flag
+    // is stripped — each effect's `contained` bool (the second tuple element)
+    // decides whether the mutation channel is discounted (a declared, bounded
+    // write) or left at full class (an escaping write).
+    let effects: Vec<Effect> = gathered.into_iter().map(|(e, _contained)| e).collect();
 
     let await_count = count_awaits(&unit.body);
     let async_boundary = unit.is_async || await_count > 0;
@@ -64,12 +71,27 @@ pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines) -> 
     }
 }
 
-/// Gather effects from all detectors. New detectors plug in here.
-fn gather(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines) -> Vec<Effect> {
-    let mut effects = Vec::new();
-    effects.extend(calls::detect(&unit.body, imports, lines));
-    // TODO(Task 8): mutation::detect — self/param write-through effects.
-    // TODO(Task 9): boundary-containment discount applied here after all effects are gathered.
+/// Gather effects from all detectors, each paired with a `contained` flag.
+///
+/// New detectors plug in here. The bool is the boundary-containment signal Task
+/// 9 consumes: world effects (calls) are never contained; mutation effects carry
+/// their own per-write classification (a write to a local/constructor-`this` is
+/// contained, an escaping write is not).
+fn gather(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines) -> Vec<(Effect, bool)> {
+    let mut effects: Vec<(Effect, bool)> = Vec::new();
+    // Call effects are world effects — never contained.
+    effects.extend(
+        calls::detect(&unit.body, imports, lines)
+            .into_iter()
+            .map(|e| (e, false)),
+    );
+    effects.extend(mutation::detect(
+        &unit.body,
+        &unit.sig,
+        unit.is_constructor,
+        lines,
+        imports,
+    ));
     // TODO(Task 10): risk::detect — risk features (unsafe, etc.).
     effects
 }
@@ -86,13 +108,6 @@ fn count_awaits(body: &FnBodyOwned) -> usize {
     }
 
     let mut counter = AwaitCounter(0);
-    match body {
-        FnBodyOwned::Block(stmts) => {
-            for s in stmts {
-                s.visit_with(&mut counter);
-            }
-        }
-        FnBodyOwned::Expr(e) => e.visit_with(&mut counter),
-    }
+    body.walk_with(&mut counter);
     counter.0
 }

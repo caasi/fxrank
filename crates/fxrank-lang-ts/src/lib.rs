@@ -40,7 +40,8 @@ impl Frontend for TsFrontend {
         for source in files {
             match functions::parse_module(&source.text, &source.path, self.lang) {
                 Err(e) => {
-                    // swc's Error has no Display; use Debug for the diagnostic message.
+                    // FIXME(diagnostic-UX): swc Error has no Display; Debug output is
+                    // verbose — extract just the message in a later pass.
                     output.diagnostics.push(Diagnostic {
                         path: source.path.clone(),
                         parsed: false,

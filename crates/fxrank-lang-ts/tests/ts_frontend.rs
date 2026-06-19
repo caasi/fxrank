@@ -1,7 +1,7 @@
 //! Integration tests for the swc-based TypeScript frontend.
 
 use fxrank_core::model::Hotspot;
-use fxrank_lang_ts::detect::{self, calls};
+use fxrank_lang_ts::detect::{self, calls, mutation};
 use fxrank_lang_ts::functions;
 use fxrank_lang_ts::imports::ImportTable;
 use fxrank_lang_ts::source::{Lang, SpanLines};
@@ -118,6 +118,74 @@ fn analyze_unit_scores_world_effects() {
     assert!(h.async_boundary, "io() must be an async boundary");
     assert!(h.await_count >= 1, "io() has at least one await");
     assert!(!h.effects.is_empty(), "io() must have detected effects");
+}
+
+// ── Task 8: mutation detection with escape analysis ──
+
+/// Read a fixture, find the unit named `fn_name`, run `mutation::detect`, and
+/// return each effect's `(wire kind, contained)` pair.
+fn mutation_effects(fixture: &str, fn_name: &str) -> Vec<(String, bool)> {
+    let path = format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(&path).expect("read fixture");
+    let (module, cm) = functions::parse_module(&src, fixture, Lang::Ts).expect("parse fixture");
+    let lines = SpanLines::new(cm);
+    let imports = ImportTable::from_module(&module);
+    let units = functions::collect(&module, fixture, &lines);
+    let unit = units
+        .iter()
+        .find(|u| u.symbol == fn_name)
+        .expect("function unit not found");
+    mutation::detect(&unit.body, &unit.sig, unit.is_constructor, &lines, &imports)
+        .into_iter()
+        .map(|(e, contained)| (e.kind.wire().to_string(), contained))
+        .collect()
+}
+
+/// Just the wire kinds of a unit's mutation effects.
+fn kinds(fixture: &str, fn_name: &str) -> Vec<String> {
+    mutation_effects(fixture, fn_name)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect()
+}
+
+#[test]
+fn classifies_mutation_by_escape() {
+    assert!(kinds("mutation.ts", "buildLocal").contains(&"local.mutation".into()));
+    assert!(kinds("mutation.ts", "mutParam").contains(&"param.mutation".into()));
+    assert!(kinds("mutation.ts", "viaClosure").contains(&"hidden.mutation".into()));
+    assert!(kinds("mutation.ts", "Box.set").contains(&"this.mutation".into()));
+    assert!(kinds("mutation.ts", "viaGlobal").contains(&"global.mutation".into()));
+}
+
+#[test]
+fn contained_flag_tracks_escape() {
+    // A write to a body-local binding is contained (Task 9 will discount it).
+    let local = mutation_effects("mutation.ts", "buildLocal");
+    let local_mut = local
+        .iter()
+        .find(|(k, _)| k == "local.mutation")
+        .expect("buildLocal has a local.mutation");
+    assert!(local_mut.1, "local.mutation must be contained == true");
+
+    // A write to a param escapes the function — not contained.
+    let param = mutation_effects("mutation.ts", "mutParam");
+    let param_mut = param
+        .iter()
+        .find(|(k, _)| k == "param.mutation")
+        .expect("mutParam has a param.mutation");
+    assert!(!param_mut.1, "param.mutation must be contained == false");
+
+    // `this.x = …` inside a constructor is local initialization — contained.
+    let ctor = mutation_effects("mutation.ts", "WithCtor.constructor");
+    let ctor_mut = ctor
+        .iter()
+        .find(|(k, _)| k == "local.mutation")
+        .expect("WithCtor.constructor has a local.mutation (this.x = 1)");
+    assert!(
+        ctor_mut.1,
+        "constructor this.x init must be local.mutation, contained == true"
+    );
 }
 
 #[test]

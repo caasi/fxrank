@@ -63,6 +63,21 @@ pub enum FnBodyOwned {
     Expr(Box<Expr>),
 }
 
+impl FnBodyOwned {
+    /// Drive a swc `Visit` over this body (block stmts or the single expr).
+    pub fn walk_with<V: swc_ecma_visit::Visit>(&self, v: &mut V) {
+        use swc_ecma_visit::VisitWith;
+        match self {
+            FnBodyOwned::Block(stmts) => {
+                for s in stmts {
+                    s.visit_with(v);
+                }
+            }
+            FnBodyOwned::Expr(e) => e.visit_with(v),
+        }
+    }
+}
+
 /// A concrete function unit — a named (or positionally-named) node with a body
 /// that can be analysed for effects. `sig` and `body` are owned clones so
 /// detectors can walk them after the source `Module` is dropped.
