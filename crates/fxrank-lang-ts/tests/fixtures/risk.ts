@@ -1,4 +1,5 @@
 function dyn(s: string): unknown { return eval(s); }
+function dynFunc(s: string): unknown { return new Function(s)(); }
 function proto(o: object): void { Object.setPrototypeOf(o, null); }
 function html(el: HTMLElement, s: string): void { el.innerHTML = s; }
 function nonNull(x: string | null): string { return x!; }

@@ -172,7 +172,7 @@ impl Visit for RiskWalker<'_> {
                         RiskKind::ProtoPollution,
                         Tier::Heuristic,
                         line,
-                        "__proto__ =".into(),
+                        ".__proto__ =".into(),
                     );
                 }
                 "innerHTML" | "outerHTML" => {

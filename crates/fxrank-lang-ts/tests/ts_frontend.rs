@@ -333,6 +333,11 @@ fn detects_risks() {
         risk_kinds("risk.ts", "dyn").contains(&"dynamic.code".into()),
         "dyn: eval should yield dynamic.code"
     );
+    // new Function(...) → dynamic.code (exact)
+    assert!(
+        risk_kinds("risk.ts", "dynFunc").contains(&"dynamic.code".into()),
+        "dynFunc: new Function should yield dynamic.code"
+    );
     // Object.setPrototypeOf(...) → proto.pollution (path)
     assert!(
         risk_kinds("risk.ts", "proto").contains(&"proto.pollution".into()),
@@ -386,5 +391,39 @@ fn pure_as_any_has_exactly_one_type_escape() {
     assert_eq!(
         count, 1,
         "pureAsAny must have exactly one type.escape (from coverage, not doubled by risk)"
+    );
+}
+
+/// Parse a `.js` fixture (non-strict ES syntax), find the unit named `fn_name`,
+/// run `risk::detect`, and return the wire kinds of the risk features found.
+///
+/// `with (…) {}` is strict-mode-illegal and therefore unparseable in `.ts`
+/// (TS modules are always strict). This helper uses `Lang::Js` so the fixture
+/// is parsed as non-strict ES, making `visit_with_stmt` reachable.
+fn risk_kinds_js(fixture: &str, fn_name: &str) -> Vec<String> {
+    let path = format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(&path).expect("read fixture");
+    let (module, cm) = functions::parse_module(&src, fixture, Lang::Js).expect("parse fixture");
+    let lines = SpanLines::new(cm);
+    let units = functions::collect(&module, fixture, &lines);
+    let unit = units
+        .iter()
+        .find(|u| u.symbol == fn_name)
+        .expect("function unit not found");
+    risk::detect(&unit.body, fixture, &lines)
+        .iter()
+        .map(|r| r.kind.wire().to_string())
+        .collect()
+}
+
+#[test]
+fn detects_with_stmt_via_js() {
+    // `with (o) {}` is illegal in strict mode, so it cannot appear in a `.ts`
+    // file (TS modules are always strict — swc rejects it at parse time).
+    // `Lang::Js` uses non-strict ES syntax, so `visit_with_stmt` IS reachable
+    // from a `.js` fixture. This test exercises that path.
+    assert!(
+        risk_kinds_js("risk_with.js", "usesWith").contains(&"dynamic.code".into()),
+        "usesWith: with(...){{}} should yield dynamic.code"
     );
 }
