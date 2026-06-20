@@ -37,34 +37,28 @@ No `Hotspot`/`FnUnit` struct field is added. Snapshots (`*.snap`) are **not expe
 
 - [ ] **Step 1: Write the failing test**
 
-Add to the `#[cfg(test)] mod tests` block in `source.rs`. The helper parses a tiny source so we control exact positions. `line_col` takes a `Span`; build one from `BytePos`. Model the test on the existing `line`/`line_of` tests already in this module (reuse their parse helper if present; otherwise parse via `crate::functions::parse_module`).
+Add to the `#[cfg(test)] mod tests` block in `source.rs`. **Reuse the existing `test_file(src) -> (cm, fm)` helper and anchor spans at `fm.start_pos.0 + offset`** — exactly as the existing `spanlines_resolves` test does (source.rs ~line 89). This is load-bearing: swc assigns the first source file `start_pos.0 = 1`, so an absolute `BytePos(4)` is **not** byte offset 4. Anchoring relative to `fm.start_pos` keeps the offsets meaning "Nth byte of the source" and immune to the base. `Span`/`BytePos` are already in scope via `super::*` (imported at source.rs top) — no new `use` needed.
 
 ```rust
 #[test]
 fn line_col_is_one_based_for_line_and_column() {
-    // Two identifiers; `b` starts at column 5 (1-based) on line 1.
-    let src = "let ab = 1;\n  cd = 2;";
-    let (_module, cm) = crate::functions::parse_module(src, "t.ts", crate::source::Lang::Ts)
-        .expect("parse");
+    // `a` of `ab` is the 5th column (1-based) of line 1 ("let " = 4 chars).
+    let (cm, fm) = test_file("let ab = 1;\n");
     let lines = SpanLines::new(cm);
-    // BytePos is 0-based byte offset; `a` of `ab` is at byte 4 -> line 1, col 5.
-    let span = Span::new(BytePos(4), BytePos(6));
-    assert_eq!(lines.line_col(span), (1, 5));
+    let pos = swc_common::BytePos(fm.start_pos.0 + 4); // byte offset of `a`
+    assert_eq!(lines.line_col(Span::new(pos, pos)), (1, 5));
 }
 
 #[test]
 fn line_col_counts_characters_not_display_width() {
-    // A leading tab is ONE character: the `x` after it is at col 2, not col 9.
-    let src = "\tx = 1;";
-    let (_module, cm) = crate::functions::parse_module(src, "t.ts", crate::source::Lang::Ts)
-        .expect("parse");
+    // A leading tab is ONE character: the `x` after it is col 2, not col 9.
+    // (col_display would report 8 for the tab; we use the char column.)
+    let (cm, fm) = test_file("\tx = 1;");
     let lines = SpanLines::new(cm);
-    let span = Span::new(BytePos(1), BytePos(2)); // the `x`
-    assert_eq!(lines.line_col(span), (1, 2));
+    let pos = swc_common::BytePos(fm.start_pos.0 + 1); // byte offset of `x`
+    assert_eq!(lines.line_col(Span::new(pos, pos)), (1, 2));
 }
 ```
-
-If `BytePos`/`Span` are not already imported in the test module, add `use swc_common::{BytePos, Span};` (they are already used by the module's existing `line_of` signature — confirm and reuse).
 
 - [ ] **Step 2: Run the test to verify it fails**
 
