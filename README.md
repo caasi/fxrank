@@ -73,14 +73,28 @@ Other flags:
 - `--include-tests` — test code is **excluded by default** (`#[test]`/`#[bench]` and
   `#[cfg(test)]` modules for Rust; `*.test.*` / `*.spec.*` / `__tests__` paths for TS/JS).
   Pass this to score tests too.
-- `--exclude a,b,c` — directory **names** to skip when scanning a directory
-  (default: `node_modules,.git,target`).
+- `--exclude a,b,c` — comma-separated patterns to skip during directory scans
+  (**replaces** the default list when given). Each entry is classified by whether it
+  contains a `/`:
+  - **No `/`, no wildcard** (`node_modules`, `__mocks__`, `jest.setup.js`): prunes a
+    matching directory **and** excludes a matching file by base name.
+  - **No `/`, has a wildcard** (`*.min.js`, `*.stories.*`, `jest.config.*`): excludes
+    matching **files** only — never prunes a directory.
+  - **Contains `/`** (`src/legacy/**`, `packages/*/generated/**`): a segment-aware
+    path glob matched against the file's root-relative path (`*` stays within one
+    segment; `**` crosses `/`). File filter only — does not prune the directory.
+
+  Files skipped by any pattern are counted in `scope.skipped_excluded` (directory
+  prunes are not counted). `--exclude` applies to directory scans only; an explicitly
+  named file or stdin is always scanned.
+
+  Default: `node_modules,.git,target,*.min.js,*.min.mjs,*.min.cjs,*.stories.*,mockServiceWorker.js,jest.setup.*,jest.config.*,__mocks__`
 
 Output is **compact JSON on stdout** (built for agents — pipe through `jq` to read it):
 
 ```jsonc
 {
-  "scope":   { "input": "src", "files": 6, "parsed": 6, "functions": 37, "risk_features": [] },
+  "scope":   { "input": "src", "files": 6, "parsed": 6, "functions": 37, "skipped_tests": 0, "skipped_excluded": 0, "risk_features": [] },
   "summary": { "own_score": 42.5, "max_class": 7, "risk_weight": 0, "confidence": 0.6 },
   "hotspots": [
     {
