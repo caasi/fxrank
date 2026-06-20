@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use std::io::Write;
+use tempfile::TempDir;
 
 fn fxrank() -> Command {
     Command::cargo_bin("fxrank").expect("binary exists")
@@ -316,6 +317,138 @@ fn scan_skips_tests_by_default_and_include_tests_keeps_them() {
     );
 }
 
+// ── Test 10: stdin with --lang ts → TS frontend, one function counted ──
+
+#[test]
+fn cli_scans_ts_fragment_from_stdin() {
+    use assert_cmd::Command;
+    let mut cmd = Command::cargo_bin("fxrank").unwrap();
+    let assert = cmd
+        .args(["scan", "--lang", "ts", "-"])
+        .write_stdin("function f(): void {}\n")
+        .assert()
+        .success();
+    let json: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(json["scope"]["functions"], 1);
+}
+
+// ── Test 12 (Task 7): TS async fn with fetch → hotspot with max_class 7 ──
+
+#[test]
+fn cli_ts_async_fetch_yields_class7_hotspot() {
+    let src = "async function load(): Promise<string> {\n\
+               const r = await fetch('https://x');\n\
+               console.log('done');\n\
+               return r.text();\n\
+               }\n";
+    let mut cmd = Command::cargo_bin("fxrank").unwrap();
+    let assert = cmd
+        .args(["scan", "--lang", "ts", "-"])
+        .write_stdin(src)
+        .assert()
+        .success();
+    let json: serde_json::Value =
+        serde_json::from_slice(&assert.get_output().stdout).expect("valid JSON");
+    let hotspots = json["hotspots"].as_array().expect("hotspots array");
+    let load = hotspots
+        .iter()
+        .find(|h| h["symbol"].as_str() == Some("load"))
+        .expect("hotspot for 'load' not found");
+    assert_eq!(
+        load["max_class"].as_u64(),
+        Some(7),
+        "load() should have max_class 7 (net.fs.db from fetch)"
+    );
+    assert!(
+        load["own_score"].as_f64().unwrap_or(0.0) >= 21.0,
+        "own_score should be >= 21.0 (weight_for_class(7) == 21)"
+    );
+    assert_eq!(
+        load["async_boundary"].as_bool(),
+        Some(true),
+        "load() should be an async boundary"
+    );
+    let effects = load["effects"].as_array().expect("effects array");
+    assert!(
+        !effects.is_empty(),
+        "load() should have detected effects, got none"
+    );
+}
+
+// ── Test 11: stdin WITHOUT --lang stays Rust (back-compat) ──
+
+#[test]
+fn cli_stdin_without_lang_is_rust() {
+    // A Rust fn body parses as Rust; the same text is not valid TS, so if the
+    // back-compat default ever flipped to TS this would error or miscount.
+    let json = scan_stdin("fn r() { println!(\"x\"); }");
+    assert_eq!(
+        json["scope"]["functions"], 1,
+        "stdin without --lang should parse as Rust"
+    );
+    assert!(
+        json.get("hotspots").is_some(),
+        "missing 'hotspots' key in: {json}"
+    );
+}
+
+// ── Test 13: --lang on a real path → error (only valid for stdin) ──
+
+#[test]
+fn lang_flag_on_file_path_is_rejected() {
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("fxrank_lang_on_path_{}.rs", std::process::id()));
+    std::fs::write(&tmp, "fn f() {}").expect("write temp file");
+
+    let output = fxrank()
+        .args(["scan", "--lang", "ts"])
+        .arg(&tmp)
+        .output()
+        .expect("process ran");
+
+    std::fs::remove_file(&tmp).ok();
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit when --lang is combined with a file path"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("expected JSON error object on stdout");
+    let error_msg = json["error"].as_str().unwrap_or("");
+    assert!(
+        error_msg.contains("--lang is only valid when reading from stdin"),
+        "error message should mention stdin restriction; got: {error_msg:?}"
+    );
+}
+
+#[test]
+fn lang_flag_on_directory_path_is_rejected() {
+    let dir = std::env::temp_dir().join(format!("fxrank_lang_on_dir_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create dir");
+
+    let output = fxrank()
+        .args(["scan", "--lang", "ts"])
+        .arg(&dir)
+        .output()
+        .expect("process ran");
+
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit when --lang is combined with a directory path"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("expected JSON error object on stdout");
+    let error_msg = json["error"].as_str().unwrap_or("");
+    assert!(
+        error_msg.contains("--lang is only valid when reading from stdin"),
+        "error message should mention stdin restriction; got: {error_msg:?}"
+    );
+}
+
 // ── Test 6: --limit 1 on ≥2 functions → hotspots length 1, summary over all ──
 
 #[test]
@@ -360,5 +493,89 @@ fn beta()  { println!("b"); }
     assert!(
         functions_count >= 2,
         "scope.functions should be ≥ 2 (all functions), got {functions_count}"
+    );
+}
+
+// ── Test 14: --exclude flag skips vendor/build dirs ──
+
+/// Build a temp tree:
+///   <tmp>/src/app.ts          — has a fetch() call (effect-producing)
+///   <tmp>/node_modules/pkg/index.ts — also has an effect
+///
+/// Default scan must skip node_modules; --exclude src must skip src but include
+/// node_modules.
+#[test]
+fn exclude_skips_default_dirs_and_flag_overrides() {
+    let tmp: TempDir = TempDir::new().expect("create temp dir");
+    let root = tmp.path();
+
+    // <tmp>/src/app.ts
+    let src_dir = root.join("src");
+    std::fs::create_dir_all(&src_dir).expect("create src dir");
+    std::fs::write(
+        src_dir.join("app.ts"),
+        "async function fetchData() { return await fetch('https://example.com'); }\n",
+    )
+    .expect("write app.ts");
+
+    // <tmp>/node_modules/pkg/index.ts
+    let nm_dir = root.join("node_modules").join("pkg");
+    std::fs::create_dir_all(&nm_dir).expect("create node_modules dir");
+    std::fs::write(
+        nm_dir.join("index.ts"),
+        "async function nmFetch() { return await fetch('https://cdn.example.com'); }\n",
+    )
+    .expect("write index.ts");
+
+    // --- Default scan: node_modules is in the default exclude list, src is not ---
+    let out_default = fxrank()
+        .arg("scan")
+        .arg(root)
+        .output()
+        .expect("process ran");
+    assert!(
+        out_default.status.success(),
+        "default scan failed; stderr: {}",
+        String::from_utf8_lossy(&out_default.stderr)
+    );
+    let stdout_default = String::from_utf8(out_default.stdout).expect("utf-8");
+    let json_default: serde_json::Value =
+        serde_json::from_str(stdout_default.trim()).expect("valid JSON");
+    let fn_count_default = json_default["scope"]["functions"].as_u64().unwrap_or(0);
+    // Only src/app.ts is scanned (node_modules excluded by default) → 1 function
+    assert_eq!(
+        fn_count_default, 1,
+        "default scan should find 1 function (node_modules excluded); got {fn_count_default}"
+    );
+
+    // --- --exclude src: src dir is now excluded; node_modules is NOT in the list ---
+    let out_custom = fxrank()
+        .arg("scan")
+        .arg(root)
+        .arg("--exclude")
+        .arg("src")
+        .output()
+        .expect("process ran");
+    assert!(
+        out_custom.status.success(),
+        "--exclude src scan failed; stderr: {}",
+        String::from_utf8_lossy(&out_custom.stderr)
+    );
+    let stdout_custom = String::from_utf8(out_custom.stdout).expect("utf-8");
+    let json_custom: serde_json::Value =
+        serde_json::from_str(stdout_custom.trim()).expect("valid JSON");
+    let fn_count_custom = json_custom["scope"]["functions"].as_u64().unwrap_or(0);
+    // node_modules/pkg/index.ts is scanned; src excluded → 1 function from node_modules
+    assert_eq!(
+        fn_count_custom, 1,
+        "--exclude src should find 1 function (only node_modules scanned); got {fn_count_custom}"
+    );
+    // The hotspot symbol should be nmFetch (from node_modules), not fetchData (from src)
+    let hotspots = json_custom["hotspots"].as_array().expect("hotspots array");
+    assert!(
+        hotspots
+            .iter()
+            .any(|h| h["symbol"].as_str() == Some("nmFetch")),
+        "expected 'nmFetch' from node_modules in hotspots when src is excluded; got: {json_custom}"
     );
 }

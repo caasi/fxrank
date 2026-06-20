@@ -16,5 +16,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build -p fxrank --no-default-features --features rust   # slim-build gate compiles
+      - run: cargo build -p fxrank --no-default-features --features ts     # slim TS-only build
       - run: cargo build -p fxrank --no-default-features                   # no-frontend build still compiles
       - run: cargo run -p fxrank -- scan crates/ > /dev/null               # dogfood: tool runs over its own source
+      - run: cargo run -p fxrank -- scan crates/fxrank-lang-ts/tests/fixtures > /dev/null  # dogfood: TS frontend runs over committed fixtures

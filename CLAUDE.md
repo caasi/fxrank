@@ -31,6 +31,11 @@ A Cargo workspace, one shipped binary, language frontends feature-gated:
 - **`crates/fxrank-lang-rust`** — the `syn`-based Rust frontend (behind the `rust`
   feature). `functions` (function-unit collection), `imports` (a `use` table), and
   `detect/{calls,macros,mutation,risk}` detectors orchestrated by `detect::analyze_unit`.
+- **`crates/fxrank-lang-ts`** — the `swc`-based JS/TS frontend (behind the `ts` feature).
+  `functions` (function-unit collection incl. arrows/methods/getters), `imports` (ES
+  `import` + `require` table), `coverage` (signature typed-slot coverage for the boundary
+  discount), and `detect/{calls,mutation,risk}` orchestrated by `detect::analyze_unit`.
+  Parses with swc, runs no type-checker (syntactic, like the Rust frontend).
 - **`crates/fxrank-cli`** (package/binary `fxrank`) — args (clap), file discovery,
   feature-gated dispatch, compact JSON to stdout.
 
@@ -42,15 +47,18 @@ cargo test --workspace                                   # all tests (~90)
 cargo test -p fxrank-core own_score_damps_non_max_weights # one test by name
 cargo fmt --check                                        # CI gate
 cargo clippy --workspace --all-targets -- -D warnings    # CI gate — warnings are hard errors
-cargo build -p fxrank --no-default-features --features rust  # slim build (feature gate compiles)
+cargo build -p fxrank --no-default-features --features rust  # slim Rust-only build
+cargo build -p fxrank --no-default-features --features ts    # slim TS-only build
 cargo run -p fxrank -- scan <path>                       # run the tool
 cargo run -p fxrank -- scan crates/ | jq                 # dogfood on our own source
+echo 'function f(): void {}' | cargo run -p fxrank -- scan --lang ts -  # scan a TS fragment from stdin
 cargo insta review                                       # accept snapshot test changes (insta)
 ```
 
 CI (`.github/workflows/ci.yml`) gates `fmt --check`, `clippy --workspace --all-targets -D
-warnings`, `test --workspace`, both slim builds, and a dogfood `scan crates/`. Run the
-first three locally before pushing.
+warnings`, `test --workspace`, all slim builds (`--features rust`, `--features ts`,
+no-features), a Rust dogfood `scan crates/`, and a TS dogfood scan over the committed
+fixtures. Run the first three locally before pushing.
 
 ## Architecture: how a scan flows
 
@@ -101,6 +109,22 @@ inline `#[cfg(test)]` modules, where `assert!`/`assert_eq!` register as `panic` 
 dominate raw rankings.** When using the tool to find smells, filter test functions (e.g.
 drop hotspots whose only effect kind is `panic`), or scan non-test code. Skipping
 `#[cfg(test)]` is a Milestone-B candidate.
+
+## Dogfooding the TS frontend (running `fxrank scan crates/fxrank-lang-ts/src/`)
+
+Dogfooding the Rust frontend on the new TS-frontend Rust code validated the containment
+discount on our own visitor pattern: every swc walker (`CallWalker`, `RiskWalker`,
+`AnyBodyWalker`, `Collector`) lands at class 2 because their `&mut self` `param.mutation`
+is correctly discounted — the pervasive visitor-accumulation pattern stays low with no
+false alarms. The real IO boundaries (`run_scan`, `walk_dir`) surface at class 7 as
+expected. Core scoring functions score near zero.
+
+**Caveat surfaced:** standalone module-level `#[cfg(test)] fn` helpers are *not* skipped
+by the Rust frontend's test detection — it skips `#[test]` functions and `#[cfg(test)]`
+*modules*, but not bare `#[cfg(test)] fn` items, so they appeared as hotspots in the scan
+output. Workaround: move test helpers inside the `#[cfg(test)] mod tests` block (done for
+`imports::table` and `source::test_file`). Extending test-skip to bare `#[cfg(test)] fn`
+is a Milestone-B candidate.
 
 ## Design artifacts & workflow
 

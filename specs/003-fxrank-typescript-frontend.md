@@ -309,7 +309,8 @@ items/statements where possible; if swc cannot parse it, it is one `diagnostic` 
 Most type-dependent JS/TS signals are `heuristic` (no `tsc`):
 
 - `exact`: `throw`, syntactic `any` / `as any` / `@ts-ignore` presence, `eval` /
-  `new Function`.
+  `new Function`, `with` (the `with` statement is syntactically unambiguous — it is
+  always `dynamic.code`, no import resolution needed).
 - `path`: a call resolved through the `import` table to a known module/member
   (`console.log`, `crypto.randomUUID`).
 - `heuristic`: method-name signals (`.query`, `.set`), `process.env` access, the
@@ -406,6 +407,42 @@ Mirrors the Rust frontend: `tests/fixtures/*.{ts,tsx,js}` read by a shared
 7. **Scheduling effects** (`setTimeout` / `setInterval` / `queueMicrotask` /
    `requestAnimationFrame`) — whether and at what class to score deferral; left
    undetected in Milestone A rather than mis-weighted.
+8. **Namespace-import member calls** — `import * as fs from 'node:fs'; fs.readFile()` is
+   not resolved through the import table. The import table records `fs → node:fs`, but
+   the call detector does not currently walk through the namespace alias to look up the
+   member. Only bare single-ident imported names (named/default imports) are resolved;
+   namespace members are currently classified by member-name heuristic alone.
+9. **`render_expr` / `render_member` duplication** — these helpers exist independently in
+   `detect/calls.rs` and `detect/risk.rs` (a Milestone-A copy to keep each detector
+   self-contained). Extract a shared helper in `detect/` in Milestone B. Note:
+   `mutation.rs`'s `base_ident` serves a distinct semantic (identifying a write target's
+   root binding) and must not be merged in.
+10. **`as unknown as T` double-assertions and `@ts-ignore` / `@ts-expect-error` comment
+    directives** are not yet detected as `any`-family. swc places comment directives in a
+    side-table not currently threaded to the detectors. Milestone A detects `as any` and
+    `: any` via AST nodes only; comment-directive detection and double-assertion unwinding
+    are Milestone-B items.
+
+## CLI / behavior notes
+
+- **`--lang` is OPTIONAL for stdin, not required in the strict sense of "absent → error"
+  for all callers.** The flag defaults to Rust (backward compatibility — existing Rust
+  stdin usage (`fxrank scan -`) is preserved unchanged). `--lang ts` / `tsx` / `js` /
+  `jsx` selects the swc frontend. This decision is deliberate: new TS usage gains an
+  explicit `--lang ts`; old Rust usage requires no change.
+- **`--lang` is rejected when combined with a file or directory path.** For file/dir
+  inputs the file extension determines the language unambiguously; `--lang` is an error
+  there (a directory tree can mix `.ts` / `.tsx` / `.js` and a single `--lang` flag
+  cannot serve it).
+- **Test-file skipping is by FILE PATH**, not by detecting `describe`/`it` in app code.
+  JS/TS convention keeps tests in separate files, so `TsFrontend` skips entire files
+  whose name contains `.test.` or `.spec.` (e.g. `foo.test.ts`, `bar.spec.tsx`), or
+  whose path contains a `__tests__` segment (split on both `/` and `\` to handle
+  Windows paths). `--include-tests` opts back in. Skipped units are counted in the
+  report's `skipped_tests` field, mirroring the Rust frontend's contract (spec 002).
+  Detecting `describe`/`it`/`test` callback units inside non-test-named files is
+  deliberately **out of scope** for Milestone A — a Milestone-B candidate if real
+  scans show it is needed.
 
 ## Open questions
 
