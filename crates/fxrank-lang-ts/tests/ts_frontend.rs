@@ -1,6 +1,8 @@
 //! Integration tests for the swc-based TypeScript frontend.
 
+use fxrank_core::frontend::{Frontend, SourceFile};
 use fxrank_core::model::Hotspot;
+use fxrank_lang_ts::TsFrontend;
 use fxrank_lang_ts::detect::{self, calls, mutation, risk};
 use fxrank_lang_ts::functions;
 use fxrank_lang_ts::imports::ImportTable;
@@ -394,6 +396,69 @@ fn pure_as_any_has_exactly_one_type_escape() {
     );
 }
 
+// ── P1: detectors must not descend into nested function bodies ───────────────
+
+fn analyze_inline_units(src: &str) -> Vec<Hotspot> {
+    let (module, cm) = functions::parse_module(src, "inline.ts", Lang::Ts).expect("parse");
+    let lines = SpanLines::new(cm);
+    let imports = ImportTable::from_module(&module);
+    let units = functions::collect(&module, "inline.ts", &lines);
+    units
+        .iter()
+        .map(|unit| detect::analyze_unit(unit, &imports, &lines))
+        .collect()
+}
+
+#[test]
+fn nested_fn_effects_not_attributed_to_parent() {
+    let src = "function outer(): void { function inner(): void { fetch('/x'); } }";
+    let hotspots = analyze_inline_units(src);
+    let outer = hotspots
+        .iter()
+        .find(|h| h.symbol == "outer")
+        .expect("outer");
+    let inner = hotspots
+        .iter()
+        .find(|h| h.symbol == "inner")
+        .expect("inner");
+    assert_eq!(
+        outer.max_class, 0,
+        "outer has no own effects; got: {:?}",
+        outer.effects
+    );
+    assert!(
+        outer.effects.is_empty(),
+        "outer effects must be empty; got: {:?}",
+        outer.effects
+    );
+    assert!(inner.max_class > 0, "inner must have net.fs.db effect");
+}
+
+#[test]
+fn callback_effects_not_attributed_to_parent() {
+    let src = "function withCb(): void { [1].forEach((x: number) => { fetch('/y'); }); }";
+    let hotspots = analyze_inline_units(src);
+    let with_cb = hotspots
+        .iter()
+        .find(|h| h.symbol == "withCb")
+        .expect("withCb");
+    let arrow = hotspots
+        .iter()
+        .find(|h| h.symbol.starts_with("<arrow@"))
+        .expect("arrow unit");
+    assert_eq!(
+        with_cb.max_class, 0,
+        "withCb has no own effects; got: {:?}",
+        with_cb.effects
+    );
+    assert!(
+        with_cb.effects.is_empty(),
+        "withCb effects must be empty; got: {:?}",
+        with_cb.effects
+    );
+    assert!(arrow.max_class > 0, "arrow must have net.fs.db effect");
+}
+
 /// Parse a `.js` fixture (non-strict ES syntax), find the unit named `fn_name`,
 /// run `risk::detect`, and return the wire kinds of the risk features found.
 ///
@@ -425,5 +490,122 @@ fn detects_with_stmt_via_js() {
     assert!(
         risk_kinds_js("risk_with.js", "usesWith").contains(&"dynamic.code".into()),
         "usesWith: with(...){{}} should yield dynamic.code"
+    );
+}
+
+// ── P1 extension: coverage any-scan must not descend into nested function bodies ──
+
+#[test]
+fn nested_any_in_inner_fn_not_attributed_to_outer() {
+    // `outer` has no `any` of its own; only `inner` has `const x: any = 1`.
+    // `outer`'s `has_any` must be false → no type.escape risk, max_class 0.
+    // `inner`'s `has_any` must be true → type.escape risk present.
+    let src = "function outer(): void { function inner(): void { const x: any = 1; } }";
+    let hotspots = analyze_inline_units(src);
+    let outer = hotspots
+        .iter()
+        .find(|h| h.symbol == "outer")
+        .expect("outer");
+    let inner = hotspots
+        .iter()
+        .find(|h| h.symbol == "inner")
+        .expect("inner");
+
+    assert!(
+        outer.risk_features.is_empty(),
+        "outer must have no risk features (inner's any must not bleed up); got: {:?}",
+        outer.risk_features
+    );
+    assert_eq!(
+        outer.max_class, 0,
+        "outer max_class must be 0; got {}",
+        outer.max_class
+    );
+
+    assert!(
+        inner
+            .risk_features
+            .iter()
+            .any(|r| r.kind.wire() == "type.escape"),
+        "inner must carry a type.escape risk (its own `const x: any`); got: {:?}",
+        inner.risk_features
+    );
+}
+
+// ── P2: test-file skipping by path ───────────────────────────────────────────
+
+/// Build a `SourceFile` with a synthetic path and text (no disk I/O).
+fn make_source(path: &str, text: &str) -> SourceFile {
+    SourceFile {
+        path: path.into(),
+        text: text.into(),
+    }
+}
+
+const TEST_SRC: &str = "function t(): void { fetch('/'); }";
+
+#[test]
+fn test_file_skipped_by_default() {
+    // A .test.ts file should be skipped when include_tests == false (the default).
+    let frontend = TsFrontend::default();
+    let out = frontend.analyze(&[make_source("x.test.ts", TEST_SRC)]);
+    assert!(
+        out.functions.is_empty(),
+        "test file must be skipped; got: {:?}",
+        out.functions.iter().map(|h| &h.symbol).collect::<Vec<_>>()
+    );
+    assert_eq!(out.skipped_tests, 1, "skipped_tests must be 1");
+}
+
+#[test]
+fn test_file_included_when_include_tests_true() {
+    // include_tests == true: even .test.ts files are analyzed.
+    let frontend = TsFrontend {
+        lang: Lang::Ts,
+        include_tests: true,
+    };
+    let out = frontend.analyze(&[make_source("x.test.ts", TEST_SRC)]);
+    assert_eq!(
+        out.functions.len(),
+        1,
+        "include_tests=true must analyze the function"
+    );
+    assert_eq!(out.skipped_tests, 0, "skipped_tests must be 0");
+}
+
+#[test]
+fn normal_ts_file_not_skipped() {
+    // A plain .ts file is always analyzed regardless of include_tests.
+    let frontend = TsFrontend::default();
+    let out = frontend.analyze(&[make_source("app.ts", TEST_SRC)]);
+    assert_eq!(out.functions.len(), 1, "normal .ts file must be analyzed");
+    assert_eq!(out.skipped_tests, 0);
+}
+
+#[test]
+fn is_test_file_recognizes_patterns() {
+    use fxrank_lang_ts::is_test_file;
+    // Must be recognized as test files.
+    assert!(is_test_file("foo.test.ts"), "foo.test.ts");
+    assert!(is_test_file("foo.spec.tsx"), "foo.spec.tsx");
+    assert!(is_test_file("__tests__/foo.ts"), "__tests__/foo.ts");
+    assert!(is_test_file("src/__tests__/bar.ts"), "src/__tests__/bar.ts");
+    // Windows backslash path separators: __tests__ segment must still be found.
+    assert!(
+        is_test_file("src\\__tests__\\foo.ts"),
+        "src\\\\__tests__\\\\foo.ts (Windows path)"
+    );
+    // Must NOT be recognized as test files.
+    assert!(!is_test_file("foo.ts"), "foo.ts");
+    assert!(!is_test_file("stdin"), "stdin");
+    assert!(
+        !is_test_file("testimony.ts"),
+        "testimony.ts: no .test. infix"
+    );
+    assert!(!is_test_file("spectral.ts"), "spectral.ts: no .spec. infix");
+    // A `.test.` in a Windows DIRECTORY name must not false-match the file.
+    assert!(
+        !is_test_file("C:\\work\\my.test.project\\src\\app.ts"),
+        "windows dir with .test. infix: file is app.ts"
     );
 }

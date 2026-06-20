@@ -109,6 +109,12 @@ impl Visit for AnyBodyWalker {
         }
         node.visit_children_with(self);
     }
+
+    // Stop at nested function boundaries: an `any` inside a nested function
+    // belongs to that function's own unit, not the enclosing one.
+    fn visit_arrow_expr(&mut self, _n: &swc_ecma_ast::ArrowExpr) {}
+    fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
+    fn visit_constructor(&mut self, _n: &swc_ecma_ast::Constructor) {}
 }
 
 fn body_has_any(body: &FnBodyOwned) -> bool {

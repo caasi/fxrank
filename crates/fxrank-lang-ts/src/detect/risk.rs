@@ -204,6 +204,10 @@ impl Visit for RiskWalker<'_> {
         );
         node.visit_children_with(self);
     }
+
+    fn visit_arrow_expr(&mut self, _n: &swc_ecma_ast::ArrowExpr) {}
+    fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
+    fn visit_constructor(&mut self, _n: &swc_ecma_ast::Constructor) {}
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
