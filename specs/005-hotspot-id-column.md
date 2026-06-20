@@ -3,7 +3,7 @@
 ## Goal
 
 A hotspot `id` must be **unique** — FxRank is built for agents, which key hotspots
-by `id` to address them, cache references, and track them across edits. Today the
+by `id` to address and reference them unambiguously within a report. Today the
 `id` is `path:line:symbol`, and that is **not unique**: two anonymous functions on
 the same physical line of the same file get the same symbol fallback
 (`<arrow@L279>`), so the report emits the same `id` more than once with different
@@ -65,8 +65,9 @@ Out of scope (YAGNI / deferred):
 
 Two distinct functions can never share a `(line, col)` start position, so
 `line + col` is a **guaranteed-unique** key — strictly stronger than a per-line
-occurrence index (`#1`, `#2`), which is positional and renumbers when an earlier
-arrow is inserted, making it a poor key for an agent caching ids across edits.
+occurrence index (`#1`, `#2`), which is a synthetic ordinal that conveys no source
+position and renumbers when an earlier arrow is inserted. The column is a real
+source coordinate (meaningful and debuggable); the occurrence index is not.
 
 The column is promoted to its own colon-delimited **structural field** (rather than
 hidden only inside the anonymous symbol) so the `id` schema is **uniform**: every
@@ -76,7 +77,7 @@ anonymous or which language produced it. The Rust frontend never actually collid
 (closures roll up; it emits no anonymous units), but it adopts the same 4-field
 shape so the wire format does not vary by frontend.
 
-**The `id` is a stable *opaque* key, not a parse target.** Do not recover the
+**The `id` is a unique *opaque* key (within a report), not a parse target.** Do not recover the
 coordinates by splitting the raw `id` string: **both** `path` (taken verbatim — may
 contain `:`, e.g. a Windows `C:\…` path) **and** `symbol` (Rust `::`, e.g.
 `User::new`, `<User as Display>::fmt`) can contain `:`, so the id is *not*
@@ -86,8 +87,9 @@ the coordinates should read the hotspot's **structured JSON fields** — `path`,
 `col` lives solely inside the `id`; to recover it, use the known field values to
 strip the **prefix** `{path}:{line}:` and the **suffix** `:{symbol}` from the `id`,
 leaving exactly `col` (e.g. `p:10:4:S::m` → strip prefix `p:10:` and suffix `:S::m`
-→ `4`). The id's contract is **uniqueness + stability across edits**, not field
-extraction.
+→ `4`). The id's contract is **uniqueness + addressability within a report**, not
+field extraction — and not stability across edits: because it encodes position, an
+`id` changes when the function moves.
 
 The anonymous symbol keeps a redundant `C{col}` suffix (`<arrow@L279C55>`) so the
 **`symbol` field is self-sufficient** too: a human skimming `symbol` can tell two

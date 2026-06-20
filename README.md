@@ -127,6 +127,14 @@ Output is **compact JSON on stdout** (built for agents — pipe through `jq` to 
 for mixing stdin/file IO with diagnostic accumulation — a real "extract the pure
 report-building from the IO boundary" candidate.)*
 
+Each hotspot `id` (`path:line:col:symbol`) is a **unique, addressable key** within a
+report — even two anonymous arrows on the same line get distinct ids (`col` is the
+1-based character column). Because it encodes position, an `id` changes when the
+function moves, so it identifies a function *within a scan*, not across edits. Treat the
+`id` as opaque: each hotspot also emits `path`, `line`, and `symbol` as their own
+top-level fields (trimmed from the abbreviated example above) — read those rather than
+splitting the `id` string.
+
 ## Using it well (the lab protocol)
 
 FxRank is a precision instrument, not a crawler — **don't point it at a whole repo
