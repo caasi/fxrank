@@ -1155,6 +1155,19 @@ fn include_tests_keeps_everything() {
     assert!(out.functions.iter().any(|f| f.symbol == "free_test"));
 }
 
+// ── Task 3 (spec 005): hotspot id includes 1-based column ───────────────────
+
+#[test]
+fn id_includes_one_based_column() {
+    let src = "fn foo() {}\n";
+    let file = syn::parse_file(src).expect("parse");
+    let units = fxrank_lang_rust::functions::collect(&file, "t.rs");
+    let foo = units.iter().find(|u| u.symbol == "foo").expect("foo unit");
+    // `fn foo` — the ident `foo` starts at column 4 (1-based) on line 1
+    // (proc-macro2 column is 0-based: `f`=0,`n`=1,` `=2,`foo`@3 -> +1 = 4).
+    assert_eq!(foo.id, "t.rs:1:4:foo");
+}
+
 #[test]
 fn cfg_test_module_risks_skipped_by_default() {
     let src = "#[cfg(test)] impl Drop for T {}\n#[cfg(test)] unsafe impl Send for T {}\n#[cfg(test)] extern \"C\" { fn x(); }";
