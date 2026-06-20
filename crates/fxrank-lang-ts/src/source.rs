@@ -63,16 +63,15 @@ impl SpanLines {
 }
 
 #[cfg(test)]
-fn test_file(src: &str) -> (Lrc<SourceMap>, Lrc<swc_common::SourceFile>) {
-    use swc_common::FileName;
-    let cm: Lrc<SourceMap> = Default::default();
-    let fm = cm.new_source_file(FileName::Custom("t".into()).into(), src.to_string());
-    (cm, fm)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_file(src: &str) -> (Lrc<SourceMap>, Lrc<swc_common::SourceFile>) {
+        use swc_common::FileName;
+        let cm: Lrc<SourceMap> = Default::default();
+        let fm = cm.new_source_file(FileName::Custom("t".into()).into(), src.to_string());
+        (cm, fm)
+    }
 
     #[test]
     fn lang_from_extension() {

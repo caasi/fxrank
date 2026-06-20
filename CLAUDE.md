@@ -110,6 +110,22 @@ dominate raw rankings.** When using the tool to find smells, filter test functio
 drop hotspots whose only effect kind is `panic`), or scan non-test code. Skipping
 `#[cfg(test)]` is a Milestone-B candidate.
 
+## Dogfooding the TS frontend (running `fxrank scan crates/fxrank-lang-ts/src/`)
+
+Dogfooding the Rust frontend on the new TS-frontend Rust code validated the containment
+discount on our own visitor pattern: every swc walker (`CallWalker`, `RiskWalker`,
+`AnyBodyWalker`, `Collector`) lands at class 2 because their `&mut self` `param.mutation`
+is correctly discounted — the pervasive visitor-accumulation pattern stays low with no
+false alarms. The real IO boundaries (`run_scan`, `walk_dir`) surface at class 7 as
+expected. Core scoring functions score near zero.
+
+**Caveat surfaced:** standalone module-level `#[cfg(test)] fn` helpers are *not* skipped
+by the Rust frontend's test detection — it skips `#[test]` functions and `#[cfg(test)]`
+*modules*, but not bare `#[cfg(test)] fn` items, so they appeared as hotspots in the scan
+output. Workaround: move test helpers inside the `#[cfg(test)] mod tests` block (done for
+`imports::table` and `source::test_file`). Extending test-skip to bare `#[cfg(test)] fn`
+is a Milestone-B candidate.
+
 ## Design artifacts & workflow
 
 Specs live in `specs/`, implementation plans in `plans/`, with matching 3-digit prefixes
