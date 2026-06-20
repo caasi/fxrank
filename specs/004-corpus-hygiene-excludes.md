@@ -18,7 +18,7 @@ ranked, and in two repos that *buried or beat* the real signal.
 - **N5 — generated files in `public/`** (`mockServiceWorker.js`, header says "do
   NOT modify") flagged class-7 and duplicated across packages.
 
-The fix space is **default-exclude lists + a path-glob matcher**, not the scoring
+The fix space is **default-exclude lists + a richer glob matcher**, not the scoring
 model. This is a **scope decision** (what we scan), consistent with 002's stance:
 FxRank is an effect-cost profiler, not a linter, and it should not waste an agent's
 attention ranking code the agent will never refactor.
@@ -27,8 +27,9 @@ attention ranking code the agent will never refactor.
 
 In scope:
 
-- Grow `--exclude` from **directory-name** matching to **path-glob** matching, while
-  preserving today's bare-name behavior (back-compatible).
+- Grow `--exclude` from **directory-name-only** matching to a matcher that handles
+  **literal filenames, filename globs, and full-path globs** — mixed freely — while
+  preserving today's directory-prune behavior (back-compatible).
 - A richer, **documented, overridable** default exclude list covering vendored
   bundles (named), Storybook stories, the MSW generated worker, and JS test-support
   files (N1/N3/N4/N5).
@@ -55,36 +56,47 @@ Out of scope (deferred, Milestone-B candidates):
   noise** and belong to `--exclude`, not the test mechanism.
 - A blanket `fixtures/` segment or generic `*.config.*` glob in the defaults — those
   names host real source too often (false-skip risk). Deliberately omitted.
+- **Windows path support.** This is a macOS/Unix-first side project. Full-path globs
+  are matched against a `/`-normalized relative path (so a future Windows port has
+  one well-defined seam), but Windows is not a tested target here.
 
 ## Ownership: two skip layers, distinct concerns
 
 | Layer | Where it lives | Flag | Owns |
 | --- | --- | --- | --- |
-| File-discovery exclude | CLI (`main.rs` walk) | `--exclude` (replace, glob) | **general ecosystem file noise**: vendored, minified (named), stories, generated, JS test-support |
+| File-discovery exclude | CLI (`main.rs` walk) | `--exclude` (replace) | **general ecosystem file noise**: vendored, minified (named), stories, generated, JS test-support |
 | Test-skip | frontends (`is_test`/`is_test_file`) | `--include-tests` | the **test mechanism**: Rust `#[test]`/`#[cfg(test)]`, TS `.test.`/`.spec.`/`__tests__` |
 
 The two never overlap and no new flag is introduced. N3's test-support files
 (`jest.setup.*`, `jest.config.*`, `__mocks__`) live in the `--exclude` default list
 because they are JS-ecosystem *files*, not the test mechanism — so re-including them
-is `--exclude`'s override, not `--include-tests`.
+is `--exclude`'s override, not `--include-tests`. `--exclude` is **not** the test
+mechanism: a `*.stories.tsx` stays excluded even under `--include-tests`.
 
-## The matcher: bare-name (today) + path-glob (new)
+## The matcher: split on `/`
 
-`--exclude` takes a comma-separated list. Each entry is classified once:
+`--exclude` takes a comma-separated list. Each entry is classified once, **by whether
+it contains a `/`** — not by whether it contains glob metacharacters:
 
-- **Bare name** — no `/` and no glob metacharacters (`*`, `?`, `[`, `{`):
-  e.g. `node_modules`, `.git`, `target`, `__mocks__`. **Prunes any directory segment
-  equal to the name** during the walk (no recursion into it). This is *exactly*
-  today's behavior, preserved verbatim, and it never reads — so a pruned tree
-  contributes nothing and is **not** counted in `skipped_excluded`.
-- **Glob** — contains `/` or a glob metacharacter: e.g. `**/*.min.js`,
-  `**/*.stories.*`, `**/jest.setup.*`. **Matched against the file's path relative to
-  the scan root.** A matched *file* is skipped before reading and counted in
-  `skipped_excluded`.
+- **No `/`** (a literal filename, a directory name, or a *filename* glob) → matched
+  against each entry's **base name** during the walk:
+  - matches a **directory** name → **prune** that subtree (no recursion). Counts in
+    nothing — the tree is never read.
+  - matches a **file** name → **exclude** that file (skip before reading) and count
+    it in `skipped_excluded`.
+  - Wildcards are allowed (`*`, `?`, `[…]`); a literal like `jest.setup.js` is just a
+    glob with no wildcards. So `node_modules`, `target`, `__mocks__`, `jest.setup.js`,
+    `*.min.js`, and `*.stories.*` are **all** no-`/` entries.
+- **Contains `/`** (`src/vendor/**`, `**/*.stories.*`, `packages/*/generated/**`) →
+  glob matched against the file's **path relative to the scan root**, `/`-normalized.
+  Path globs are **file filters, not traversal prunes** — the walk still descends the
+  tree and skips matching *files*. To prune a whole subtree cheaply, use its **bare
+  directory name** (e.g. `vendor`, `dist`) as a no-`/` entry.
 
-Globs match the **path relative to the scan root** (so `**/` anchors anywhere
-beneath it). The classification is purely lexical (presence of metacharacters), so
-no behavior is hidden behind detection.
+This is why "mix single files and filename globs" just works: literal names and
+filename globs are both no-`/` basename entries, matched the same way. It also kills
+the footgun where `--exclude jest.setup.js` would otherwise be read as a directory
+name and silently skip nothing — a no-`/` entry matches *files* too.
 
 **Override semantics: replace (unchanged from today).** Passing `--exclude` replaces
 the entire default list. The defaults are printed in `--help` so an agent can copy
@@ -93,41 +105,60 @@ the "restate the whole list to add one entry" cost falls only on humans typing b
 hand, not on the agent that is the primary consumer.)
 
 **Implementation choice:** use the `globset` crate (BurntSushi / ripgrep — the
-gold-standard, actively-maintained glob engine) for the glob arm. It lives only in
-`fxrank-cli` (core stays parser- and dependency-free). Bare names bypass `globset`
-entirely (segment-equality during the walk, as today).
+gold-standard, actively-maintained glob engine). It lives only in `fxrank-cli` (core
+stays parser- and dependency-free). Build **two** `GlobSet`s from the entry list: one
+of no-`/` entries (matched against each base name) and one of `/`-bearing entries
+(matched against the `/`-normalized relative path).
 
-## Default exclude list (per-language, applied as a union)
+**`--exclude` applies to directory scans only.** A single explicit file
+(`fxrank scan a.min.js`) and stdin (`scan --lang ts -`) are **always honored** — an
+explicitly named target is never silently dropped by a default. Exclusion is a
+directory-walk concern; `run_scan`'s file and stdin branches do not consult
+`--exclude`. (Consequently there are no single-file/stdin exclusion test cases — it
+is a no-op there by design.)
 
-Globs are extension-scoped, so unioning every language's list is safe
-(`**/*.min.js` can never match a `.rs` file). The effective default is the union:
+## Default exclude list (per-language)
+
+The effective default is the union across languages. A no-`/` filename glob is
+matched on the base name, so `*.stories.*` *can* lexically match a hypothetical
+`foo.stories.rs`; this residual cross-language overlap is accepted (the names are JS
+conventions; collisions in real Rust trees are vanishingly rare and, for the
+directory entry `__mocks__`, harmless). The defaults are **all no-`/` entries**:
 
 - **Common (all languages):** `node_modules`, `.git`, `target`
-- **TS / JS ecosystem:** `**/*.min.js`, `**/*.stories.*`, `**/mockServiceWorker.js`,
-  `**/jest.setup.*`, `**/jest.config.*`, `__mocks__`
+- **TS / JS ecosystem:** `*.min.js`, `*.min.mjs`, `*.min.cjs`, `*.stories.*`,
+  `mockServiceWorker.js`, `jest.setup.*`, `jest.config.*`, `__mocks__`
 - **Rust ecosystem:** (none beyond common — `target` already covers it)
 
 This resolves:
 
-- **N1** (named bundles) via `**/*.min.js`. Unnamed bundles (`swagger-ui.js`) are
-  *not* auto-skipped — a documented, accepted limitation (minified code isn't a
-  target; add a manual `--exclude` entry if needed).
-- **N3** via `**/jest.setup.*`, `**/jest.config.*`, `__mocks__`.
-- **N4** via `**/*.stories.*` (covers `.stories.tsx`/`.ts`/`.jsx`/`.js`/`.mdx`).
-- **N5** via `**/mockServiceWorker.js` (the specific generated file; a broad
-  `public/` prune is *not* applied — `public/` hosts hand-written source too).
+- **N1** (named bundles) via `*.min.js` / `*.min.mjs` / `*.min.cjs` (the routed
+  JS-family minified extensions). Unnamed bundles (`swagger-ui.js`) are *not*
+  auto-skipped — a documented, accepted limitation (minified code isn't a target;
+  add a manual `--exclude` entry if needed).
+- **N3** via `jest.setup.*`, `jest.config.*`, and the `__mocks__` directory prune.
+- **N4** via `*.stories.*` (covers the routed `.stories.{ts,tsx,js,jsx,mjs,cjs}`;
+  `.stories.mdx` is already not a routed extension, so it never reaches the walk's
+  read step regardless).
+- **N5** via `mockServiceWorker.js` (the specific generated file; a broad `public/`
+  prune is *not* applied — `public/` hosts hand-written source too).
 
-`__mocks__` is a directory convention, so it is expressed as a **bare-name dir-prune**
-(consistent with `node_modules`); the rest are file globs.
+The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min.cjs,*.stories.*,mockServiceWorker.js,jest.setup.*,jest.config.*,__mocks__`.
 
 ## Behavior
 
-- **Default:** the union default list above is the active exclude set. Bare names
-  prune dirs (as today); file globs skip individual files.
-- **`scope.skipped_excluded`** counts files skipped by a **file glob** (e.g. a
-  `*.stories.tsx`, a `*.min.js`). Dir-pruned trees (`node_modules`, `__mocks__`) are
-  **not** counted — they may be arbitrarily large and were never read; counting them
-  would require descending into them, defeating the prune. Documented asymmetry.
+- **Default:** the union default list above is the active exclude set. No-`/` entries
+  prune matching directories and exclude matching files; `/`-globs exclude matching
+  files by path.
+- **`scope.skipped_excluded`** counts **files** skipped by any exclude entry (a
+  `*.stories.tsx`, a `*.min.js`, a `jest.setup.js`). **Directory prunes are not
+  counted** — a pruned tree (`node_modules`, `__mocks__`) may be arbitrarily large
+  and is never read; counting it would require descending into it, defeating the
+  prune. Documented asymmetry (same as today's `node_modules` handling).
+- **`scope.files`** continues to count files that were **read** (parsed set + read
+  errors). An excluded file never enters the collected `sources`, so it contributes
+  to **neither** `files` **nor** `read_errors` — it is reflected only in
+  `skipped_excluded`. A pruned directory's contents appear in none of the three.
 - **`--exclude <list>`** replaces the default entirely. To keep the defaults and add
   one entry, the caller restates the documented default list plus the new entry.
 - **`--include-tests`** is unchanged and orthogonal — it governs the test
@@ -136,24 +167,36 @@ This resolves:
 ## Architecture
 
 - **CLI (`fxrank-cli`).** The `--exclude` arg keeps its comma `value_delimiter` and a
-  `default_value` updated to the documented union list. In `run_scan`, build a matcher
-  from the entries: partition into a `HashSet<String>` of bare names (existing
-  fast-path) and a `globset::GlobSet` of glob entries (each compiled relative-path).
-  `walk_dir` gains the glob set; for each directory it still checks the bare-name set
-  (prune); for each routable **file** it additionally checks the glob set against the
-  path **relative to the scan root** and, on match, increments a
-  `skipped_excluded` tally instead of reading the file.
+  `default_value` updated to the documented union string. In `run_scan`, build the
+  matcher from the entries: partition into no-`/` entries and `/`-bearing entries,
+  compile each group into a `globset::GlobSet`. Empty entries (from `--exclude ''` or
+  a trailing comma) are **ignored** (inert) before compilation.
+- **Walk integration (`walk_dir`).** Thread the two glob sets and the scan-root
+  prefix through the walk:
+  - For each **directory** entry: match its **base name** against the no-`/` set →
+    on match, prune (skip recursion). This subsumes today's `HashSet` segment check.
+  - For each **routable file** (after `route_for_path` returns `Some` — see
+    invariant below): match its base name against the no-`/` set **or** its
+    `/`-normalized root-relative path against the `/`-set → on match, **do not read**
+    the file and increment a `skipped_excluded` tally instead of pushing to
+    `sources`.
+- **Exclusion runs after extension routing (invariant).** The glob check is applied
+  only to files `route_for_path` already accepts. Non-routable files are skipped
+  anyway, so excluding them is moot; placing the check after routing keeps "what
+  could be excluded" ⊆ "what would be read." An implementer must not move the check
+  before routing.
 - **Relative-path computation.** The walk currently carries absolute-ish
-  `entry.path()`s; thread the scan-root prefix so the glob is matched against the
-  path *relative to the root* (so `**/` behaves predictably regardless of where the
-  user invoked the tool). Bare-name dir matching stays on the segment file name and is
-  unaffected.
+  `entry.path()`s; thread the scan-root prefix so `/`-globs match the path *relative
+  to the root* (so `**/` behaves predictably regardless of the invoking cwd). The
+  relative path is `/`-normalized before matching (the one Windows seam; basename
+  matching needs no normalization — a file name carries no separator).
 - **Core (`fxrank-core`).** `Scope` gains `skipped_excluded: usize`, declared
-  **after `skipped_tests`** (serde emits in declaration order; see schema below). It
-  is purely a CLI-supplied count — no frontend or scoring change. `FrontendOutput`
-  is **not** modified (exclusion happens before any source reaches a frontend).
-- **No frontend changes.** Excluded files are never read, so neither
-  `RustFrontend` nor `TsFrontend` sees them; `is_test`/`is_test_file` are untouched.
+  **after `skipped_tests`** and before `risk_features` (serde emits in declaration
+  order; see schema below). It is purely a CLI-supplied count — no frontend or
+  scoring change. `FrontendOutput` is **not** modified (exclusion happens before any
+  source reaches a frontend).
+- **No frontend changes.** Excluded files are never read, so neither `RustFrontend`
+  nor `TsFrontend` sees them; `is_test`/`is_test_file` are untouched.
 
 ## Output schema change
 
@@ -163,25 +206,38 @@ This resolves:
 "scope": { "input": "src", "files": 40, "parsed": 40, "functions": 120, "skipped_tests": 8, "skipped_excluded": 12, "risk_features": [] }
 ```
 
-`files` continues to count files that were **read** (parsed set + read errors);
-glob-excluded files are reflected only in `skipped_excluded`, and dir-pruned trees in
-neither (never read, never counted) — same as today's `node_modules` handling.
-
 ## Error Handling
 
-No new failure modes. An invalid glob in `--exclude` is a **startup error**
-(`globset` compile failure) surfaced as the standard JSON `{ "error": ... }` object
-with a non-zero exit — fail fast, never silently ignore a malformed pattern. Bare
-names cannot fail to compile. The walk's existing read/permission diagnostics are
-unchanged.
+- **One new startup-validation failure mode:** an invalid glob in `--exclude` is a
+  `globset` compile error, surfaced as the standard JSON `{ "error": ... }` object
+  with a non-zero exit — fail fast, never silently ignore a malformed pattern. (This
+  refines spec 001's "no new failure modes" for the scan command.)
+- **Comma is the list delimiter, so an entry cannot contain a literal comma.** clap's
+  `value_delimiter = ','` splits on every comma, so brace alternation that contains a
+  comma (`*.{js,ts}`) is **not** expressible as one entry — it would split into
+  `*.{js` and `ts}` (both invalid globs → startup error). Use separate entries
+  (`*.js`, `*.ts`) instead. Brace groups without commas, and all other glob
+  metacharacters, are fine.
+- **Empty entries are inert.** `--exclude ''` or a trailing comma yields an empty
+  string, which is dropped before compilation (matches nothing, prunes nothing).
+- The walk's existing read/permission diagnostics are unchanged.
 
 ## Testing Strategy
 
-- **Bare-name back-compat:** `--exclude node_modules,.git,target` prunes those dirs
+- **Dir-name back-compat:** `--exclude node_modules,.git,target` prunes those dirs
   exactly as today; no file under them is read; `skipped_excluded == 0`.
-- **File glob:** a tree with `a.ts`, `a.min.js`, `b.stories.tsx`, `mockServiceWorker.js`
-  → with defaults, only `a.ts` is scored; `skipped_excluded == 3`.
-- **Replace semantics:** `--exclude '**/*.foo'` makes `a.min.js`/`b.stories.tsx`
+- **Literal filename (the resolved footgun):** `--exclude jest.setup.js` on a tree
+  containing `src/jest.setup.js` excludes that file (basename match) and counts it —
+  it is **not** treated as a directory name.
+- **Filename glob:** a tree with `a.ts`, `a.min.js`, `b.stories.tsx`,
+  `mockServiceWorker.js` → with defaults, only `a.ts` is scored; `skipped_excluded ==
+  3`.
+- **Mixed entries:** `--exclude '*.min.js,vendor.js,src/legacy/**'` skips by glob,
+  literal name, and full-path glob in one run.
+- **Full-path glob is a file filter, not a prune:** `--exclude 'src/legacy/**'`
+  skips routable files under `src/legacy/` (counted in `skipped_excluded`) while the
+  walk still descends it; a bare `legacy` instead prunes the subtree (uncounted).
+- **Replace semantics:** `--exclude '*.foo'` makes `a.min.js`/`b.stories.tsx`
   reappear in the scored set (defaults dropped) — proves replace, not additive.
 - **Relative-path anchoring:** `**/*.stories.*` matches `pkg/ui/x.stories.tsx`
   regardless of the directory passed to `scan`.
@@ -189,9 +245,15 @@ unchanged.
   counted in `skipped_excluded` (dir-prune asymmetry).
 - **jest support files:** `jest.setup.js`, `jest.config.ts` skipped by default and
   counted in `skipped_excluded`.
+- **`files` accounting:** excluded files contribute to neither `files` nor
+  `read_errors`; `files == parsed` when every excluded file is well-formed.
 - **Invalid glob:** `--exclude '['` exits non-zero with a JSON `error`.
+- **Empty entry:** `--exclude ''` (and a trailing comma) is inert — equivalent to no
+  excludes for that slot.
 - **`--include-tests` orthogonality:** a `*.stories.tsx` stays excluded even with
   `--include-tests` (exclude is not the test mechanism).
+- **Single-file / stdin no-op:** `fxrank scan a.min.js` and `scan --lang ts -` ignore
+  `--exclude` (explicit target honored) — asserted as a no-op, not as exclusion.
 - **Dogfood regression:** `scan crates/` output is unchanged (our tree has no
   `*.min.js`/stories/jest files; `target` already pruned).
 
@@ -209,15 +271,18 @@ unchanged.
 | Decision | Choice | Rationale |
 | --- | --- | --- |
 | Stance | Skip noise by default, opt-out via `--exclude` | Out-of-box reports are usable; an agent shouldn't sift vendored/story/setup noise. |
-| Matcher | Bare-name (prune dir) + path-glob (skip file), classified lexically | Preserves today's behavior; adds file patterns with no hidden detection. |
-| Glob engine | `globset` (ripgrep), CLI-only | Gold-standard, maintained; core stays parser/dep-free. |
+| Matcher classification | Split on `/`: no-`/` → base-name match (file exclude or dir prune); `/` → full-path glob (file filter) | Lets users mix literal filenames and filename globs freely; removes the "bare filename silently prunes a dir" footgun. |
+| Glob engine | `globset` (ripgrep), CLI-only, two `GlobSet`s | Gold-standard, maintained; core stays parser/dep-free. |
 | Override | Replace (unchanged); defaults in `--help` | The restate cost falls on humans, not the agent consumer; simplest model. |
 | N3 test-support placement | `--exclude` default list, not test-skip | They are JS-ecosystem *files*, not the test *mechanism*; keeps `--include-tests` clean. |
-| Minified detector | Patterns only, no density heuristic | Zero magic, zero false-skip; minified code isn't a target. |
+| Minified detector | Patterns only, no density heuristic; cover `.min.{js,mjs,cjs}` | Zero magic, zero false-skip; minified code isn't a target. |
 | N2 ID collision | Deferred | Only occurs in minified files we now skip; tool targets unminified source. |
 | Config file | Deferred | Agent regenerates the command per run; persistence is a human nicety for later. |
 | `public/` / `fixtures/` / `*.config.*` blanket | Omitted | Host hand-written source too often — false-skip risk. Target the specific generated file (`mockServiceWorker.js`) instead. |
-| Transparency | `scope.skipped_excluded` (file globs only) | Never a silent drop; dir-prunes uncounted because never read (matches `node_modules`). |
+| Directory pruning via globs | Not added; use bare dir names | Bare names already prune (`vendor`, `dist`); `/`-globs are file filters. YAGNI on deep-pattern prunes. |
+| `--exclude` on single-file/stdin | No-op; explicit target always honored | A named target should never be silently dropped by a default. |
+| Windows `\` paths | `/`-normalize the relative path for `/`-globs; Windows untested | macOS-first side project; one well-defined seam without claiming support. |
+| Transparency | `scope.skipped_excluded` (files only) | Never a silent drop; dir-prunes uncounted because never read (matches `node_modules`). |
 
 ## Open Questions
 
