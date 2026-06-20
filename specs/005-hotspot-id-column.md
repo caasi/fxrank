@@ -83,17 +83,33 @@ same-line arrows apart, not only their ids.
 ## Column semantics
 
 - **1-based.** Matches the existing 1-based `line` and the issue's implied `C55`
-  notation. (Both parsers expose column 0-based; the frontends add 1.)
+  notation. Both parsers expose the column **0-based**; the frontends add 1.
 - **Character column** — counts Unicode scalar values, **not** bytes, **not**
   UTF-16 code units, **not** display width. Tabs and wide characters therefore do
   not shift the column. This is the stable, parser-native coordinate:
-  - TS/swc: `SourceMap::lookup_char_pos(pos).col` (a 0-based `CharPos`).
-  - Rust/proc-macro2: `span.start().column` (0-based, character-based).
-- **Anchor consistency.** `col` is taken from the *same* span whose `.lo` / start
-  produced `line`, so `(line, col)` is one real source position:
-  - Rust: `…ident.span()` for fns/methods/trait-default methods (as today for line).
-  - TS: the identifier span for `fn_decl`; the function/arrow span for the anonymous
-    and expression cases — i.e. whichever span the current `line` already uses.
+  - **TS/swc:** `cm.lookup_char_pos(pos).col` is a `CharPos` newtype, not a bare
+    integer — unwrap it before adding 1. The 1-based char column is
+    `cm.lookup_char_pos(pos).col.to_usize() + 1` (equivalently `.col.0 + 1`, since
+    `CharPos` is a public tuple struct). `col_display` is the *display-width*
+    variant and is deliberately **not** used.
+  - **Rust/proc-macro2:** `span.start().column + 1` — `LineColumn.column` is a bare
+    0-based, character-based `usize`. (Requires the `span-locations` feature,
+    already set in `fxrank-lang-rust/Cargo.toml` and load-bearing for non-zero
+    line/col.)
+- **Anchor consistency (the load-bearing invariant).** `col` MUST be taken from the
+  **exact same `span` / `BytePos` already passed to the line lookup** at each
+  collection site — never a second, different span. `(line, col)` is one real source
+  position only if both coordinates share an anchor. Concretely: do not anchor `line`
+  to a function/property span while anchoring `col` to the method *key* span. The
+  TS frontend derives `line` from several different anchors depending on the function
+  kind (identifier span for `fn_decl`; the `Function`/arrow span `f.span`/`node.span`
+  for fn-exprs, arrows, class methods, private methods, and method-props; the whole
+  *property* span `node.span` for getters/setters; `c.span` for constructors), and
+  the Rust frontend uses `…ident.span()` for fns/methods/trait-default methods. The
+  rule is anchor-agnostic: whatever span feeds `line` at a site, the same span feeds
+  `col` at that site. Implementation note: prefer a combined
+  `SpanLines::line_col(span) -> (usize, usize)` (parallel to today's `line`/`line_of`
+  in `source.rs`) so each site does **one** `lookup_char_pos`, not two.
 
 ## Behavior
 
@@ -107,7 +123,9 @@ same-line arrows apart, not only their ids.
 
 - **`<computed>`-keyed methods** sharing a line (`[a]() {} [b]() {}`) — which today
   also collide on the `<computed>` fallback — are disambiguated by the new `col`
-  field for free.
+  field, **provided** the method sites obey the anchor-consistency rule above (their
+  `col` comes from the same `f.span` that feeds `line`); it is "free" only as a
+  consequence of that rule, not independently of it.
 - **Named functions/methods** (both frontends) keep their `symbol` unchanged; their
   `id` gains the `col` field (e.g. `src/user.rs:42:1:save_user`,
   `src/store.rs:10:5:Store::set_name`).
@@ -134,6 +152,10 @@ that `col` is the 1-based character column of the line anchor, and that
   (`col` unaffected by tab display width).
 - Anonymous symbols render as `<arrow@L{line}C{col}>` / `<fn@L{line}C{col}>`; named
   symbols are unchanged.
+- The inline `FnUnit.id` doc comments in **both** frontends (currently
+  "Collision-resistant id: `path:line:symbol`" in `fxrank-lang-ts/src/functions.rs`
+  and `fxrank-lang-rust/src/functions.rs`) are updated to the `path:line:col:symbol`
+  format, so the code's own documentation matches the wire format.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -D warnings`,
   and `cargo fmt --check` all pass; insta snapshots are regenerated to include the
   `col` field.
