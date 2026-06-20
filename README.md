@@ -2,9 +2,10 @@
 
 **An effect-cost profiler for coding agents.**
 
-`fxrank scan <path>` analyzes Rust source and emits compact JSON ranking each function by
-its **effect cost** — how much IO, mutation, panic, and risk it carries in its own body —
-so an agent (or a human) can find the hotspots worth refactoring toward a purer core.
+`fxrank scan <path>` analyzes Rust and TypeScript/JavaScript source and emits compact JSON
+ranking each function by its **effect cost** — how much IO, mutation, panic, and risk it
+carries in its own body — so an agent (or a human) can find the hotspots worth refactoring
+toward a purer core.
 
 FxRank is a *measuring instrument*, not a linter. It reports facts — effect kind, severity
 class, why a discount applied, the evidence, a confidence, and risk flags — and
@@ -13,7 +14,7 @@ deliberately offers **no refactoring advice**. The decision is yours.
 ## Why it's not just a purity checker
 
 A binary "pure vs impure" label is too coarse to refactor against. FxRank gives a
-**gradient**, and it understands that Rust's type system makes some effects safer than
+**gradient**, and it understands that a language's type system makes some effects safer than
 others:
 
 - A **declared `&mut`** mutation is visible and bounded at the call site, so it is
@@ -22,11 +23,32 @@ others:
   `Mutex`, atomics) is **hidden** from the signature, so it scores *higher*.
 
 So FxRank **inverts** a naïve checker: the honest `&mut self` mutation ranks *below* the
-sneaky `&self` + `borrow_mut()` one. That anti-Goodhart inversion is the whole thesis.
+sneaky `&self` + `borrow_mut()` one. That anti-Goodhart inversion is the whole thesis. The
+TS/JS frontend applies an analogous **boundary discount** driven by how much of a
+function's signature is typed — an `any` at the boundary poisons it.
 
-## Install / build
+## Install
 
-Requires a stable Rust toolchain (edition 2024, Rust ≥ 1.85).
+Requires a stable Rust toolchain (edition 2024, Rust ≥ 1.85). If you don't have one,
+install it with [rustup](https://rustup.rs).
+
+**Install the binary** (recommended — puts `fxrank` on your `PATH` at `~/.cargo/bin`):
+
+```bash
+cargo install --git https://github.com/caasi/fxrank fxrank
+```
+
+Re-run the same command to update; `cargo uninstall fxrank` removes it.
+
+By default the binary ships **both** frontends (Rust + TS/JS). For a slimmer build, install
+just one:
+
+```bash
+cargo install --git https://github.com/caasi/fxrank fxrank --no-default-features --features rust  # Rust only
+cargo install --git https://github.com/caasi/fxrank fxrank --no-default-features --features ts    # TS/JS only
+```
+
+**Or build from a clone** (for development):
 
 ```bash
 git clone https://github.com/caasi/fxrank
@@ -37,11 +59,22 @@ cargo build --release        # binary at target/release/fxrank
 ## Usage
 
 ```bash
-fxrank scan src/                 # scan a directory (recurses *.rs, symlink-safe)
-fxrank scan src/lib.rs           # scan one file
-cat foo.rs | fxrank scan         # read from stdin
+fxrank scan src/                 # scan a directory (recurses by extension, symlink-safe)
+fxrank scan src/lib.rs           # scan one Rust file
+fxrank scan app/                 # .rs → Rust; .ts/.tsx/.js/.jsx → TS/JS frontend
 fxrank scan src/ --limit 20      # keep only the top-20 hotspots
+cat foo.rs | fxrank scan         # read Rust from stdin
+cat foo.ts | fxrank scan --lang ts   # read TS/JS from stdin (--lang: ts, tsx, js, jsx)
 ```
+
+The frontend is chosen by **file extension** for paths; `--lang` selects it for stdin.
+Other flags:
+
+- `--include-tests` — test code is **excluded by default** (`#[test]`/`#[bench]` and
+  `#[cfg(test)]` modules for Rust; `*.test.*` / `*.spec.*` / `__tests__` paths for TS/JS).
+  Pass this to score tests too.
+- `--exclude a,b,c` — directory **names** to skip when scanning a directory
+  (default: `node_modules,.git,target`).
 
 Output is **compact JSON on stdout** (built for agents — pipe through `jq` to read it):
 
@@ -91,14 +124,15 @@ The full spec lives in [`specs/001-fxrank-rust-effect-scanner.md`](specs/001-fxr
 
 ## Status & roadmap
 
-**Milestone A (this release):** a Rust-only, primarily-syntactic analyzer — effect & risk
-detection, the containment discount, the hidden-mutation inversion, async/confidence
-metadata, diagnostics, and the `fxrank scan` CLI.
+**Milestone A:** a primarily-syntactic analyzer — effect & risk detection, the containment
+discount, the hidden-mutation inversion, async/confidence metadata, diagnostics, and the
+`fxrank scan` CLI. Ships **two frontends**: Rust (`syn`) and TypeScript/JavaScript (`swc`),
+each syntactic (no type-checker or borrow-checker).
 
 Known limitations (accepted for Milestone A): own-score only (no call-graph propagation, so
 extract-method can launder a score); type-dependent signals are heuristic; macro-generated
-effects are invisible to `syn`; scanning `src/` includes inline `#[cfg(test)]` modules
-(filter test functions when hunting smells).
+effects are invisible to `syn`. Test code is skipped by default, but a bare top-level
+`#[cfg(test)] fn` (a helper outside a `#[cfg(test)] mod`) is not yet detected as test.
 
-**Next:** call-graph propagation (`inherited_score`), a JavaScript/TypeScript frontend, and
-a `lower-effect-score` agent skill (the "lab protocol" for using FxRank safely).
+**Next:** call-graph propagation (`inherited_score`) and a `lower-effect-score` agent skill
+(the "lab protocol" for using FxRank safely).

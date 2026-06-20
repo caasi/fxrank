@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project
 
 **FxRank** is an *effect-cost profiler for coding agents*. `fxrank scan <path>` analyzes
-Rust source and emits compact JSON ranking each function by its **own-body effect cost**
+Rust and TypeScript/JavaScript source and emits compact JSON ranking each function by its **own-body effect cost**
 (IO, mutation, panic, risk, …), so an agent can find hotspots and refactor toward purer
 cores. It is a *measuring instrument* — it reports facts (effect kind, severity class,
 discount rationale, evidence, confidence, risk), and deliberately gives **no refactoring
@@ -16,8 +16,9 @@ The differentiator from a naïve purity checker is the **containment discount**:
 *lower*; conversely `&self` + interior mutability is *hidden* and scores *higher* than an
 honest `&mut self`. Validated end-to-end (and by dogfooding — see below).
 
-Milestone A is Rust-only and **primarily syntactic** (`syn`, no borrow-checker / type
-inference); type-dependent signals are heuristic and carry a confidence penalty.
+Milestone A ships two frontends — Rust (`syn`) and TS/JS (`swc`) — both **primarily
+syntactic** (no borrow-checker / type inference); type-dependent signals are heuristic and
+carry a confidence penalty.
 
 ## Workspace layout
 
@@ -51,8 +52,10 @@ cargo build -p fxrank --no-default-features --features rust  # slim Rust-only bu
 cargo build -p fxrank --no-default-features --features ts    # slim TS-only build
 cargo run -p fxrank -- scan <path>                       # run the tool
 cargo run -p fxrank -- scan crates/ | jq                 # dogfood on our own source
+cargo run -p fxrank -- scan crates/ --include-tests      # score test code too (skipped by default)
 echo 'function f(): void {}' | cargo run -p fxrank -- scan --lang ts -  # scan a TS fragment from stdin
 cargo insta review                                       # accept snapshot test changes (insta)
+cargo install --git https://github.com/caasi/fxrank fxrank  # field-install the binary to ~/.cargo/bin
 ```
 
 CI (`.github/workflows/ci.yml`) gates `fmt --check`, `clippy --workspace --all-targets -D
@@ -104,11 +107,12 @@ CLI → core::Report::build(scope, hotspots, diagnostics, limit)  → compact JS
 
 The tool correctly surfaces genuine production hotspots (`run_scan`, `walk_dir` — the IO
 boundaries) with accurate evidence, and the discount correctly keeps the pervasive
-`&mut self` visitor accumulation *low* (no false alarms). **But scanning `src/` also scans
-inline `#[cfg(test)]` modules, where `assert!`/`assert_eq!` register as `panic` effects and
-dominate raw rankings.** When using the tool to find smells, filter test functions (e.g.
-drop hotspots whose only effect kind is `panic`), or scan non-test code. Skipping
-`#[cfg(test)]` is a Milestone-B candidate.
+`&mut self` visitor accumulation *low* (no false alarms). Test code is now **skipped by
+default** (`#[test]`/`#[bench]` functions and `#[cfg(test)]` modules; pass `--include-tests`
+to score it), so the old "`assert!`/`assert_eq!` register as `panic` and dominate raw
+rankings" noise is gone for normal scans. One gap remains: a bare top-level
+`#[cfg(test)] fn` (a helper *outside* a `#[cfg(test)] mod`) is still collected as a normal
+function — see the TS dogfooding caveat below.
 
 ## Dogfooding the TS frontend (running `fxrank scan crates/fxrank-lang-ts/src/`)
 
