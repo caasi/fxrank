@@ -90,6 +90,41 @@ with "no matching package" beforehand; they are verified by publishing in depend
 order. Publishes are **permanent** — a bad version can only be `cargo yank`ed, never
 deleted.
 
+The full release flow as an Arrow DSL pipeline (validate with `ocaml-compose-dsl`; see
+the `compose` skill) — preflight gates, ordered publish, verify, then tag/release:
+
+```arrow
+-- Publish fxrank to crates.io. Run from repo root on `main`, in sync with origin.
+-- The four crates publish in dependency order: core has no internal deps; the two
+-- language frontends depend on core; the fxrank binary depends on all three.
+
+let preflight =
+  (on_branch(name: main) &&& in_sync(with: "origin/main") &&& tree_clean)   -- ref: git rev-parse / status
+    >>> gate(require: [pass, pass, pass])                                    -- abort if any fails
+in
+let dry_run =
+  publish(crate: "fxrank-core", mode: dry_run)?                             -- ref: cargo publish -p fxrank-core --dry-run
+    >>> (ok ||| abort(reason: "core dry-run failed"))
+in
+let publish_all =
+  publish(crate: "fxrank-core")                                             -- ref: cargo publish -p fxrank-core
+    >>> publish(crate: "fxrank-lang-rust")                                  -- waits for index between each
+    >>> publish(crate: "fxrank-lang-ts")
+    >>> publish(crate: "fxrank")                                            -- the binary; depends on the three above
+in
+let verify =
+  install(crate: "fxrank")?                                                 -- ref: cargo install fxrank && fxrank scan --help
+    >>> (ok ||| abort(reason: "install verify failed"))
+in
+preflight
+  >>> login(registry: crates_io)                                            -- ref: cargo login <token> (interactive)
+  >>> dry_run
+  >>> publish_all
+  >>> verify
+  >>> tag(version: "v0.1.0")                                                -- ref: git tag vX.Y.Z && git push origin vX.Y.Z
+  >>> release(version: "v0.1.0")                                            -- ref: gh release create --generate-notes
+```
+
 ## Architecture: how a scan flows
 
 ```
