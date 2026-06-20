@@ -127,6 +127,38 @@ Output is **compact JSON on stdout** (built for agents — pipe through `jq` to 
 for mixing stdin/file IO with diagnostic accumulation — a real "extract the pure
 report-building from the IO boundary" candidate.)*
 
+## Using it well (the lab protocol)
+
+FxRank is a precision instrument, not a crawler — **don't point it at a whole repo
+blindly.** It only makes sense on hand-written, unminified source; the scores are
+**meaningless on minified, generated, or vendored code**. The reliable way to use it:
+
+0. **Discover first.** Map the repo before measuring: find the hand-written source, and
+   identify what's *not* it — vendored / `third_party`, build output (`dist`, `build`),
+   generated files, minified bundles, test scaffolding. That map decides what to scan.
+1. **Scan the source.** Point FxRank at the real source dirs (or scan from the root and
+   let `--exclude` drop the noise). **Never aim it at minified or generated code** — a
+   minified file named directly is still scanned (`--exclude` is a no-op for an explicit
+   file), and its scores are garbage.
+2. **Verify, don't trust.** Open the top hotspots and confirm them against the source —
+   true *and* false positives. The JSON is a measurement, not a verdict.
+3. **Separate noise from signal.** Vendored / minified / test-scaffold / stories aren't
+   refactor targets. The defaults skip the common ones; anything that slips through (e.g.
+   an unnamed bundle like `swagger-ui.js`) you catch here.
+4. **Re-run with excludes for a clean list.** `--exclude` **replaces** the default list,
+   so restate the defaults and append the repo's own noise. Use literal directory names
+   for cheap prunes (`dist`, `build`, `third_party`) and literal filenames or globs for
+   files (`swagger-ui.js`, `*.generated.ts`):
+
+   ```bash
+   fxrank scan . --exclude 'node_modules,.git,target,*.min.js,*.min.mjs,*.min.cjs,*.stories.*,mockServiceWorker.js,jest.setup.*,jest.config.*,__mocks__,dist,build,third_party,swagger-ui.js'
+   ```
+
+   If the cleaned top results still include generated, vendored, or minified paths, update
+   the exclude list and rerun before choosing refactor targets.
+5. **Pick refactor targets.** Use the clean ranking to choose what's worth refactoring
+   toward a purer core.
+
 ## The scoring model, briefly
 
 - **Severity class `0..=8`** rates the *kind* of effect (`0` pure … `7` net/fs/db …), each
