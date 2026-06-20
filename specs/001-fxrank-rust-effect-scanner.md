@@ -249,10 +249,13 @@ The scored unit is, precisely:
 - **Macro-generated items are invisible** (`syn` sees unexpanded macro
   invocations); a known limitation, not silently treated as pure.
 
-`id` is `path:line:symbol`. `symbol` includes the `impl` type where available
-(`User::new`), and for **trait-impl** methods the trait path too
+`id` is `path:line:col:symbol`, where `col` is the 1-based character column of the
+function's name anchor (see spec 005). `symbol` includes the `impl` type where
+available (`User::new`), and for **trait-impl** methods the trait path too
 (`<User as Display>::fmt`), so two trait impls of the same method on one type do not
-collide. `line` is the final tiebreak, making ids collision-resistant.
+collide. `(line, col)` — not `line` alone — is what guarantees per-file uniqueness:
+two anonymous functions can share a line, so `line` by itself is *not* a sufficient
+tiebreak (the bug spec 005 fixes); their distinct start columns break the tie.
 
 ## Occurrence Counting
 
@@ -522,7 +525,7 @@ correctness:
 | Risk in ranking | Each risk feature carries a severity class; `risk_class` feeds `max_class` | Otherwise a risk-only function (`mem::forget`) ranks as class 0 — cheap — contradicting intent. |
 | Aggregation | `own_score = max_weight + 0.5·Σrest`; rank by `(max_class, own_score, risk_weight, confidence)`, ordered via scaled integers | Per-effect convexity is re-linearized by summation; ranking on `max_class` first guarantees one real boundary effect outranks effect-soup; integer keys avoid `f64: Ord`. |
 | Detectability | Three tiers (`exact` / `path` / `heuristic`), heuristic ⇒ confidence penalty | Reconciles "no type resolution" with a catalog that needs some type facts; keeps the tool honest and confidence meaningful. |
-| Function unit | Free fns + inherent/trait-impl methods + trait default bodies; closures roll up; trait sigs / `extern` decls excluded; `id = path:line:symbol` | Defines the output unit unambiguously and avoids id collisions across `impl` blocks. |
+| Function unit | Free fns + inherent/trait-impl methods + trait default bodies; closures roll up; trait sigs / `extern` decls excluded; `id = path:line:col:symbol` (col per spec 005) | Defines the output unit unambiguously and avoids id collisions across `impl` blocks. |
 | Constructor vs effect | Score the effectful terminal call (`Command::spawn`), not the builder (`Command::new`) | Counting constructors creates false positives and rewards hiding the real effect downstream. |
 | `Result` | Not an effect | Fallibility-as-value (ADT); only runtime-aborting constructs are `panic`. |
 | Hidden mutation | Interior mutation through *any* shared `&` ref scored above `&mut self`, flagged | Anti-Goodhart: prevents laundering mutation into a signature-pure-looking method or shared parameter. |
