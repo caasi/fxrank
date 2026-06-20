@@ -35,17 +35,23 @@ install it with [rustup](https://rustup.rs).
 **Install the binary** (recommended — puts `fxrank` on your `PATH` at `~/.cargo/bin`):
 
 ```bash
-cargo install --git https://github.com/caasi/fxrank fxrank
+cargo install fxrank
 ```
 
-Re-run the same command to update; `cargo uninstall fxrank` removes it.
+Re-run with `cargo install fxrank --force` to update; `cargo uninstall fxrank` removes it.
 
 By default the binary ships **both** frontends (Rust + TS/JS). For a slimmer build, install
 just one:
 
 ```bash
-cargo install --git https://github.com/caasi/fxrank fxrank --no-default-features --features rust  # Rust only
-cargo install --git https://github.com/caasi/fxrank fxrank --no-default-features --features ts    # TS/JS only
+cargo install fxrank --no-default-features --features rust  # Rust only
+cargo install fxrank --no-default-features --features ts    # TS/JS only
+```
+
+To install the latest unreleased version straight from git:
+
+```bash
+cargo install --git https://github.com/caasi/fxrank fxrank
 ```
 
 **Or build from a clone** (for development):
