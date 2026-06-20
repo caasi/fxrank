@@ -21,7 +21,7 @@ use syn::{ImplItem, Item, ItemImpl, ItemTrait, TraitItem};
 pub struct FnUnit {
     /// Display symbol: `free_fn`, `S::method`, `<S as T>::method`, `T::defaulted`.
     pub symbol: String,
-    /// Collision-resistant id: `path:line:symbol`.
+    /// Collision-resistant id: `path:line:col:symbol` (col is the 1-based char column).
     pub id: String,
     /// Source file path (as passed in).
     pub path: String,
@@ -74,10 +74,12 @@ fn collect_items(items: &[Item], path: &str, in_cfg_test: bool, out: &mut Vec<Fn
         match item {
             Item::Fn(f) => {
                 let symbol = f.sig.ident.to_string();
-                let line = f.sig.ident.span().start().line;
+                let start = f.sig.ident.span().start();
+                let line = start.line;
+                let col = start.column + 1; // proc-macro2 column is 0-based
                 let is_test = in_cfg_test || has_test_attr(&f.attrs);
                 out.push(FnUnit {
-                    id: format!("{path}:{line}:{symbol}"),
+                    id: format!("{path}:{line}:{col}:{symbol}"),
                     symbol,
                     path: path.to_string(),
                     line,
@@ -121,7 +123,9 @@ fn collect_from_impl(impl_block: &ItemImpl, path: &str, in_cfg_test: bool, out: 
     for item in &impl_block.items {
         if let ImplItem::Fn(method) = item {
             let method_name = method.sig.ident.to_string();
-            let line = method.sig.ident.span().start().line;
+            let start = method.sig.ident.span().start();
+            let line = start.line;
+            let col = start.column + 1; // proc-macro2 column is 0-based
 
             let symbol = match &trait_name {
                 Some(tr) => format!("<{type_name} as {tr}>::{method_name}"),
@@ -130,7 +134,7 @@ fn collect_from_impl(impl_block: &ItemImpl, path: &str, in_cfg_test: bool, out: 
 
             let is_test = in_cfg_test || has_test_attr(&method.attrs);
             out.push(FnUnit {
-                id: format!("{path}:{line}:{symbol}"),
+                id: format!("{path}:{line}:{col}:{symbol}"),
                 symbol,
                 path: path.to_string(),
                 line,
@@ -155,12 +159,14 @@ fn collect_from_trait(
             // Only emit a unit when there is a default body.
             if let Some(block) = &method.default {
                 let method_name = method.sig.ident.to_string();
-                let line = method.sig.ident.span().start().line;
+                let start = method.sig.ident.span().start();
+                let line = start.line;
+                let col = start.column + 1; // proc-macro2 column is 0-based
                 let symbol = format!("{trait_name}::{method_name}");
 
                 let is_test = in_cfg_test || has_test_attr(&method.attrs);
                 out.push(FnUnit {
-                    id: format!("{path}:{line}:{symbol}"),
+                    id: format!("{path}:{line}:{col}:{symbol}"),
                     symbol,
                     path: path.to_string(),
                     line,
