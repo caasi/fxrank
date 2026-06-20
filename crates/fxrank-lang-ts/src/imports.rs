@@ -13,7 +13,10 @@
 
 use std::collections::HashMap;
 
-use swc_ecma_ast::{Callee, Decl, Expr, Lit, Module, ModuleDecl, ModuleItem, Pat, Stmt, VarDecl};
+use swc_ecma_ast::{
+    CallExpr, Callee, Decl, Expr, ExprStmt, Lit, Module, ModuleDecl, ModuleItem, Pat, Stmt, VarDecl,
+};
+use swc_ecma_visit::{Visit, VisitWith};
 
 /// Mapping from local names to their module source strings, built from the
 /// `import` declarations and top-level `const x = require(...)` calls in a
@@ -50,7 +53,24 @@ impl ImportTable {
                 ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) => {
                     table.scan_var_decl(var);
                 }
+                ModuleItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) => {
+                    // Top-level expression statement: check for a bare `import(...)`
+                    // call or an `await import(...)` — both indicate a dynamic import
+                    // that is not captured by the static import table.
+                    table.check_expr_for_dynamic_import(expr);
+                }
                 _ => {}
+            }
+        }
+
+        // Walk the full module for any `import(...)` nested inside function
+        // bodies (e.g. `const f = async () => { await import(name); }`).
+        // This catches cases the top-level scan above cannot reach.
+        if !table.has_dynamic {
+            let mut walker = DynamicImportWalker { found: false };
+            module.visit_with(&mut walker);
+            if walker.found {
+                table.has_dynamic = true;
             }
         }
 
@@ -109,7 +129,7 @@ impl ImportTable {
 
     /// Check whether a `CallExpr` with `callee: Callee::Import` has a
     /// non-literal argument; if so, mark this table as having a dynamic import.
-    fn check_dynamic_import(&mut self, call: &swc_ecma_ast::CallExpr) {
+    fn check_dynamic_import(&mut self, call: &CallExpr) {
         if !matches!(&call.callee, Callee::Import(_)) {
             return;
         }
@@ -119,6 +139,25 @@ impl ImportTable {
         };
         if !matches!(arg.expr.as_ref(), Expr::Lit(Lit::Str(_))) {
             self.has_dynamic = true;
+        }
+    }
+
+    /// Check a top-level expression for a bare or awaited `import(...)` call.
+    ///
+    /// Handles: `import('x')` and `await import('x')` as expression statements.
+    /// Any `import(...)` — literal or not — signals an unbound dynamic load
+    /// (fire-and-forget), so `has_dynamic` is set to `true` regardless of the
+    /// argument type.
+    fn check_expr_for_dynamic_import(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Call(call) if matches!(&call.callee, Callee::Import(_)) => {
+                self.has_dynamic = true;
+            }
+            Expr::Await(await_expr) => {
+                // `await import(...)` — unwrap the await and check the inner expr.
+                self.check_expr_for_dynamic_import(&await_expr.arg);
+            }
+            _ => {}
         }
     }
 
@@ -140,34 +179,51 @@ impl ImportTable {
     }
 }
 
-/// Parse `src` as a TypeScript module and build an `ImportTable`.
-///
-/// This is a test-only convenience: it owns the swc parse plumbing and returns
-/// the table. Production callers will use `from_module` with an already-parsed
-/// `Module`.
-#[cfg(test)]
-fn table(src: &str) -> ImportTable {
-    use swc_common::{FileName, SourceMap, sync::Lrc};
-    use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
+/// Visitor that sets `found = true` the moment it encounters any `import(...)`
+/// call expression, regardless of nesting depth (function bodies, arrow
+/// functions, method bodies, await expressions, etc.).
+struct DynamicImportWalker {
+    found: bool,
+}
 
-    use crate::source::Lang;
-
-    let cm: Lrc<SourceMap> = Default::default();
-    let fm = cm.new_source_file(FileName::Custom("t.ts".into()).into(), src.to_string());
-    let lexer = Lexer::new(
-        Lang::Ts.syntax(),
-        Default::default(),
-        StringInput::from(&*fm),
-        None,
-    );
-    let mut parser = Parser::new_from(lexer);
-    let module = parser.parse_module().expect("parse failed");
-    ImportTable::from_module(&module)
+impl Visit for DynamicImportWalker {
+    fn visit_call_expr(&mut self, node: &CallExpr) {
+        if matches!(&node.callee, Callee::Import(_)) {
+            self.found = true;
+            // No need to recurse further — we already found one.
+            return;
+        }
+        // Continue walking children for other call expressions.
+        node.visit_children_with(self);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse `src` as a TypeScript module and build an `ImportTable`.
+    ///
+    /// Test-only convenience: owns the swc parse plumbing and returns the table.
+    /// Production callers use `from_module` with an already-parsed `Module`.
+    fn table(src: &str) -> ImportTable {
+        use swc_common::{FileName, SourceMap, sync::Lrc};
+        use swc_ecma_parser::{Parser, StringInput, lexer::Lexer};
+
+        use crate::source::Lang;
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let fm = cm.new_source_file(FileName::Custom("t.ts".into()).into(), src.to_string());
+        let lexer = Lexer::new(
+            Lang::Ts.syntax(),
+            Default::default(),
+            StringInput::from(&*fm),
+            None,
+        );
+        let mut parser = Parser::new_from(lexer);
+        let module = parser.parse_module().expect("parse failed");
+        ImportTable::from_module(&module)
+    }
 
     #[test]
     fn resolves_named_default_namespace() {
@@ -209,5 +265,49 @@ mod tests {
         let t = table("import { readFile as rf } from 'node:fs';");
         assert_eq!(t.resolve("rf"), Some("node:fs"));
         assert_eq!(t.resolve("readFile"), None);
+    }
+
+    // ── FIX 2: bare / awaited expression-statement dynamic import() ──
+
+    #[test]
+    fn bare_dynamic_import_expression_stmt_sets_has_dynamic() {
+        // `import('x');` as a top-level expression statement (fire-and-forget).
+        let t = table("import('x');");
+        assert!(
+            t.has_dynamic(),
+            "bare import('x'); expression statement should set has_dynamic"
+        );
+    }
+
+    #[test]
+    fn dynamic_import_non_literal_expression_stmt_sets_has_dynamic() {
+        // `import(name);` — non-literal argument as expression statement.
+        let t = table("import(name);");
+        assert!(
+            t.has_dynamic(),
+            "import(name); expression statement should set has_dynamic"
+        );
+    }
+
+    #[test]
+    fn awaited_dynamic_import_in_async_fn_sets_has_dynamic() {
+        // `await import(name);` inside an async function body.
+        // Top-level await requires a module context that swc may or may not accept in
+        // test mode, so wrap in an async arrow to ensure it parses cleanly.
+        let t = table("const f = async () => { await import(name); };");
+        assert!(
+            t.has_dynamic(),
+            "await import(name) inside a function body should set has_dynamic"
+        );
+    }
+
+    #[test]
+    fn static_import_only_does_not_set_has_dynamic() {
+        // A file with only a static `import { x } from 'y';` must not set has_dynamic.
+        let t = table("import { readFile } from 'node:fs';");
+        assert!(
+            !t.has_dynamic(),
+            "static import only should NOT set has_dynamic"
+        );
     }
 }
