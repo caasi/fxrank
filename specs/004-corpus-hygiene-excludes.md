@@ -235,8 +235,11 @@ The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min
   `value_delimiter = ','` splits on every comma, so brace alternation that contains a
   comma (`*.{js,ts}`) is **not** expressible as one entry — it would split into
   `*.{js` and `ts}` (both invalid globs → startup error). Use separate entries
-  (`*.js`, `*.ts`) instead. Brace groups without commas, and all other glob
-  metacharacters, are fine.
+  (`*.js`, `*.ts`) instead — the semantics are identical, and the defaults never need
+  brace alternation. Brace groups without commas, and all other glob metacharacters,
+  are fine. **Shell quoting does not help:** `--exclude "*.{js,ts}"` still splits,
+  because the split is clap's `value_delimiter` (applied to the value *after* the
+  shell has stripped the quotes), not a shell-level split.
 - **Empty entries are inert.** `--exclude ''` or a trailing comma yields an empty
   string, which is dropped before compilation (matches nothing, prunes nothing).
   Since override is *replace*, `--exclude ''` with no other entry therefore disables
