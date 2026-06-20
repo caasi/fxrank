@@ -29,7 +29,9 @@ In scope:
 
 - Grow `--exclude` from **directory-name-only** matching to a matcher that handles
   **literal filenames, filename globs, and full-path globs** — mixed freely — while
-  preserving today's directory-prune behavior (back-compatible).
+  preserving today's directory-prune behavior for ordinary literal directory names
+  (back-compatible; an entry containing glob metacharacters, e.g. `foo*`, now globs
+  rather than denoting a literal directory named `foo*`).
 - A richer, **documented, overridable** default exclude list covering vendored
   bundles (named), Storybook stories, the MSW generated worker, and JS test-support
   files (N1/N3/N4/N5).
@@ -67,7 +69,10 @@ Out of scope (deferred, Milestone-B candidates):
 | File-discovery exclude | CLI (`main.rs` walk) | `--exclude` (replace) | **general ecosystem file noise**: vendored, minified (named), stories, generated, JS test-support |
 | Test-skip | frontends (`is_test`/`is_test_file`) | `--include-tests` | the **test mechanism**: Rust `#[test]`/`#[cfg(test)]`, TS `.test.`/`.spec.`/`__tests__` |
 
-The two never overlap and no new flag is introduced. N3's test-support files
+They own distinct concerns and no new flag is introduced. If a path would match both
+layers (e.g. `src/__tests__/foo.stories.tsx`), the **discovery exclude wins** because
+it runs first — the file is counted in `skipped_excluded` and never reaches the
+frontend's test-skip. N3's test-support files
 (`jest.setup.*`, `jest.config.*`, `__mocks__`) live in the `--exclude` default list
 because they are JS-ecosystem *files*, not the test mechanism — so re-including them
 is `--exclude`'s override, not `--include-tests`. `--exclude` is **not** the test
@@ -79,14 +84,20 @@ mechanism: a `*.stories.tsx` stays excluded even under `--include-tests`.
 it contains a `/`** — not by whether it contains glob metacharacters:
 
 - **No `/`** (a literal filename, a directory name, or a *filename* glob) → matched
-  against each entry's **base name** during the walk:
-  - matches a **directory** name → **prune** that subtree (no recursion). Counts in
-    nothing — the tree is never read.
-  - matches a **file** name → **exclude** that file (skip before reading) and count
-    it in `skipped_excluded`.
-  - Wildcards are allowed (`*`, `?`, `[…]`); a literal like `jest.setup.js` is just a
-    glob with no wildcards. So `node_modules`, `target`, `__mocks__`, `jest.setup.js`,
-    `*.min.js`, and `*.stories.*` are **all** no-`/` entries.
+  against each entry's **base name** during the walk. Whether it can prune a
+  *directory* depends on wildcards:
+  - **Literal, no wildcard** (`node_modules`, `target`, `__mocks__`, `jest.setup.js`):
+    a base-name match on a **directory** → **prune** that subtree (no recursion, never
+    read, counted in nothing); a base-name match on a **file** → **exclude** it (skip
+    before reading) and count it in `skipped_excluded`.
+  - **Wildcard glob** (`*`, `?`, `[…]` — e.g. `*.min.js`, `*.stories.*`,
+    `jest.config.*`): matches **files only** — a base-name file match excludes+counts
+    it; it **never prunes a directory**. This is deliberate: nobody writes
+    `*.stories.*` to prune a tree, and letting a filename glob match a same-named
+    directory (`x.stories.d/`) would silently drop real source *uncounted* — the
+    mirror of the literal-filename footgun this design removes. To prune a tree, use a
+    literal directory name. (Because the base name is a separator-free string, a `*`
+    in a no-`/` glob spans the whole base name.)
 - **Contains `/`** (`src/vendor/**`, `**/*.stories.*`, `packages/*/generated/**`) →
   glob matched against the file's **path relative to the scan root**, `/`-normalized.
   Path globs are **file filters, not traversal prunes** — the walk still descends the
@@ -106,9 +117,12 @@ hand, not on the agent that is the primary consumer.)
 
 **Implementation choice:** use the `globset` crate (BurntSushi / ripgrep — the
 gold-standard, actively-maintained glob engine). It lives only in `fxrank-cli` (core
-stays parser- and dependency-free). Build **two** `GlobSet`s from the entry list: one
-of no-`/` entries (matched against each base name) and one of `/`-bearing entries
-(matched against the `/`-normalized relative path).
+stays parser- and dependency-free). Partition the entries three ways: (1) **literal**
+no-`/` names → a `HashSet<String>`, used for **both** directory pruning and file
+exclusion by base-name equality; (2) **wildcard** no-`/` globs → a `GlobSet` matched
+against each **file** base name (file exclusion only — never prunes); (3) `/`-bearing
+entries → a `GlobSet` matched against the `/`-normalized relative path (file exclusion
+only).
 
 **`--exclude` applies to directory scans only.** A single explicit file
 (`fxrank scan a.min.js`) and stdin (`scan --lang ts -`) are **always honored** — an
@@ -171,15 +185,16 @@ The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min
   matcher from the entries: partition into no-`/` entries and `/`-bearing entries,
   compile each group into a `globset::GlobSet`. Empty entries (from `--exclude ''` or
   a trailing comma) are **ignored** (inert) before compilation.
-- **Walk integration (`walk_dir`).** Thread the two glob sets and the scan-root
+- **Walk integration (`walk_dir`).** Thread the three matchers and the scan-root
   prefix through the walk:
-  - For each **directory** entry: match its **base name** against the no-`/` set →
-    on match, prune (skip recursion). This subsumes today's `HashSet` segment check.
-  - For each **routable file** (after `route_for_path` returns `Some` — see
-    invariant below): match its base name against the no-`/` set **or** its
-    `/`-normalized root-relative path against the `/`-set → on match, **do not read**
-    the file and increment a `skipped_excluded` tally instead of pushing to
-    `sources`.
+  - For each **directory** entry: prune iff its **base name** is in the literal set
+    (1). Wildcard globs (2) and `/`-globs (3) never prune. This subsumes today's
+    `HashSet` segment check (which was already literal-only).
+  - For each **routable file** (after `route_for_path` returns `Some` — see invariant
+    below): exclude iff its base name is in the literal set (1) **or** matches the
+    wildcard base-name set (2) **or** its `/`-normalized root-relative path matches
+    the path set (3). On a match, **do not read** the file and increment a
+    `skipped_excluded` tally instead of pushing to `sources`.
 - **Exclusion runs after extension routing (invariant).** The glob check is applied
   only to files `route_for_path` already accepts. Non-routable files are skipped
   anyway, so excluding them is moot; placing the check after routing keeps "what
@@ -220,6 +235,8 @@ The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min
   metacharacters, are fine.
 - **Empty entries are inert.** `--exclude ''` or a trailing comma yields an empty
   string, which is dropped before compilation (matches nothing, prunes nothing).
+  Since override is *replace*, `--exclude ''` with no other entry therefore disables
+  **all** default excludes — an empty effective matcher (every file is scanned).
 - The walk's existing read/permission diagnostics are unchanged.
 
 ## Testing Strategy
@@ -243,6 +260,9 @@ The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min
   regardless of the directory passed to `scan`.
 - **`__mocks__` dir-prune:** files under `src/__mocks__/` are pruned and **not**
   counted in `skipped_excluded` (dir-prune asymmetry).
+- **Wildcard never prunes a dir:** a directory named `x.stories.d/` containing `a.ts`
+  is **not** pruned by the default `*.stories.*` (wildcard → files only); `a.ts` is
+  still scored. A literal `legacy` entry, by contrast, prunes `src/legacy/`.
 - **jest support files:** `jest.setup.js`, `jest.config.ts` skipped by default and
   counted in `skipped_excluded`.
 - **`files` accounting:** excluded files contribute to neither `files` nor
@@ -271,7 +291,7 @@ The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min
 | Decision | Choice | Rationale |
 | --- | --- | --- |
 | Stance | Skip noise by default, opt-out via `--exclude` | Out-of-box reports are usable; an agent shouldn't sift vendored/story/setup noise. |
-| Matcher classification | Split on `/`: no-`/` → base-name match (file exclude or dir prune); `/` → full-path glob (file filter) | Lets users mix literal filenames and filename globs freely; removes the "bare filename silently prunes a dir" footgun. |
+| Matcher classification | Split on `/`; among no-`/`, only **literal** names prune directories, **wildcard** names match files only; `/` → full-path glob (file filter) | Lets users mix literal filenames and filename globs; removes both the "bare filename silently prunes nothing" and "filename glob silently prunes a dir" footguns. |
 | Glob engine | `globset` (ripgrep), CLI-only, two `GlobSet`s | Gold-standard, maintained; core stays parser/dep-free. |
 | Override | Replace (unchanged); defaults in `--help` | The restate cost falls on humans, not the agent consumer; simplest model. |
 | N3 test-support placement | `--exclude` default list, not test-skip | They are JS-ecosystem *files*, not the test *mechanism*; keeps `--include-tests` clean. |
