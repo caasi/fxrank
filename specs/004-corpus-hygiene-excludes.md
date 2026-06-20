@@ -80,8 +80,9 @@ mechanism: a `*.stories.tsx` stays excluded even under `--include-tests`.
 
 ## The matcher: split on `/`
 
-`--exclude` takes a comma-separated list. Each entry is classified once, **by whether
-it contains a `/`** — not by whether it contains glob metacharacters:
+`--exclude` takes a comma-separated list. Each entry is classified first **by whether
+it contains a `/`**; no-`/` entries are then split into *literal* (no glob
+metacharacter) vs *wildcard*:
 
 - **No `/`** (a literal filename, a directory name, or a *filename* glob) → matched
   against each entry's **base name** during the walk. Whether it can prune a
@@ -90,8 +91,8 @@ it contains a `/`** — not by whether it contains glob metacharacters:
     a base-name match on a **directory** → **prune** that subtree (no recursion, never
     read, counted in nothing); a base-name match on a **file** → **exclude** it (skip
     before reading) and count it in `skipped_excluded`.
-  - **Wildcard glob** (`*`, `?`, `[…]` — e.g. `*.min.js`, `*.stories.*`,
-    `jest.config.*`): matches **files only** — a base-name file match excludes+counts
+  - **Wildcard glob** (contains any glob metacharacter — `*`, `?`, `[`, `{` — e.g.
+    `*.min.js`, `*.stories.*`, `jest.config.*`): matches **files only** — a base-name file match excludes+counts
     it; it **never prunes a directory**. This is deliberate: nobody writes
     `*.stories.*` to prune a tree, and letting a filename glob match a same-named
     directory (`x.stories.d/`) would silently drop real source *uncounted* — the
@@ -161,9 +162,10 @@ The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min
 
 ## Behavior
 
-- **Default:** the union default list above is the active exclude set. No-`/` entries
-  prune matching directories and exclude matching files; `/`-globs exclude matching
-  files by path.
+- **Default:** the union default list above is the active exclude set. No-`/`
+  *literal* entries prune matching directories and exclude matching files; no-`/`
+  *wildcard* entries exclude matching files only; `/`-globs exclude matching files by
+  path.
 - **`scope.skipped_excluded`** counts **files** skipped by any exclude entry (a
   `*.stories.tsx`, a `*.min.js`, a `jest.setup.js`). **Directory prunes are not
   counted** — a pruned tree (`node_modules`, `__mocks__`) may be arbitrarily large
@@ -182,9 +184,11 @@ The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min
 
 - **CLI (`fxrank-cli`).** The `--exclude` arg keeps its comma `value_delimiter` and a
   `default_value` updated to the documented union string. In `run_scan`, build the
-  matcher from the entries: partition into no-`/` entries and `/`-bearing entries,
-  compile each group into a `globset::GlobSet`. Empty entries (from `--exclude ''` or
-  a trailing comma) are **ignored** (inert) before compilation.
+  matcher from the entries via the three-way partition described under *Implementation
+  choice* above: no-`/` literals → a `HashSet<String>`; no-`/` wildcards → a
+  `globset::GlobSet`; `/`-bearing entries → a second `globset::GlobSet`. Empty entries
+  (from `--exclude ''` or a trailing comma) are **ignored** (inert) before
+  compilation.
 - **Walk integration (`walk_dir`).** Thread the three matchers and the scan-root
   prefix through the walk:
   - For each **directory** entry: prune iff its **base name** is in the literal set
@@ -292,7 +296,7 @@ The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min
 | --- | --- | --- |
 | Stance | Skip noise by default, opt-out via `--exclude` | Out-of-box reports are usable; an agent shouldn't sift vendored/story/setup noise. |
 | Matcher classification | Split on `/`; among no-`/`, only **literal** names prune directories, **wildcard** names match files only; `/` → full-path glob (file filter) | Lets users mix literal filenames and filename globs; removes both the "bare filename silently prunes nothing" and "filename glob silently prunes a dir" footguns. |
-| Glob engine | `globset` (ripgrep), CLI-only, two `GlobSet`s | Gold-standard, maintained; core stays parser/dep-free. |
+| Glob engine | `globset` (ripgrep), CLI-only; a literal `HashSet` + two `GlobSet`s | Gold-standard, maintained; core stays parser/dep-free. |
 | Override | Replace (unchanged); defaults in `--help` | The restate cost falls on humans, not the agent consumer; simplest model. |
 | N3 test-support placement | `--exclude` default list, not test-skip | They are JS-ecosystem *files*, not the test *mechanism*; keeps `--include-tests` clean. |
 | Minified detector | Patterns only, no density heuristic; cover `.min.{js,mjs,cjs}` | Zero magic, zero false-skip; minified code isn't a target. |
