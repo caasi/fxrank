@@ -104,7 +104,7 @@ Output is **compact JSON on stdout** (built for agents — pipe through `jq` to 
   "summary": { "own_score": 42.5, "max_class": 7, "risk_weight": 0, "confidence": 0.6 },
   "hotspots": [
     {
-      "id": "src/main.rs:48:run_scan",
+      "id": "src/main.rs:48:4:run_scan",
       "symbol": "run_scan",
       "max_class": 7, "own_score": 42.5, "confidence": 0.6,
       "effects": [

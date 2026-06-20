@@ -245,7 +245,8 @@ boundary, while escaping mutation and world effects stay fully visible.
   - `functions` — collect `FnUnit`s from the swc AST. JS function forms collected as
     units: function declarations, function expressions, arrow functions, class
     methods, getters/setters, object methods, generators (and their `async`
-    variants). Anonymous arrows get a synthesized symbol `<arrow@L{line}>`. The
+    variants). Anonymous arrows get a synthesized symbol `<arrow@L{line}C{col}>`
+    (the `C{col}` column suffix added in spec 005). The
     own-body model holds: **nested functions are their own units** (no call-graph
     roll-up; deferred). Trivially-pure callbacks score 0 and fall off via
     `Report::build`'s limit, so collecting every form does not flood the output.
@@ -346,7 +347,7 @@ Mirrors the Rust frontend: `tests/fixtures/*.{ts,tsx,js}` read by a shared
 - **Risk kinds:** `eval` → `dynamic.code`; `el.innerHTML =` → `html.injection`;
   `Object.setPrototypeOf` → `proto.pollution`.
 - **Function forms:** arrow / method / getter collected as units; a pure
-  `x => x*2` callback scores 0; anonymous arrow gets `<arrow@L…>`.
+  `x => x*2` callback scores 0; anonymous arrow gets `<arrow@L…C…>`.
 - **async:** `async`/`await` sets `async_boundary` / `await_count`, emits no effect of
   its own.
 - **Fragment mode:** `echo '<fn>' | fxrank scan --lang ts -` scores a single function;
