@@ -434,6 +434,15 @@ Mirrors the Rust frontend: `tests/fixtures/*.{ts,tsx,js}` read by a shared
   inputs the file extension determines the language unambiguously; `--lang` is an error
   there (a directory tree can mix `.ts` / `.tsx` / `.js` and a single `--lang` flag
   cannot serve it).
+- **Test-file skipping is by FILE PATH**, not by detecting `describe`/`it` in app code.
+  JS/TS convention keeps tests in separate files, so `TsFrontend` skips entire files
+  whose name contains `.test.` or `.spec.` (e.g. `foo.test.ts`, `bar.spec.tsx`), or
+  whose path contains a `__tests__` segment (split on both `/` and `\` to handle
+  Windows paths). `--include-tests` opts back in. Skipped units are counted in the
+  report's `skipped_tests` field, mirroring the Rust frontend's contract (spec 002).
+  Detecting `describe`/`it`/`test` callback units inside non-test-named files is
+  deliberately **out of scope** for Milestone A — a Milestone-B candidate if real
+  scans show it is needed.
 
 ## Open questions
 

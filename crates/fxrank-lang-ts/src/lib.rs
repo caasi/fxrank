@@ -22,8 +22,12 @@ use crate::source::{Lang, SpanLines};
 ///
 /// `lang` is the dialect used for *all* this frontend's sources; the CLI groups
 /// sources by resolved `Lang` so each group gets a `TsFrontend` with the right
-/// dialect. `include_tests` is carried for parity with `RustFrontend` but is not
-/// yet consumed — test-skipping logic arrives in a later task.
+/// dialect. When `include_tests` is `false` (the default), whole files whose path
+/// contains `.test.` or `.spec.` (e.g. `foo.test.ts`, `bar.spec.tsx`) or any
+/// path segment equals `__tests__` are skipped; their unit count is tallied in
+/// `FrontendOutput::skipped_tests`. JS/TS convention keeps tests in separate
+/// files, so skipping is by file path (not by detecting `describe`/`it` inside
+/// app code), mirroring the Rust frontend's `skipped_tests` contract.
 #[derive(Default)]
 pub struct TsFrontend {
     pub lang: Lang,
@@ -56,10 +60,14 @@ impl Frontend for TsFrontend {
                     let lines = SpanLines::new(cm);
                     let imports = ImportTable::from_module(&module);
                     let units = functions::collect(&module, &source.path, &lines);
-                    for unit in &units {
-                        output
-                            .functions
-                            .push(detect::analyze_unit(unit, &imports, &lines));
+                    if !self.include_tests && is_test_file(&source.path) {
+                        output.skipped_tests += units.len();
+                    } else {
+                        for unit in &units {
+                            output
+                                .functions
+                                .push(detect::analyze_unit(unit, &imports, &lines));
+                        }
                     }
                 }
             }
@@ -67,4 +75,25 @@ impl Frontend for TsFrontend {
 
         output
     }
+}
+
+/// Return `true` if `path` identifies a test file by convention.
+///
+/// A file is a test file when:
+/// - the file name contains `.test.` or `.spec.` (e.g. `foo.test.ts`, `bar.spec.tsx`), OR
+/// - any path segment is exactly `__tests__` (e.g. `src/__tests__/foo.ts`).
+///
+/// Only these two well-established JS/TS conventions are checked. Stdin
+/// (`"stdin"`) and ordinary `.ts`/`.js` files are never test files.
+pub fn is_test_file(path: &str) -> bool {
+    // Use the file name only for the infix check (avoid matching `.test.` in a
+    // directory component like `my.test.project/app.ts`). Split on both `/` and
+    // `\` so a Windows directory like `my.test.project\app.ts` isn't false-matched.
+    let file_name = path.split(['/', '\\']).next_back().unwrap_or(path);
+    if file_name.contains(".test.") || file_name.contains(".spec.") {
+        return true;
+    }
+    // Any path segment equal to `__tests__` marks the whole file as a test file.
+    // Split on both `/` and `\` to handle Windows paths (e.g. `src\__tests__\foo.ts`).
+    path.split(['/', '\\']).any(|seg| seg == "__tests__")
 }
