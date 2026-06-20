@@ -22,9 +22,9 @@
 //! **Symbol naming.** Declarations and class/object members use their own name
 //! (`foo`, `C.method`, `C.get g`, `C.set g`, `C.constructor`). Arrows take the
 //! binding name when assigned directly to a `const`/`let`/`var` declarator
-//! (`const f = () => {}` -> `f`); otherwise they fall back to `<arrow@L{line}>`
+//! (`const f = () => {}` -> `f`); otherwise they fall back to `<arrow@L{line}C{col}>`
 //! (inline callbacks such as `[1].map(x => x)`). Anonymous function expressions
-//! use `<fn@L{line}>` as their positional fallback.
+//! use `<fn@L{line}C{col}>` as their positional fallback.
 
 use swc_ecma_ast::{
     ArrowExpr, BlockStmtOrExpr, Class, ClassMethod, Constructor, Decl, Expr, FnDecl, FnExpr,
@@ -83,9 +83,9 @@ impl FnBodyOwned {
 /// detectors can walk them after the source `Module` is dropped.
 pub struct FnUnit {
     /// Display symbol: `foo`, `f`, `C.method`, `C.get g`, `C.set g`,
-    /// `C.constructor`, or `<arrow@L{line}>`.
+    /// `C.constructor`, or `<arrow@L{line}C{col}>`.
     pub symbol: String,
-    /// Collision-resistant id: `path:line:symbol`.
+    /// Collision-resistant id: `path:line:col:symbol` (col is the 1-based char column).
     pub id: String,
     /// Source file path (as passed in).
     pub path: String,
@@ -186,13 +186,16 @@ impl Collector<'_> {
     fn push(
         &mut self,
         symbol: String,
-        line: usize,
+        // `(line, col)` is one source coordinate, kept as a single param so the
+        // 1-based line and column always travel together (and to stay under
+        // clippy's `too_many_arguments` threshold).
+        (line, col): (usize, usize),
         is_async: bool,
         is_constructor: bool,
         sig: FnSig,
         body: FnBodyOwned,
     ) {
-        let id = format!("{}:{}:{}", self.path, line, symbol);
+        let id = format!("{}:{}:{}:{}", self.path, line, col, symbol);
         self.units.push(FnUnit {
             symbol,
             id,
@@ -241,13 +244,20 @@ fn prop_name(key: &PropName) -> String {
 impl Visit for Collector<'_> {
     fn visit_fn_decl(&mut self, node: &FnDecl) {
         let symbol = node.ident.sym.to_string();
-        let line = self.lines.line(node.ident.span);
+        let (line, col) = self.lines.line_col(node.ident.span);
         let f = &node.function;
         let sig = FnSig {
             params: params_of_function(f),
             return_type: return_type_of(&f.return_type),
         };
-        self.push(symbol, line, f.is_async, false, sig, body_of_function(f));
+        self.push(
+            symbol,
+            (line, col),
+            f.is_async,
+            false,
+            sig,
+            body_of_function(f),
+        );
         // Recurse into the body so nested functions become their own units.
         node.visit_children_with(self);
     }
@@ -256,27 +266,34 @@ impl Visit for Collector<'_> {
         let f = &node.function;
         // Prefer the function expression's own name, then the binding name, then
         // a positional fallback.
-        let line = self.lines.line(f.span);
+        let (line, col) = self.lines.line_col(f.span);
         let symbol = node
             .ident
             .as_ref()
             .map(|i| i.sym.to_string())
             .or_else(|| self.pending_name.take())
-            .unwrap_or_else(|| format!("<fn@L{line}>"));
+            .unwrap_or_else(|| format!("<fn@L{line}C{col}>"));
         let sig = FnSig {
             params: params_of_function(f),
             return_type: return_type_of(&f.return_type),
         };
-        self.push(symbol, line, f.is_async, false, sig, body_of_function(f));
+        self.push(
+            symbol,
+            (line, col),
+            f.is_async,
+            false,
+            sig,
+            body_of_function(f),
+        );
         node.visit_children_with(self);
     }
 
     fn visit_arrow_expr(&mut self, node: &ArrowExpr) {
-        let line = self.lines.line(node.span);
+        let (line, col) = self.lines.line_col(node.span);
         let symbol = self
             .pending_name
             .take()
-            .unwrap_or_else(|| format!("<arrow@L{line}>"));
+            .unwrap_or_else(|| format!("<arrow@L{line}C{col}>"));
         let sig = FnSig {
             params: node.params.clone(),
             return_type: return_type_of(&node.return_type),
@@ -285,7 +302,7 @@ impl Visit for Collector<'_> {
             BlockStmtOrExpr::BlockStmt(block) => FnBodyOwned::Block(block.stmts.clone()),
             BlockStmtOrExpr::Expr(expr) => FnBodyOwned::Expr(expr.clone()),
         };
-        self.push(symbol, line, node.is_async, false, sig, body);
+        self.push(symbol, (line, col), node.is_async, false, sig, body);
         node.visit_children_with(self);
     }
 
@@ -367,18 +384,25 @@ impl Visit for Collector<'_> {
 
     fn visit_method_prop(&mut self, node: &MethodProp) {
         let f = &node.function;
-        let line = self.lines.line(f.span);
+        let (line, col) = self.lines.line_col(f.span);
         let symbol = prop_name(&node.key);
         let sig = FnSig {
             params: params_of_function(f),
             return_type: return_type_of(&f.return_type),
         };
-        self.push(symbol, line, f.is_async, false, sig, body_of_function(f));
+        self.push(
+            symbol,
+            (line, col),
+            f.is_async,
+            false,
+            sig,
+            body_of_function(f),
+        );
         node.visit_children_with(self);
     }
 
     fn visit_getter_prop(&mut self, node: &GetterProp) {
-        let line = self.lines.line(node.span);
+        let (line, col) = self.lines.line_col(node.span);
         let symbol = format!("get {}", prop_name(&node.key));
         let sig = FnSig {
             params: Vec::new(),
@@ -388,12 +412,12 @@ impl Visit for Collector<'_> {
             Some(block) => FnBodyOwned::Block(block.stmts.clone()),
             None => FnBodyOwned::Block(Vec::new()),
         };
-        self.push(symbol, line, false, false, sig, body);
+        self.push(symbol, (line, col), false, false, sig, body);
         node.visit_children_with(self);
     }
 
     fn visit_setter_prop(&mut self, node: &SetterProp) {
-        let line = self.lines.line(node.span);
+        let (line, col) = self.lines.line_col(node.span);
         let symbol = format!("set {}", prop_name(&node.key));
         let sig = FnSig {
             params: vec![(*node.param).clone()],
@@ -403,7 +427,7 @@ impl Visit for Collector<'_> {
             Some(block) => FnBodyOwned::Block(block.stmts.clone()),
             None => FnBodyOwned::Block(Vec::new()),
         };
-        self.push(symbol, line, false, false, sig, body);
+        self.push(symbol, (line, col), false, false, sig, body);
         node.visit_children_with(self);
     }
 }
@@ -411,7 +435,7 @@ impl Visit for Collector<'_> {
 impl Collector<'_> {
     fn collect_class_method(&mut self, class: &str, m: &ClassMethod) {
         let f = &m.function;
-        let line = self.lines.line(f.span);
+        let (line, col) = self.lines.line_col(f.span);
         let name = prop_name(&m.key);
         let symbol = match m.kind {
             MethodKind::Method => format!("{class}.{name}"),
@@ -422,22 +446,36 @@ impl Collector<'_> {
             params: params_of_function(f),
             return_type: return_type_of(&f.return_type),
         };
-        self.push(symbol, line, f.is_async, false, sig, body_of_function(f));
+        self.push(
+            symbol,
+            (line, col),
+            f.is_async,
+            false,
+            sig,
+            body_of_function(f),
+        );
     }
 
     fn collect_private_method(&mut self, class: &str, m: &PrivateMethod) {
         let f = &m.function;
-        let line = self.lines.line(f.span);
+        let (line, col) = self.lines.line_col(f.span);
         let symbol = format!("{class}.#{}", m.key.name);
         let sig = FnSig {
             params: params_of_function(f),
             return_type: return_type_of(&f.return_type),
         };
-        self.push(symbol, line, f.is_async, false, sig, body_of_function(f));
+        self.push(
+            symbol,
+            (line, col),
+            f.is_async,
+            false,
+            sig,
+            body_of_function(f),
+        );
     }
 
     fn collect_constructor(&mut self, class: &str, c: &Constructor) {
-        let line = self.lines.line(c.span);
+        let (line, col) = self.lines.line_col(c.span);
         let symbol = format!("{class}.constructor");
         // Constructor params may include TS parameter properties (`public x: T`);
         // extract the underlying `Pat` from each variant.
@@ -460,6 +498,6 @@ impl Collector<'_> {
             Some(block) => FnBodyOwned::Block(block.stmts.clone()),
             None => FnBodyOwned::Block(Vec::new()),
         };
-        self.push(symbol, line, false, true, sig, body);
+        self.push(symbol, (line, col), false, true, sig, body);
     }
 }

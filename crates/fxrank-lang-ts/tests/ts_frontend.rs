@@ -69,7 +69,7 @@ fn collects_all_function_forms() {
     assert!(symbols.contains(&"D.set v".to_string()));
     // Total count guards against future double-emit regressions.
     // functions.ts yields: topLevel, arrowConst, C.method, C.get g, exported,
-    //   <arrow@L5> (inline x => x), D.get v, D.set v  — 8 units total.
+    //   <arrow@L5C…> (inline x => x), D.get v, D.set v  — 8 units total.
     assert_eq!(symbols.len(), 8);
 }
 
@@ -608,4 +608,42 @@ fn is_test_file_recognizes_patterns() {
         !is_test_file("C:\\work\\my.test.project\\src\\app.ts"),
         "windows dir with .test. infix: file is app.ts"
     );
+}
+
+#[test]
+fn anonymous_fns_on_same_line_get_distinct_ids() {
+    // Two anonymous arrows on one physical line — issue #9.
+    let src = "foo().then(() => {}).catch(() => {});";
+    let units = functions::parse_and_collect(src, "t.ts", Lang::Ts).expect("parse");
+
+    let arrows: Vec<_> = units
+        .iter()
+        .filter(|u| u.symbol.starts_with("<arrow@L"))
+        .collect();
+    assert_eq!(arrows.len(), 2, "both arrows collected");
+
+    // The bug: identical ids. The fix: distinct (column disambiguates).
+    assert_ne!(
+        arrows[0].id, arrows[1].id,
+        "same-line arrows must have distinct ids"
+    );
+
+    // Every id in the report is unique.
+    let ids: Vec<&String> = units.iter().map(|u| &u.id).collect();
+    let unique: std::collections::HashSet<&&String> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "all hotspot ids are unique");
+
+    // 4-field shape `path:line:col:symbol` and the symbol carries C{col}.
+    for a in &arrows {
+        assert!(
+            a.symbol.starts_with("<arrow@L") && a.symbol.contains('C'),
+            "anonymous symbol carries column: {}",
+            a.symbol
+        );
+        assert!(
+            a.id.starts_with("t.ts:1:"),
+            "id is path:line:col:symbol: {}",
+            a.id
+        );
+    }
 }
