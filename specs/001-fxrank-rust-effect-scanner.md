@@ -255,7 +255,11 @@ available (`User::new`), and for **trait-impl** methods the trait path too
 (`<User as Display>::fmt`), so two trait impls of the same method on one type do not
 collide. `(line, col)` — not `line` alone — is what guarantees per-file uniqueness:
 two anonymous functions can share a line, so `line` by itself is *not* a sufficient
-tiebreak (the bug spec 005 fixes); their distinct start columns break the tie.
+tiebreak (the bug spec 005 fixes). That collision arises in the **TS/JS frontend**,
+which emits anonymous arrows/functions as their own units; the Rust frontend never
+hits it (closures roll up and are not emitted as separate units). Rust adopts the
+4-field `path:line:col:symbol` format anyway so the id schema is uniform across
+frontends. Their distinct start columns break the tie.
 
 ## Occurrence Counting
 

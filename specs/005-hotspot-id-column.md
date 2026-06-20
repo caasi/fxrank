@@ -50,10 +50,11 @@ In scope:
 
 Out of scope (YAGNI / deferred):
 
-- **Structured `line`/`col` wire fields on `Hotspot`.** `line` is not a separate
-  field today (it lives only inside `id` and in evidence); `col` follows suit. If a
-  consumer later needs machine-parseable coordinates without splitting the `id`
-  string, that is a separate, additive change.
+- **A structured `col` wire field on `Hotspot`.** `path`, `line`, and `symbol` are
+  already separate `Hotspot` fields, but `col` is deliberately *not* added as one —
+  it lives only inside the `id` string. If a consumer later needs `col` as a
+  first-class field (rather than recovering it from the `id` via the structured
+  `symbol`/`line` anchors), that is a separate, additive change.
 - **Call-graph propagation / `inherited_score`**, FFI call-site detection, and the
   other Milestone-B deferrals from spec 001 — untouched.
 - **Content/density heuristics for unnamed minified bundles** (spec 004's deferred
@@ -68,13 +69,25 @@ occurrence index (`#1`, `#2`), which is positional and renumbers when an earlier
 arrow is inserted, making it a poor key for an agent caching ids across edits.
 
 The column is promoted to its own colon-delimited **structural field** (rather than
-hidden only inside the anonymous symbol) so the `id` schema is **uniform and
-machine-parseable**: every `id`, from either frontend and for named or anonymous
-functions alike, has the shape `path:line:col:symbol`. A consumer splitting on the
-last-three-from-the-right delimiters gets `(line, col, symbol)` without needing to
-know whether the function was anonymous or which language produced it. The Rust
-frontend never actually collides (closures roll up; it emits no anonymous units),
-but it adopts the same 4-field shape so the wire format does not vary by frontend.
+hidden only inside the anonymous symbol) so the `id` schema is **uniform**: every
+`id`, from either frontend and for named or anonymous functions alike, has the shape
+`path:line:col:symbol`. The same shape holds regardless of whether the function was
+anonymous or which language produced it. The Rust frontend never actually collides
+(closures roll up; it emits no anonymous units), but it adopts the same 4-field
+shape so the wire format does not vary by frontend.
+
+**The `id` is a stable *opaque* key, not a parse target.** Do not recover the
+coordinates by splitting the raw `id` string: **both** `path` (taken verbatim — may
+contain `:`, e.g. a Windows `C:\…` path) **and** `symbol` (Rust `::`, e.g.
+`User::new`, `<User as Display>::fmt`) can contain `:`, so the id is *not*
+unambiguously splittable by delimiter position from either end. A consumer that needs
+the coordinates should read the hotspot's **structured JSON fields** — `path`,
+`line`, and `symbol` are each emitted as their own field on the `Hotspot`. Only
+`col` lives solely inside the `id`; to recover it, use the known field values to
+strip the **prefix** `{path}:{line}:` and the **suffix** `:{symbol}` from the `id`,
+leaving exactly `col` (e.g. `p:10:4:S::m` → strip prefix `p:10:` and suffix `:S::m`
+→ `4`). The id's contract is **uniqueness + stability across edits**, not field
+extraction.
 
 The anonymous symbol keeps a redundant `C{col}` suffix (`<arrow@L279C55>`) so the
 **`symbol` field is self-sufficient** too: a human skimming `symbol` can tell two
@@ -157,5 +170,7 @@ that `col` is the 1-based character column of the line anchor, and that
   and `fxrank-lang-rust/src/functions.rs`) are updated to the `path:line:col:symbol`
   format, so the code's own documentation matches the wire format.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -D warnings`,
-  and `cargo fmt --check` all pass; insta snapshots are regenerated to include the
-  `col` field.
+  and `cargo fmt --check` all pass. No snapshot churn is expected: the insta
+  snapshots intentionally omit `id`/`line` (see the `summarize` helpers in the
+  frontend `tests/snapshots.rs`), so the `col` change does not touch them. Should a
+  future snapshot include an `id`, regenerate it with `cargo insta review`.
