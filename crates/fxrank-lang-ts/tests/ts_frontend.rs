@@ -633,17 +633,42 @@ fn anonymous_fns_on_same_line_get_distinct_ids() {
     let unique: std::collections::HashSet<&&String> = ids.iter().collect();
     assert_eq!(unique.len(), ids.len(), "all hotspot ids are unique");
 
-    // 4-field shape `path:line:col:symbol` and the symbol carries C{col}.
+    // Parse each id into exactly 4 fields `path:line:col:symbol` (the symbol
+    // `<arrow@LnCm>` and the path `t.ts` contain no colons, so a plain split is
+    // unambiguous here) and validate every field — not just a prefix, which the
+    // old 3-field format would also satisfy.
     for a in &arrows {
-        assert!(
-            a.symbol.starts_with("<arrow@L") && a.symbol.contains('C'),
-            "anonymous symbol carries column: {}",
+        let fields: Vec<&str> = a.id.split(':').collect();
+        assert_eq!(fields.len(), 4, "id has 4 colon-separated fields: {}", a.id);
+        let (path, line, col_str, sym) = (fields[0], fields[1], fields[2], fields[3]);
+        assert_eq!(path, "t.ts", "path field: {}", a.id);
+        assert_eq!(line, "1", "line field is 1: {}", a.id);
+        let col: usize = col_str.parse().expect("col field is numeric");
+        assert!(col >= 1, "col is 1-based (>= 1): {}", a.id);
+        assert_eq!(sym, a.symbol, "4th field is the symbol: {}", a.id);
+
+        // Parse the *whole* anonymous symbol shape `<arrow@L{line}C{col}>` and
+        // cross-check both coordinates against the id fields — a loose suffix
+        // match would accept malformed symbols (`<arrow@L1CjunkC12>`, a missing
+        // `>`, or an `L{line}` that disagrees with the id).
+        let inner = a
+            .symbol
+            .strip_prefix("<arrow@L")
+            .and_then(|s| s.strip_suffix('>'))
+            .expect("anonymous arrow symbol is <arrow@L{line}C{col}>");
+        let (sym_line, sym_col_str) = inner
+            .rsplit_once('C')
+            .expect("symbol has an L{line}C{col} shape");
+        assert_eq!(
+            sym_line, line,
+            "symbol L{{line}} matches id line field: {}",
             a.symbol
         );
-        assert!(
-            a.id.starts_with("t.ts:1:"),
-            "id is path:line:col:symbol: {}",
-            a.id
+        let sym_col: usize = sym_col_str.parse().expect("symbol col is numeric");
+        assert_eq!(
+            sym_col, col,
+            "symbol C{{col}} matches id col field: {}",
+            a.symbol
         );
     }
 }
