@@ -72,8 +72,12 @@ library crates, so all four are published in dependency order. Shared package me
 (`license = "MIT OR Apache-2.0"`, `repository`, `authors`, `rust-version`, `keywords`,
 `categories`) lives in `[workspace.package]` and is inherited via `field.workspace =
 true`; each crate sets its own `description`. Internal deps carry both `path` and
-`version` so crates.io can resolve them. Bump `version` in `[workspace.package]` (one
-place) for every release.
+`version` so crates.io can resolve them. For every release bump `version` in
+**two** lockstep places: `[workspace.package].version`, **and** the `version = "X.Y.Z"`
+pin on each internal dependency (`fxrank-core`/`fxrank-lang-rust`/`fxrank-lang-ts` in
+the consuming crates' `Cargo.toml`). The internal pins are a caret range, so a stale
+one still *builds*, but the published crate would advertise the wrong (older)
+internal-dep requirement — bump both. (`cargo build` afterward refreshes `Cargo.lock`.)
 
 ```bash
 # one-time: cargo login <crates-token>   (or set CARGO_REGISTRY_TOKEN)
@@ -121,8 +125,8 @@ preflight
   >>> dry_run
   >>> publish_all
   >>> verify
-  >>> tag(version: "v0.1.0")                                                -- ref: git tag vX.Y.Z && git push origin vX.Y.Z
-  >>> release(version: "v0.1.0")                                            -- ref: gh release create --generate-notes
+  >>> tag(version: "vX.Y.Z")                                                -- ref: git tag vX.Y.Z && git push origin vX.Y.Z
+  >>> release(version: "vX.Y.Z")                                            -- ref: gh release create --generate-notes
 ```
 
 ## Architecture: how a scan flows
@@ -153,6 +157,15 @@ CLI → core::Report::build(scope, hotspots, diagnostics, limit)  → compact JS
   render as `3.0` (not `3`). **Per-effect `confidence` is NOT serialized** — confidence is
   computed per detection but only surfaced at the function level (`hotspots[].confidence`,
   the weakest-link min). `effects[]` carry no `confidence` field.
+- **Hotspot `id` is `path:line:col:symbol`** (spec 005): a uniform 4-field shape across both
+  frontends, where `col` is the 1-based **character** column of the function's name anchor
+  (same span that produces `line`). Anonymous TS symbols carry a `C{col}` suffix
+  (`<arrow@L279C55>`). The `id` is a **unique opaque key within a report** — it encodes
+  position, so it changes when code moves (not stable across edits). Do *not* recover
+  coordinates by splitting it, since both `path` (verbatim) and Rust `symbol` (`::`) can
+  contain `:`; read the structured `path`/`line`/`symbol` fields (`col` is the only
+  coordinate that lives solely inside the `id`). Adding a column is what makes two same-line
+  anonymous functions distinct (`line` alone is not enough).
 - **Detectability tiers** — every signal is `exact` / `path` / `heuristic`. Anything that
   truly needs type info (interior mutability, `.lock()`/`.set()` method-name effects,
   `unwrap`/`expect`, `&mut` write-through) is `heuristic` and takes a confidence penalty.
