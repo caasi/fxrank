@@ -5,6 +5,13 @@ members = ["crates/fxrank-core", "crates/fxrank-lang-rust", "crates/fxrank-cli",
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/caasi/fxrank"
+homepage = "https://github.com/caasi/fxrank"
+authors = ["caasi Huang <caasi.igd@gmail.com>"]
+rust-version = "1.85"
+keywords = ["effect", "profiler", "static-analysis", "rust", "typescript"]
+categories = ["development-tools::profiling"]
 
 [workspace.lints.clippy]
 all = "warn"

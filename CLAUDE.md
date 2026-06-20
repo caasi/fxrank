@@ -56,13 +56,39 @@ cargo run -p fxrank -- scan crates/ --include-tests      # score test code too (
 cargo run -p fxrank -- scan <path> --exclude 'node_modules,*.min.js,*.stories.*'  # replaces the default skip list
 echo 'function f(): void {}' | cargo run -p fxrank -- scan --lang ts -  # scan a TS fragment from stdin
 cargo insta review                                       # accept snapshot test changes (insta)
-cargo install --git https://github.com/caasi/fxrank fxrank  # field-install the binary to ~/.cargo/bin
+cargo install fxrank                                     # install the released binary from crates.io
+cargo install --git https://github.com/caasi/fxrank fxrank  # install the latest unreleased binary from git
 ```
 
 CI (`.github/workflows/ci.yml`) gates `fmt --check`, `clippy --workspace --all-targets -D
 warnings`, `test --workspace`, all slim builds (`--features rust`, `--features ts`,
 no-features), a Rust dogfood `scan crates/`, and a TS dogfood scan over the committed
 fixtures. Run the first three locally before pushing.
+
+## Releasing to crates.io
+
+The workspace publishes **four** crates; the binary `fxrank` depends on the three
+library crates, so all four are published in dependency order. Shared package metadata
+(`license = "MIT OR Apache-2.0"`, `repository`, `authors`, `rust-version`, `keywords`,
+`categories`) lives in `[workspace.package]` and is inherited via `field.workspace =
+true`; each crate sets its own `description`. Internal deps carry both `path` and
+`version` so crates.io can resolve them. Bump `version` in `[workspace.package]` (one
+place) for every release.
+
+```bash
+# one-time: cargo login <crates-token>   (or set CARGO_REGISTRY_TOKEN)
+cargo publish -p fxrank-core
+cargo publish -p fxrank-lang-rust
+cargo publish -p fxrank-lang-ts
+cargo publish -p fxrank            # the binary; depends on the three above
+```
+
+Validate `fxrank-core` first without uploading: `cargo publish -p fxrank-core
+--dry-run`. The downstream crates **cannot** be dry-run-validated until `fxrank-core` is
+on crates.io — their `version` dep resolves from the registry index, so packaging fails
+with "no matching package" beforehand; they are verified by publishing in dependency
+order. Publishes are **permanent** — a bad version can only be `cargo yank`ed, never
+deleted.
 
 ## Architecture: how a scan flows
 

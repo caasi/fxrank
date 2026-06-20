@@ -1,14 +1,23 @@
 [package]
 name = "fxrank"
+description = "Effect-cost profiler for coding agents — ranks Rust & TS/JS functions by their own-body side-effect cost."
 edition.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories = ["development-tools::profiling", "command-line-utilities"]
+readme = "README.md"
 [[bin]]
 name = "fxrank"
 path = "src/main.rs"
 [dependencies]
-fxrank-core = { path = "../fxrank-core" }
-fxrank-lang-rust = { path = "../fxrank-lang-rust", optional = true }
-fxrank-lang-ts = { path = "../fxrank-lang-ts", optional = true }
+fxrank-core = { path = "../fxrank-core", version = "0.1.0" }
+fxrank-lang-rust = { path = "../fxrank-lang-rust", version = "0.1.0", optional = true }
+fxrank-lang-ts = { path = "../fxrank-lang-ts", version = "0.1.0", optional = true }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 globset = "0.4"
