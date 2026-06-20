@@ -1,7 +1,8 @@
+mod exclude;
+
 use clap::{Parser, Subcommand};
 use fxrank_core::frontend::{FrontendOutput, SourceFile};
 use fxrank_core::model::{Diagnostic, Report, Scope};
-use std::collections::HashSet;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -32,12 +33,16 @@ enum Cmd {
         /// for stdin; for files/directories the extension decides the frontend.
         #[arg(long)]
         lang: Option<String>,
-        /// Directory NAMES to skip during directory scans (comma-separated;
-        /// overrides the default set when provided).
+        /// Patterns to skip during directory scans (comma-separated; replaces the
+        /// default list when provided). Classified by `/`: a no-`/` literal prunes a
+        /// matching directory and excludes a matching file; a no-`/` glob (`*.min.js`,
+        /// `*.stories.*`) excludes files only; a `/`-bearing glob (`src/legacy/**`)
+        /// filters files by path. An entry cannot contain a comma (the list delimiter),
+        /// so brace alternation with commas (`*.{js,ts}`) must be split into entries.
         #[arg(
             long,
             value_delimiter = ',',
-            default_value = "node_modules,.git,target"
+            default_value = "node_modules,.git,target,*.min.js,*.min.mjs,*.min.cjs,*.stories.*,mockServiceWorker.js,jest.setup.*,jest.config.*,__mocks__"
         )]
         exclude: Vec<String>,
     },
@@ -72,8 +77,7 @@ fn main() -> ExitCode {
         exclude,
     } = cli.cmd;
 
-    let exclude_set: HashSet<String> = exclude.into_iter().collect();
-    match run_scan(path, limit, include_tests, lang, &exclude_set) {
+    match run_scan(path, limit, include_tests, lang, exclude) {
         Ok(report) => {
             // Compact JSON: no trailing newline issues — println! adds exactly one.
             println!(
@@ -95,10 +99,11 @@ fn run_scan(
     limit: Option<usize>,
     include_tests: bool,
     lang: Option<String>,
-    exclude: &HashSet<String>,
+    exclude: Vec<String>,
 ) -> Result<Report, String> {
     // Accumulated read-error diagnostics (files that exist but couldn't be read).
     let mut read_errors: Vec<Diagnostic> = Vec::new();
+    let mut skipped_excluded = 0usize; // 0 for stdin/single-file (no-op)
 
     // `-` is the conventional "read stdin" path; treat it like an omitted path.
     let is_stdin = match &path {
@@ -147,7 +152,7 @@ fn run_scan(
             return Err(format!("path not found: {}", p.display()));
         }
         if p.is_file() {
-            // Single explicit file: route by its extension.
+            // Single explicit file: route by its extension. --exclude is a no-op here.
             let route = route_for_path(&p)
                 .ok_or_else(|| format!("unsupported file extension: {}", p.display()))?;
             let label = p.to_string_lossy().into_owned();
@@ -159,9 +164,13 @@ fn run_scan(
             };
             (label, vec![RoutedSource { source, route }])
         } else {
-            // Directory: walk recursively collecting routable source files.
+            // Directory branch — the ONLY place the matcher is built.
+            // A bad glob surfaces here as a JSON error (non-zero exit).
+            // Single-file/stdin branches above never consult --exclude.
+            let matcher = exclude::ExcludeMatcher::build(&exclude)?;
             let label = p.to_string_lossy().into_owned();
-            let routed = collect_source_files(&p, &mut read_errors, exclude);
+            let routed =
+                collect_source_files(&p, &p, &mut read_errors, &matcher, &mut skipped_excluded);
             (label, routed)
         }
     };
@@ -185,6 +194,7 @@ fn run_scan(
         parsed: source_count.saturating_sub(parse_diag_count),
         functions: output.functions.len(),
         skipped_tests: output.skipped_tests,
+        skipped_excluded,
         risk_features: output.module_risks,
     };
 
@@ -209,25 +219,37 @@ fn route_for_path(path: &std::path::Path) -> Option<Route> {
 
 /// Walk `dir` recursively, collecting every routable source file (`.rs` plus the
 /// JS/TS family) as a `RoutedSource`. Files that can't be read are pushed to
-/// `read_errors` instead. Directories whose file name matches an entry in
-/// `exclude` are skipped entirely (no recursion).
+/// `read_errors` instead. The `ExcludeMatcher` prunes directories and excludes
+/// files; `root` is the scan root used to compute root-relative paths for path globs.
 fn collect_source_files(
     dir: &std::path::Path,
+    root: &std::path::Path,
     read_errors: &mut Vec<Diagnostic>,
-    exclude: &HashSet<String>,
+    matcher: &exclude::ExcludeMatcher,
+    skipped_excluded: &mut usize,
 ) -> Vec<RoutedSource> {
     let mut sources = Vec::new();
-    walk_dir(dir, &mut sources, read_errors, exclude);
+    walk_dir(
+        dir,
+        root,
+        &mut sources,
+        read_errors,
+        matcher,
+        skipped_excluded,
+    );
     sources
 }
 
-/// Recursively collects routable source files under `dir`, skipping symlinks
-/// and any directory whose name is in `exclude`.
+/// Recursively collects routable source files under `dir`, skipping symlinks,
+/// pruning directories whose base name is a literal exclude entry, and excluding
+/// files that match any exclude pattern (after extension routing).
 fn walk_dir(
     dir: &std::path::Path,
+    root: &std::path::Path,
     sources: &mut Vec<RoutedSource>,
     read_errors: &mut Vec<Diagnostic>,
-    exclude: &HashSet<String>,
+    matcher: &exclude::ExcludeMatcher,
+    skipped_excluded: &mut usize,
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -272,16 +294,35 @@ fn walk_dir(
                 }
                 let path = entry.path();
                 if file_type.is_dir() {
-                    // Skip directories whose name matches the exclude set.
+                    // Prune iff the dir base name is a literal exclude entry.
+                    // Wildcard globs and path globs never prune directories (spec 004).
                     let dir_name = entry.file_name();
-                    let dir_name_str = dir_name.to_string_lossy();
-                    if exclude.contains(dir_name_str.as_ref()) {
+                    if matcher.dir_pruned(&dir_name.to_string_lossy()) {
                         continue;
                     }
-                    walk_dir(&path, sources, read_errors, exclude);
+                    walk_dir(&path, root, sources, read_errors, matcher, skipped_excluded);
                 } else if file_type.is_file() {
                     // Route by extension; skip files no frontend handles.
                     if let Some(route) = route_for_path(&path) {
+                        // Exclusion runs AFTER routing (spec 004 invariant).
+                        let rel = path.strip_prefix(root).unwrap_or(&path);
+                        let rel_lossy = rel.to_string_lossy();
+                        // Normalize the OS separator to '/' for glob matching ONLY on Windows.
+                        // On Unix '\' is a valid filename char, so we must not rewrite it (and the
+                        // separator is already '/', so the borrowed path is used verbatim — zero alloc).
+                        let rel_str: std::borrow::Cow<str> = if cfg!(windows) {
+                            std::borrow::Cow::Owned(rel_lossy.replace('\\', "/"))
+                        } else {
+                            rel_lossy
+                        };
+                        let file_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if matcher.file_excluded(&file_name, &rel_str) {
+                            *skipped_excluded += 1;
+                            continue;
+                        }
                         match std::fs::read_to_string(&path) {
                             Ok(text) => sources.push(RoutedSource {
                                 source: SourceFile {

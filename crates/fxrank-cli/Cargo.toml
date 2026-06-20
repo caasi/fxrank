@@ -11,6 +11,7 @@ fxrank-lang-rust = { path = "../fxrank-lang-rust", optional = true }
 fxrank-lang-ts = { path = "../fxrank-lang-ts", optional = true }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
+globset = "0.4"
 [features]
 default = ["rust", "ts"]
 rust = ["dep:fxrank-lang-rust"]

@@ -21,6 +21,7 @@ fn analyze_worked() -> Report {
         parsed: 1,
         functions: output.functions.len(),
         skipped_tests: output.skipped_tests,
+        skipped_excluded: 0,
         risk_features: output.module_risks,
     };
     Report::build(scope, output.functions, output.diagnostics, None)

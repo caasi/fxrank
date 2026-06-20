@@ -496,6 +496,85 @@ fn beta()  { println!("b"); }
     );
 }
 
+// ── Task 004: default file-glob excludes + skipped_excluded count ──
+#[test]
+fn default_excludes_skip_bundles_stories_and_count_them() {
+    let tmp = TempDir::new().expect("tmp");
+    let root = tmp.path();
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).expect("mkdir");
+    // one real source file (kept) + three default-excluded files
+    std::fs::write(src.join("app.ts"), "export function ok() { return 1; }\n").unwrap();
+    std::fs::write(src.join("vendor.min.js"), "function a(){}\n").unwrap();
+    std::fs::write(
+        src.join("Button.stories.tsx"),
+        "export const s = () => 1;\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("jest.setup.js"), "globalThis.x = 1;\n").unwrap();
+
+    let out = fxrank().arg("scan").arg(root).output().expect("ran");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(
+        j["scope"]["skipped_excluded"].as_u64(),
+        Some(3),
+        "three default-excluded files; got: {j}"
+    );
+    // only app.ts contributed functions
+    assert!(j["scope"]["functions"].as_u64().unwrap_or(0) >= 1);
+}
+
+// ── Task 004: a wildcard entry must NOT prune a same-named directory ──
+#[test]
+fn wildcard_default_does_not_prune_matching_directory() {
+    let tmp = TempDir::new().expect("tmp");
+    let root = tmp.path();
+    // directory name matches the default `*.stories.*`
+    let d = root.join("x.stories.d");
+    std::fs::create_dir_all(&d).expect("mkdir");
+    std::fs::write(d.join("keep.ts"), "export function keep() { return 2; }\n").unwrap();
+
+    let out = fxrank().arg("scan").arg(root).output().expect("ran");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    // keep.ts under x.stories.d/ is still scanned (wildcard files-only)
+    assert!(
+        j["hotspots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["symbol"].as_str() == Some("keep")),
+        "x.stories.d/ must not be pruned by the `*.stories.*` default; got: {j}"
+    );
+    assert_eq!(j["scope"]["skipped_excluded"].as_u64(), Some(0));
+}
+
+// ── Task 004: invalid glob → non-zero exit + JSON error ──
+#[test]
+fn invalid_exclude_glob_is_startup_error() {
+    let tmp = TempDir::new().expect("tmp");
+    let out = fxrank()
+        .arg("scan")
+        .arg(tmp.path())
+        .arg("--exclude")
+        .arg("[")
+        .output()
+        .expect("ran");
+    assert!(!out.status.success(), "expected non-zero exit for bad glob");
+    let j: serde_json::Value = serde_json::from_str(String::from_utf8(out.stdout).unwrap().trim())
+        .expect("JSON error object");
+    assert!(j.get("error").is_some(), "expected error key; got: {j}");
+}
+
 // ── Test 14: --exclude flag skips vendor/build dirs ──
 
 /// Build a temp tree:
@@ -577,5 +656,200 @@ fn exclude_skips_default_dirs_and_flag_overrides() {
             .iter()
             .any(|h| h["symbol"].as_str() == Some("nmFetch")),
         "expected 'nmFetch' from node_modules in hotspots when src is excluded; got: {json_custom}"
+    );
+}
+
+// ── Task 004: --exclude replaces the default (not additive) ──
+#[test]
+fn exclude_replaces_default_so_bundles_reappear() {
+    let tmp = TempDir::new().expect("tmp");
+    let root = tmp.path();
+    std::fs::write(root.join("a.min.js"), "function a(){ fetch('x'); }\n").unwrap();
+    // override with an unrelated pattern → a.min.js is no longer excluded
+    let out = fxrank()
+        .arg("scan")
+        .arg(root)
+        .arg("--exclude")
+        .arg("*.nope")
+        .output()
+        .expect("ran");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        j["scope"]["functions"].as_u64().unwrap_or(0) >= 1,
+        "a.min.js should be scanned once defaults are replaced; got: {j}"
+    );
+}
+
+// ── Task 004: --exclude is a no-op for an explicitly named single file ──
+#[test]
+fn exclude_does_not_apply_to_single_file_target() {
+    let tmp = TempDir::new().expect("tmp");
+    let f = tmp.path().join("vendor.min.js");
+    std::fs::write(&f, "function a(){ fetch('x'); }\n").unwrap();
+    // Even though *.min.js is a default exclude, naming the file scans it. The
+    // bogus `--exclude '['` ALSO proves the no-op: for a single file the matcher
+    // is never built, so the invalid glob can't error (guards against building
+    // the matcher at the top of run_scan).
+    let out = fxrank()
+        .arg("scan")
+        .arg(&f)
+        .arg("--exclude")
+        .arg("[")
+        .output()
+        .expect("ran");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        j["scope"]["functions"].as_u64().unwrap_or(0) >= 1,
+        "explicit single-file target must be honored; got: {j}"
+    );
+    assert_eq!(j["scope"]["skipped_excluded"].as_u64(), Some(0));
+}
+
+// ── Task 004: --include-tests does NOT re-include a *.stories.* file ──
+#[test]
+fn include_tests_does_not_reinclude_excluded_stories() {
+    let tmp = TempDir::new().expect("tmp");
+    let root = tmp.path();
+    std::fs::write(root.join("X.stories.tsx"), "export const s = () => 1;\n").unwrap();
+    let out = fxrank()
+        .arg("scan")
+        .arg(root)
+        .arg("--include-tests")
+        .output()
+        .expect("ran");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        j["scope"]["skipped_excluded"].as_u64(),
+        Some(1),
+        "stories stay excluded under --include-tests (exclude != test mechanism); got: {j}"
+    );
+}
+
+// ── Task 004: files accounting — excluded files are in neither files nor read_errors ──
+#[test]
+fn excluded_files_count_in_skipped_not_files() {
+    let tmp = TempDir::new().expect("tmp");
+    let root = tmp.path();
+    std::fs::write(root.join("app.ts"), "export function ok() { return 1; }\n").unwrap();
+    std::fs::write(root.join("vendor.min.js"), "function a(){}\n").unwrap(); // excluded by default
+    let out = fxrank().arg("scan").arg(root).output().expect("ran");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // app.ts is the only file read; vendor.min.js is excluded (not counted in files)
+    assert_eq!(
+        j["scope"]["files"].as_u64(),
+        Some(1),
+        "files = read files only; got: {j}"
+    );
+    assert_eq!(j["scope"]["parsed"].as_u64(), Some(1));
+    assert_eq!(j["scope"]["skipped_excluded"].as_u64(), Some(1));
+}
+
+// ── Task 004 follow-up: mixed entries (glob + literal + path glob); path glob descends & counts ──
+#[test]
+fn exclude_mixes_glob_literal_and_path_glob() {
+    let tmp = TempDir::new().expect("tmp");
+    let root = tmp.path();
+    std::fs::write(
+        root.join("keep.ts"),
+        "export function keep() { return 1; }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("a.min.js"), "function a(){}\n").unwrap(); // *.min.js (name glob)
+    std::fs::write(root.join("vendor.js"), "function v(){}\n").unwrap(); // vendor.js (literal filename)
+    let legacy = root.join("legacy");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(
+        legacy.join("old.ts"),
+        "export function old() { return 2; }\n",
+    )
+    .unwrap(); // legacy/** (path glob)
+    let out = fxrank()
+        .arg("scan")
+        .arg(root)
+        .arg("--exclude")
+        .arg("*.min.js,vendor.js,legacy/**")
+        .output()
+        .expect("ran");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // glob + literal + path-glob each exclude one routable file; legacy/ is descended
+    // (path globs are file filters, not prunes) so old.ts is counted, not pruned.
+    assert_eq!(
+        j["scope"]["skipped_excluded"].as_u64(),
+        Some(3),
+        "glob + literal + path-glob should each exclude one file; got: {j}"
+    );
+    assert!(
+        j["hotspots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["symbol"].as_str() == Some("keep")),
+        "keep.ts should be scanned; got: {j}"
+    );
+}
+
+// ── Task 004 follow-up: path glob anchors relative to scan root through nested dirs ──
+#[test]
+fn path_glob_anchors_through_nested_dirs() {
+    let tmp = TempDir::new().expect("tmp");
+    let root = tmp.path();
+    let nested = root.join("pkg").join("ui");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("x.stories.tsx"), "export const s = () => 1;\n").unwrap();
+    std::fs::write(
+        root.join("keep.ts"),
+        "export function keep() { return 1; }\n",
+    )
+    .unwrap();
+    let out = fxrank()
+        .arg("scan")
+        .arg(root)
+        .arg("--exclude")
+        .arg("**/*.stories.*")
+        .output()
+        .expect("ran");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        j["scope"]["skipped_excluded"].as_u64(),
+        Some(1),
+        "nested pkg/ui/x.stories.tsx matched by **/*.stories.* regardless of depth; got: {j}"
+    );
+    assert!(
+        j["hotspots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["symbol"].as_str() == Some("keep")),
+        "keep.ts should be scanned; got: {j}"
     );
 }

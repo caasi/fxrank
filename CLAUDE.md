@@ -53,6 +53,7 @@ cargo build -p fxrank --no-default-features --features ts    # slim TS-only buil
 cargo run -p fxrank -- scan <path>                       # run the tool
 cargo run -p fxrank -- scan crates/ | jq                 # dogfood on our own source
 cargo run -p fxrank -- scan crates/ --include-tests      # score test code too (skipped by default)
+cargo run -p fxrank -- scan <path> --exclude 'node_modules,*.min.js,*.stories.*'  # replaces the default skip list
 echo 'function f(): void {}' | cargo run -p fxrank -- scan --lang ts -  # scan a TS fragment from stdin
 cargo insta review                                       # accept snapshot test changes (insta)
 cargo install --git https://github.com/caasi/fxrank fxrank  # field-install the binary to ~/.cargo/bin
@@ -100,6 +101,15 @@ CLI → core::Report::build(scope, hotspots, diagnostics, limit)  → compact JS
   The discount touches only the mutation channel, never sibling effects.
 - **Centralize new vocabulary**: add effect kinds to `EffectKind` and risk kinds to
   `RiskKind` (both have `wire()` + class) — never hand-write wire strings at call sites.
+- **`--exclude` is a three-class matcher** (spec 004): a no-`/` literal prunes a
+  matching directory and excludes a matching file; a no-`/` glob (`*.min.js`,
+  `*.stories.*`) excludes files only (never prunes a same-named dir); a `/`-bearing
+  glob filters files by relative path. It **replaces** the default list when given.
+  The default skips vendored bundles, Storybook stories, `jest.setup`/`jest.config`,
+  `__mocks__`, and the MSW worker. Files dropped this way are counted in
+  `scope.skipped_excluded` (directory prunes are not counted — they are never read).
+  `--exclude` applies only to directory scans; an explicitly named file/stdin is
+  always scanned.
 - Tests use a shared `analyze_fixture(name)` helper reading `tests/fixtures/*.rs`
   (subdir — cargo does not compile those as test targets). Snapshot tests use `insta`.
 

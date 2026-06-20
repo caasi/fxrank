@@ -9,6 +9,7 @@ pub struct Scope {
     pub parsed: usize,
     pub functions: usize,
     pub skipped_tests: usize,
+    pub skipped_excluded: usize,
     pub risk_features: Vec<RiskFeature>,
 }
 
@@ -20,6 +21,7 @@ impl Scope {
             parsed: 0,
             functions: 0,
             skipped_tests: 0,
+            skipped_excluded: 0,
             risk_features: vec![],
         }
     }
@@ -173,6 +175,7 @@ mod tests {
                 parsed: 1,
                 functions: 2,
                 skipped_tests: 0,
+                skipped_excluded: 0,
                 risk_features: vec![],
             },
             vec![hot("a", 4, 5.0, 0.9), hot("b", 7, 25.5, 0.6)],
@@ -214,6 +217,7 @@ mod tests {
             parsed: 1,
             functions: 0,
             skipped_tests: 0,
+            skipped_excluded: 0,
             risk_features: vec![risk(RiskKind::ImplDrop, "f.rs", 3)], // class 2, weight 2
         };
         let report = Report::build(scope, vec![], vec![], None);
@@ -230,6 +234,7 @@ mod tests {
             parsed: 1,
             functions: 1,
             skipped_tests: 0,
+            skipped_excluded: 0,
             risk_features: vec![risk(RiskKind::Transmute, "f.rs", 1)],
         };
         let report = Report::build(scope, vec![hot("a", 4, 5.0, 0.9)], vec![], None);
@@ -246,6 +251,7 @@ mod tests {
                 parsed: 1,
                 functions: 2,
                 skipped_tests: 3,
+                skipped_excluded: 5,
                 risk_features: vec![],
             },
             vec![],
@@ -253,7 +259,9 @@ mod tests {
             None,
         );
         let json = serde_json::to_string(&report).unwrap();
-        assert!(json.contains("\"functions\":2,\"skipped_tests\":3,\"risk_features\":"));
+        assert!(json.contains(
+            "\"functions\":2,\"skipped_tests\":3,\"skipped_excluded\":5,\"risk_features\":"
+        ));
     }
 
     #[test]
@@ -265,6 +273,7 @@ mod tests {
                 parsed: 1,
                 functions: 3,
                 skipped_tests: 0,
+                skipped_excluded: 0,
                 risk_features: vec![],
             },
             vec![
