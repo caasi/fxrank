@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use std::io::Write;
+use tempfile::TempDir;
 
 fn fxrank() -> Command {
     Command::cargo_bin("fxrank").expect("binary exists")
@@ -492,5 +493,89 @@ fn beta()  { println!("b"); }
     assert!(
         functions_count >= 2,
         "scope.functions should be ≥ 2 (all functions), got {functions_count}"
+    );
+}
+
+// ── Test 14: --exclude flag skips vendor/build dirs ──
+
+/// Build a temp tree:
+///   <tmp>/src/app.ts          — has a fetch() call (effect-producing)
+///   <tmp>/node_modules/pkg/index.ts — also has an effect
+///
+/// Default scan must skip node_modules; --exclude src must skip src but include
+/// node_modules.
+#[test]
+fn exclude_skips_default_dirs_and_flag_overrides() {
+    let tmp: TempDir = TempDir::new().expect("create temp dir");
+    let root = tmp.path();
+
+    // <tmp>/src/app.ts
+    let src_dir = root.join("src");
+    std::fs::create_dir_all(&src_dir).expect("create src dir");
+    std::fs::write(
+        src_dir.join("app.ts"),
+        "async function fetchData() { return await fetch('https://example.com'); }\n",
+    )
+    .expect("write app.ts");
+
+    // <tmp>/node_modules/pkg/index.ts
+    let nm_dir = root.join("node_modules").join("pkg");
+    std::fs::create_dir_all(&nm_dir).expect("create node_modules dir");
+    std::fs::write(
+        nm_dir.join("index.ts"),
+        "async function nmFetch() { return await fetch('https://cdn.example.com'); }\n",
+    )
+    .expect("write index.ts");
+
+    // --- Default scan: node_modules is in the default exclude list, src is not ---
+    let out_default = fxrank()
+        .arg("scan")
+        .arg(root)
+        .output()
+        .expect("process ran");
+    assert!(
+        out_default.status.success(),
+        "default scan failed; stderr: {}",
+        String::from_utf8_lossy(&out_default.stderr)
+    );
+    let stdout_default = String::from_utf8(out_default.stdout).expect("utf-8");
+    let json_default: serde_json::Value =
+        serde_json::from_str(stdout_default.trim()).expect("valid JSON");
+    let fn_count_default = json_default["scope"]["functions"].as_u64().unwrap_or(0);
+    // Only src/app.ts is scanned (node_modules excluded by default) → 1 function
+    assert_eq!(
+        fn_count_default, 1,
+        "default scan should find 1 function (node_modules excluded); got {fn_count_default}"
+    );
+
+    // --- --exclude src: src dir is now excluded; node_modules is NOT in the list ---
+    let out_custom = fxrank()
+        .arg("scan")
+        .arg(root)
+        .arg("--exclude")
+        .arg("src")
+        .output()
+        .expect("process ran");
+    assert!(
+        out_custom.status.success(),
+        "--exclude src scan failed; stderr: {}",
+        String::from_utf8_lossy(&out_custom.stderr)
+    );
+    let stdout_custom = String::from_utf8(out_custom.stdout).expect("utf-8");
+    let json_custom: serde_json::Value =
+        serde_json::from_str(stdout_custom.trim()).expect("valid JSON");
+    let fn_count_custom = json_custom["scope"]["functions"].as_u64().unwrap_or(0);
+    // node_modules/pkg/index.ts is scanned; src excluded → 1 function from node_modules
+    assert_eq!(
+        fn_count_custom, 1,
+        "--exclude src should find 1 function (only node_modules scanned); got {fn_count_custom}"
+    );
+    // The hotspot symbol should be nmFetch (from node_modules), not fetchData (from src)
+    let hotspots = json_custom["hotspots"].as_array().expect("hotspots array");
+    assert!(
+        hotspots
+            .iter()
+            .any(|h| h["symbol"].as_str() == Some("nmFetch")),
+        "expected 'nmFetch' from node_modules in hotspots when src is excluded; got: {json_custom}"
     );
 }

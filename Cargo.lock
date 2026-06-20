@@ -331,6 +331,7 @@ dependencies = [
  "fxrank-lang-ts",
  "predicates",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

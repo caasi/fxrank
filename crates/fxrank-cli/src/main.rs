@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use fxrank_core::frontend::{FrontendOutput, SourceFile};
 use fxrank_core::model::{Diagnostic, Report, Scope};
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,6 +32,14 @@ enum Cmd {
         /// for stdin; for files/directories the extension decides the frontend.
         #[arg(long)]
         lang: Option<String>,
+        /// Directory NAMES to skip during directory scans (comma-separated;
+        /// overrides the default set when provided).
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "node_modules,.git,target"
+        )]
+        exclude: Vec<String>,
     },
 }
 
@@ -60,9 +69,11 @@ fn main() -> ExitCode {
         limit,
         include_tests,
         lang,
+        exclude,
     } = cli.cmd;
 
-    match run_scan(path, limit, include_tests, lang) {
+    let exclude_set: HashSet<String> = exclude.into_iter().collect();
+    match run_scan(path, limit, include_tests, lang, &exclude_set) {
         Ok(report) => {
             // Compact JSON: no trailing newline issues — println! adds exactly one.
             println!(
@@ -84,6 +95,7 @@ fn run_scan(
     limit: Option<usize>,
     include_tests: bool,
     lang: Option<String>,
+    exclude: &HashSet<String>,
 ) -> Result<Report, String> {
     // Accumulated read-error diagnostics (files that exist but couldn't be read).
     let mut read_errors: Vec<Diagnostic> = Vec::new();
@@ -149,7 +161,7 @@ fn run_scan(
         } else {
             // Directory: walk recursively collecting routable source files.
             let label = p.to_string_lossy().into_owned();
-            let routed = collect_source_files(&p, &mut read_errors);
+            let routed = collect_source_files(&p, &mut read_errors, exclude);
             (label, routed)
         }
     };
@@ -197,21 +209,25 @@ fn route_for_path(path: &std::path::Path) -> Option<Route> {
 
 /// Walk `dir` recursively, collecting every routable source file (`.rs` plus the
 /// JS/TS family) as a `RoutedSource`. Files that can't be read are pushed to
-/// `read_errors` instead.
+/// `read_errors` instead. Directories whose file name matches an entry in
+/// `exclude` are skipped entirely (no recursion).
 fn collect_source_files(
     dir: &std::path::Path,
     read_errors: &mut Vec<Diagnostic>,
+    exclude: &HashSet<String>,
 ) -> Vec<RoutedSource> {
     let mut sources = Vec::new();
-    walk_dir(dir, &mut sources, read_errors);
+    walk_dir(dir, &mut sources, read_errors, exclude);
     sources
 }
 
-/// Recursively collects routable source files under `dir`, skipping symlinks.
+/// Recursively collects routable source files under `dir`, skipping symlinks
+/// and any directory whose name is in `exclude`.
 fn walk_dir(
     dir: &std::path::Path,
     sources: &mut Vec<RoutedSource>,
     read_errors: &mut Vec<Diagnostic>,
+    exclude: &HashSet<String>,
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -256,7 +272,13 @@ fn walk_dir(
                 }
                 let path = entry.path();
                 if file_type.is_dir() {
-                    walk_dir(&path, sources, read_errors);
+                    // Skip directories whose name matches the exclude set.
+                    let dir_name = entry.file_name();
+                    let dir_name_str = dir_name.to_string_lossy();
+                    if exclude.contains(dir_name_str.as_ref()) {
+                        continue;
+                    }
+                    walk_dir(&path, sources, read_errors, exclude);
                 } else if file_type.is_file() {
                     // Route by extension; skip files no frontend handles.
                     if let Some(route) = route_for_path(&path) {
