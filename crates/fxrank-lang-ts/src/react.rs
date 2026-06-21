@@ -417,6 +417,43 @@ mod tests {
     }
 
     #[test]
+    fn usereducer_lazy_init_maps_render_at_arg2() {
+        // With a 3rd arg (the init function): args[2] arrow → HookPhase::Render.
+        let (u, lines) = unit_with_lines(
+            "function C(){ const [s,d]=useReducer(reducer, initial, () => fetch('/a')); return <i/>; }",
+            "C",
+        );
+        let map = inherited_callbacks(&u.body, &lines);
+        assert_eq!(map.len(), 1, "exactly one callback mapped");
+        assert!(
+            map.values().all(|&p| p == HookPhase::Render),
+            "lazy init arg maps to Render phase"
+        );
+
+        // Without a 3rd arg: no lazy init → 0 entries.
+        let (u2, lines2) = unit_with_lines(
+            "function C(){ const [s,d]=useReducer(reducer, initial); return <i/>; }",
+            "C",
+        );
+        let map2 = inherited_callbacks(&u2.body, &lines2);
+        assert_eq!(map2.len(), 0, "no 3rd arg means no callback mapped");
+    }
+
+    #[test]
+    fn usestate_lazy_init_maps_render() {
+        let (u, lines) = unit_with_lines(
+            "function C(){ const [v,setV]=useState(() => fetch('/b')); return <i/>; }",
+            "C",
+        );
+        let map = inherited_callbacks(&u.body, &lines);
+        assert_eq!(map.len(), 1, "exactly one callback mapped");
+        assert!(
+            map.values().all(|&p| p == HookPhase::Render),
+            "useState lazy init maps to Render phase"
+        );
+    }
+
+    #[test]
     fn detects_jsx_return() {
         assert!(returns_jsx(
             &unit("function C(){ return <div/>; }", "C").body
