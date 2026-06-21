@@ -174,6 +174,11 @@ hooks as hooks; `.current` reads; `use(promise)`; `useSyncExternalStore`; `creat
 `React.useX` calls; custom-hook callback inheritance; base-TS raw-DOM world effects and the
 `hidden`→`global` refinement; cross-file confirmation (#25).
 
+**Known Limitation (Milestone-A, accepted):** a `useMemo(() => <jsx/>)` arrow that both returns JSX
+and is a hook callback is suppressed (the inherited-callback check precedes the component branch), so
+its own render signals are not augmented with `EffectInRender` — the arrow's JSX-returning nature is
+never evaluated once it is claimed by `useMemo`. Deferred to Milestone-B.
+
 ## 10. Acceptance sketch (only in-scope demonstrables)
 
 - React files detected by `.tsx`/`.jsx` or JSX syntax; detectors in `fxrank-lang-ts`; no new crate.
