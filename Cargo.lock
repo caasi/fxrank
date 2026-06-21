@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "fxrank"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "fxrank-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "fxrank-lang-python"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "fxrank-core",
  "insta",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "fxrank-lang-rust"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "fxrank-core",
  "insta",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "fxrank-lang-ts"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "fxrank-core",
  "insta",
