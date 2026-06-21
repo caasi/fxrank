@@ -27,6 +27,7 @@ pub enum EffectKind {
     LocalMutation,
     UnknownMacro,
     ThisMutation,
+    StateTransition,
 }
 impl EffectKind {
     pub fn wire(self) -> &'static str {
@@ -48,6 +49,7 @@ impl EffectKind {
             LocalMutation => "local.mutation",
             UnknownMacro => "unknown.macro",
             ThisMutation => "this.mutation",
+            StateTransition => "state.transition",
         }
     }
     pub fn base_class(self) -> u8 {
@@ -60,7 +62,7 @@ impl EffectKind {
             GlobalMutation => 6,
             HiddenMutation | ParamMutation => 3,
             AmbientRead | UnknownMacro => 2,
-            LocalMutation => 1,
+            LocalMutation | StateTransition => 1,
             ThisMutation => 3,
         }
     }
@@ -88,6 +90,7 @@ pub enum RiskKind {
     DynamicCode,
     ProtoPollution,
     HtmlInjection,
+    EffectInRender,
 }
 impl RiskKind {
     pub fn wire(self) -> &'static str {
@@ -113,6 +116,7 @@ impl RiskKind {
             DynamicCode => "dynamic.code",
             ProtoPollution => "proto.pollution",
             HtmlInjection => "html.injection",
+            EffectInRender => "effect.in.render",
         }
     }
     pub fn class(self) -> u8 {
@@ -121,7 +125,7 @@ impl RiskKind {
             Transmute | RawPtrDeref | FfiCall | Asm | RawPtrOp | MaybeUninit | FromRaw
             | GetUnchecked | DynamicCode => 7,
             UnsafeBlock | UnsafeFn | UnsafeImpl | HtmlInjection => 5,
-            BoxLeak | MemForget | ManuallyDrop | ProtoPollution => 4,
+            BoxLeak | MemForget | ManuallyDrop | ProtoPollution | EffectInRender => 4,
             TypeEscape => 3,
             ImplDrop | ExternBlock => 2,
         }
@@ -202,5 +206,13 @@ mod tests {
         assert_eq!(RiskKind::DynamicCode.class(), 7);
         assert_eq!(RiskKind::ProtoPollution.class(), 4);
         assert_eq!(RiskKind::HtmlInjection.class(), 5);
+    }
+
+    #[test]
+    fn react_vocabulary_metadata() {
+        assert_eq!(EffectKind::StateTransition.wire(), "state.transition");
+        assert_eq!(EffectKind::StateTransition.base_class(), 1);
+        assert_eq!(RiskKind::EffectInRender.wire(), "effect.in.render");
+        assert_eq!(RiskKind::EffectInRender.class(), 4);
     }
 }
