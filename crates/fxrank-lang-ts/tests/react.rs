@@ -110,12 +110,37 @@ fn lifting_makes_child_pure_parent_holds_state() {
 #[test]
 fn onclick_handler_is_not_effect_in_render() {
     let hs = util::analyze_tsx("function C(){ return <button onClick={() => fetch('/x')}/>; }");
+
+    // AFFIRMATIVE: the inline handler arrow appears as its own non-suppressed hotspot
+    // carrying the net.fs.db effect — proving the fetch was scored on the handler unit,
+    // NOT on the component, and that scanning actually ran.
+    let handler = hs
+        .iter()
+        .find(|h| h.symbol.starts_with("<arrow@"))
+        .expect("onClick handler arrow must appear as its own hotspot");
+    assert!(
+        handler
+            .effects
+            .iter()
+            .any(|e| e.kind == fxrank_core::effect::EffectKind::NetFsDb),
+        "handler arrow carries NetFsDb effect (the fetch)"
+    );
+    assert!(
+        handler
+            .risk_features
+            .iter()
+            .all(|r| r.kind != fxrank_core::effect::RiskKind::EffectInRender),
+        "handler arrow itself is not tagged EffectInRender (it is event-time)"
+    );
+
+    // ABSENCE: the component C must not carry EffectInRender — the absence assertion
+    // is now discriminating because we confirmed scanning ran and the fetch scored.
     let c = hs.iter().find(|h| h.symbol == "C").unwrap();
     assert!(
         c.risk_features
             .iter()
             .all(|r| r.kind != fxrank_core::effect::RiskKind::EffectInRender),
-        "event handler is not render-time"
+        "event handler is not render-time — C must not carry EffectInRender"
     );
 }
 
