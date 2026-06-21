@@ -1,9 +1,13 @@
 //! React-specific syntax recognition for the TS frontend.
 
-use swc_ecma_ast::{Expr, ReturnStmt};
+use fxrank_core::confidence::detection_confidence;
+use fxrank_core::effect::{Effect, EffectKind, Tier};
+use fxrank_core::score::weight_for_class;
+use swc_ecma_ast::{Expr, Pat, ReturnStmt, VarDeclarator};
 use swc_ecma_visit::Visit;
 
 use crate::functions::FnBodyOwned;
+use crate::source::SpanLines;
 
 /// True if the function body yields JSX on at least one return path (or as a
 /// bare arrow expression body). Descent stops at nested functions/arrows, so a
@@ -17,6 +21,84 @@ pub fn returns_jsx(body: &FnBodyOwned) -> bool {
             v.found
         }
     }
+}
+
+/// Emit one `StateTransition` (class 1) effect per literal `useState` /
+/// `useReducer` declaration in the component body.
+///
+/// Only top-level declarations in the function's own body are recognized;
+/// descent stops at nested functions/arrows so a `useState` inside a callback
+/// does not attribute to the enclosing component. Alias hooks (custom names that
+/// wrap `useState`) are an accepted miss — only literal callee idents match.
+///
+/// Attribution is at the DECLARATION (the `const [v, setV] = useState(…)` line),
+/// not at setter call sites. This is the "component holds traced state" signal;
+/// `contained` handling belongs to the Task 9 caller.
+pub fn state_transitions(body: &FnBodyOwned, lines: &SpanLines) -> Vec<Effect> {
+    let mut walker = StateTransitionWalker {
+        lines,
+        effects: Vec::new(),
+    };
+    body.walk_with(&mut walker);
+    walker.effects
+}
+
+struct StateTransitionWalker<'a> {
+    lines: &'a SpanLines,
+    effects: Vec<Effect>,
+}
+
+impl Visit for StateTransitionWalker<'_> {
+    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
+        // Recognize: `const [v, setV] = useState(…)` / `[s, dispatch] = useReducer(…)`
+        // The init must be a call expression with a literal `useState`/`useReducer` callee.
+        let Some(init) = &node.init else {
+            return;
+        };
+        let Expr::Call(call) = init.as_ref() else {
+            return;
+        };
+        let callee_name = match &call.callee {
+            swc_ecma_ast::Callee::Expr(e) => match e.as_ref() {
+                Expr::Ident(i) => Some(i.sym.to_string()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let subreason = match callee_name.as_deref() {
+            Some("useState") => "useState",
+            Some("useReducer") => "useReducer",
+            _ => return,
+        };
+        // Only emit for array-destructuring patterns (canonical `[v, setV]` shape).
+        // Non-destructured `const state = useState(…)` does not match the hook contract.
+        if !matches!(&node.name, Pat::Array(_)) {
+            return;
+        }
+        let line = self.lines.line(node.span);
+        let class: u8 = 1;
+        let confidence = detection_confidence(Tier::Heuristic, false, false);
+        self.effects.push(Effect {
+            kind: EffectKind::StateTransition,
+            class,
+            discounted_to: None,
+            weight: weight_for_class(class),
+            line,
+            tier: Tier::Heuristic,
+            hidden: false,
+            evidence: format!("{subreason}(…)"),
+            discount: None,
+            subreason: Some(subreason.to_string()),
+            confidence,
+        });
+        // Do NOT recurse into children — this is just a declarator visit.
+        // Nested fns/arrows are stopped by the overrides below.
+    }
+
+    // Stop descent at nested function scopes so a useState call inside a
+    // callback does not attribute to the enclosing component.
+    fn visit_arrow_expr(&mut self, _n: &swc_ecma_ast::ArrowExpr) {}
+    fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
 }
 
 fn expr_is_jsx(e: &Expr) -> bool {
@@ -59,6 +141,31 @@ mod tests {
             .into_iter()
             .find(|u| u.symbol == symbol)
             .expect("unit")
+    }
+
+    // parse_and_collect DROPS the SourceMap, so this helper uses parse_module
+    // (which returns the cm) + collect — it cannot wrap parse_and_collect.
+    fn unit_with_lines(src: &str, symbol: &str) -> (crate::functions::FnUnit, SpanLines) {
+        use crate::functions::{collect, parse_module};
+        let (module, cm) = parse_module(src, "t.tsx", Lang::Tsx).unwrap();
+        let lines = SpanLines::new(cm);
+        let u = collect(&module, "t.tsx", &lines)
+            .into_iter()
+            .find(|u| u.symbol == symbol)
+            .expect("unit");
+        (u, lines)
+    }
+
+    #[test]
+    fn usestate_decl_emits_state_transition() {
+        let (u, lines) = unit_with_lines(
+            "function C(){ const [v,setV]=useState(0); return <i/>; }",
+            "C",
+        );
+        let effs = state_transitions(&u.body, &lines);
+        assert_eq!(effs.len(), 1);
+        assert_eq!(effs[0].kind, EffectKind::StateTransition);
+        assert_eq!(effs[0].class, 1);
     }
 
     #[test]
