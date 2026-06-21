@@ -208,7 +208,10 @@ fn expr_is_jsx(e: &Expr) -> bool {
         || matches!(e, Expr::Paren(p) if expr_is_jsx(&p.expr))
         // `cond ? <a/> : <b/>` and `x && <a/>` are common JSX return shapes.
         || matches!(e, Expr::Cond(c) if expr_is_jsx(&c.cons) || expr_is_jsx(&c.alt))
-        || matches!(e, Expr::Bin(b) if expr_is_jsx(&b.right))
+        // only logical `&&` / `||` JSX shapes, not arbitrary binary exprs:
+        || matches!(e, Expr::Bin(b)
+            if matches!(b.op, swc_ecma_ast::BinaryOp::LogicalAnd | swc_ecma_ast::BinaryOp::LogicalOr)
+            && expr_is_jsx(&b.right))
 }
 
 struct JsxReturnFinder { found: bool }
@@ -247,6 +250,7 @@ git commit -m "feat(ts): React JSX-return component detection"
 
 **Interfaces:**
 - Produces: a unit named after the outer binding when its init is `memo(fn)` / `forwardRef(fn)` (so `const C = forwardRef(function(){return <i/>})` reports as `C`, not `<fn@…>`).
+- Produces: a new `FnUnit.col: usize` field (set in `Collector::push` from the `(line, col)` it already computes) — Task 9's inheritance linkage needs `unit.col` directly and must **never** parse `col` out of `id` (both `path` and `symbol` can contain `:`).
 
 - [ ] **Step 1: Write the failing test** — in the `functions.rs` tests:
 
@@ -290,7 +294,9 @@ fn react_wrapped_inner(init: Option<&Expr>) -> bool {
 }
 ```
 
-Then in `visit_var_declarator`: `let directly_callable = matches!(...) || react_wrapped_inner(node.init.as_deref());`. Because `pending_name` is consumed by the **next** `visit_arrow_expr`/`visit_fn_expr`, and the wrapper call's argument arrow/fn is the next such node visited during `node.visit_children_with(self)`, the inner function picks up the outer name. (Verify ordering with the test; if the call's other args could intercept, narrow by only setting `pending_name` when arg 0 is the callable.)
+Then in `visit_var_declarator`: `let directly_callable = matches!(...) || react_wrapped_inner(node.init.as_deref());`. Because `pending_name` is consumed by the **next** `visit_arrow_expr`/`visit_fn_expr`, and the wrapper call's argument arrow/fn is the next such node visited during `node.visit_children_with(self)`, the inner function picks up the outer name. The `react_wrapped_inner` guard (arg 0 must be the arrow/fn) is **load-bearing, not optional** — `forwardRef((props, ref) => …)` is arg 0, but a stray `memo(x, () => …)` must not mis-bind. Nested wrappers (`memo(forwardRef(fn))`) are a **documented miss** for Milestone-A (add a fixture noting it).
+
+Also add `pub col: usize` to `struct FnUnit` (functions.rs:84) and set it in `Collector::push` (functions.rs:186) from the `(line, col)` tuple it already receives — Task 9 reads `unit.col` directly because the `id` cannot be safely split for `col`.
 
 - [ ] **Step 4: Run it, verify it passes**
 
@@ -332,7 +338,7 @@ fn useref_current_write_is_hidden_mutation() {
 }
 ```
 
-(`detect_in` = a small test helper that parses the source, takes the `C` unit, and calls `detect(...)`. Add it to the test module if absent, mirroring existing tests.)
+(`mutation.rs` has **no** `#[cfg(test)]` module yet — create one. There is nothing in this file to "mirror"; model the helper on `calls.rs`'s `kinds` helper (`calls.rs:254`): parse via `functions::parse_module`, build `SpanLines::new(cm)` and `ImportTable::from_module`, `functions::collect`, take the `C` unit, then call the real 5-arg signature `detect(&unit.body, &unit.sig, unit.is_constructor, &lines, &imports) -> Vec<(Effect, bool)>`.)
 
 - [ ] **Step 2: Run it, verify it fails**
 
@@ -349,7 +355,7 @@ Expected: FAIL — currently `r` is a local → `LocalMutation` class 1.
         .with_subreason("ref-cell-write")
 ```
 
-  - thread `subreason` through `Classification` and into the emitted `Effect` (`subreason: c.subreason`). Only `.current`-targeted writes should qualify: in `record_write`, when the base is a ref binding, confirm the place expression's member chain includes `.current` (guard so a non-`.current` write to the ref binding itself, rare, doesn't misfire). Reads are NOT handled (mutation walker only visits write sites — correct per spec).
+  - add a `subreason: Option<&'static str>` field to `struct Classification` (default `None` in `Classification::new`) plus a builder `fn with_subreason(mut self, s: &'static str) -> Self { self.subreason = Some(s); self }` (the `.with_subreason("ref-cell-write")` call above needs it defined); thread it into the emitted `Effect` as `subreason: c.subreason.map(String::from)`. Only `.current`-targeted writes should qualify: in `record_write`, when the base is a ref binding, confirm the place expression's member chain includes `.current` (guard so a non-`.current` write to the ref binding itself, rare, doesn't misfire). Reads are NOT handled (mutation walker only visits write sites — correct per spec).
 
 - [ ] **Step 4: Run it, verify it passes**
 
@@ -377,10 +383,20 @@ git commit -m "feat(ts): classify useRef().current writes as hidden mutation"
 - [ ] **Step 1: Write the failing test:**
 
 ```rust
+// parse_and_collect DROPS the SourceMap, so this helper must use parse_module
+// (which returns the cm) + collect — it cannot wrap parse_and_collect.
+fn unit_with_lines(src: &str, symbol: &str) -> (crate::functions::FnUnit, SpanLines) {
+    use crate::functions::{collect, parse_module};
+    let (module, cm) = parse_module(src, "t.tsx", Lang::Tsx).unwrap();
+    let lines = SpanLines::new(cm);
+    let u = collect(&module, "t.tsx", &lines).into_iter()
+        .find(|u| u.symbol == symbol).expect("unit");
+    (u, lines)
+}
+
 #[test]
 fn usestate_decl_emits_state_transition() {
-    let u = unit("function C(){ const [v,setV]=useState(0); return <i/>; }", "C");
-    let lines = /* SpanLines for the same parse */ ;
+    let (u, lines) = unit_with_lines("function C(){ const [v,setV]=useState(0); return <i/>; }", "C");
     let effs = state_transitions(&u.body, &lines);
     assert_eq!(effs.len(), 1);
     assert_eq!(effs[0].kind, EffectKind::StateTransition);
@@ -388,7 +404,7 @@ fn usestate_decl_emits_state_transition() {
 }
 ```
 
-(Restructure the `unit` helper to also return the `SpanLines`, or add a sibling helper `unit_with_lines`. The parse already builds a `SourceMap`; expose `SpanLines::new(cm)`.)
+(`SpanLines::new(cm)` and `line_col` both exist in `source.rs`. This single `unit_with_lines` helper serves Tasks 6, 7, and 8.)
 
 - [ ] **Step 2: Run it, verify it fails**
 
@@ -496,7 +512,8 @@ Expected: FAIL.
 - [ ] **Step 3: Implement** — a visitor over the component body. For each `CallExpr` whose callee ident is a known hook, if `args[0].expr` (and for `useState`/`useReducer` the lazy-init arg) is `Expr::Arrow`, record `(arrow.span → (line,col))` with the phase:
   - `useEffect`, `useLayoutEffect` → `HookPhase::Effect`;
   - `useMemo`, `useCallback` → `HookPhase::Render`;
-  - `useState`, `useReducer` → `HookPhase::Render` **only for the lazy-initializer arrow** (the first arg when it is an arrow).
+  - `useState` → `HookPhase::Render` only for the **lazy-initializer arrow** (`args[0]` when it is an arrow);
+  - `useReducer` → `HookPhase::Render` only for the **lazy `init` arrow**, which is the **third** argument: `useReducer(reducer, initialArg, init)` → `args[2]`. Do **not** inherit `useReducer`'s reducer (`args[0]`) or initial value (`args[1]`).
   Stop at nested fns/arrows so only **direct** hook-argument arrows are mapped (single-hop). Do not record event-handler arrows (they are JSX attributes, never hook call arguments).
 
 - [ ] **Step 4: Run it, verify it passes**
@@ -567,57 +584,74 @@ fn useref_write_outranks_setter() {
 Run: `cargo test -p fxrank-lang-ts --test react`
 Expected: FAIL — components don't inherit; arrows still present.
 
-- [ ] **Step 3: Implement** the two-pass in `TsFrontend::analyze` (replace the single per-unit loop):
+- [ ] **Step 3: Implement** the two-pass in `TsFrontend::analyze`. **Preserve the existing `is_test_file` skip + `skipped_tests` tally (lib.rs:63–71)** — run this pass only on non-test files. Replace the per-unit scoring loop:
 
 ```rust
-// after `let units = functions::collect(...)`:
 use crate::react;
+use std::collections::{HashMap, HashSet};
 
-// 1. Identify components and their inherited arrow callbacks.
+// 1. Components, their ref-binding sets, and the inherited arrows they own.
 let components: Vec<&FnUnit> = units.iter().filter(|u| react::returns_jsx(&u.body)).collect();
-// arrow (line,col) -> (component_id, phase)
-let mut inherited: HashMap<(usize,usize), (String, react::HookPhase)> = HashMap::new();
+let comp_refs: HashMap<String, HashSet<String>> =
+    components.iter().map(|c| (c.id.clone(), react::ref_bindings(&c.body))).collect();
+let mut inherited: HashMap<(usize, usize), (String, react::HookPhase)> = HashMap::new();
 for c in &components {
-    for ((l,col), phase) in react::inherited_callbacks(&c.body, &lines) {
-        inherited.insert((l,col), (c.id.clone(), phase));
+    for ((l, col), phase) in react::inherited_callbacks(&c.body, &lines) {
+        inherited.insert((l, col), (c.id.clone(), phase));
     }
 }
 
-// 2. Score each unit, but route inherited arrows into their component.
-//    `analyze_unit_raw` returns (Hotspot, raw effects+risks) so the component can absorb.
+// 2. Score each unit, routing inherited arrows into their owning component.
 let mut by_id: HashMap<String, Hotspot> = HashMap::new();
 let mut order: Vec<String> = Vec::new();
+let mut pending: HashMap<String, Vec<(react::HookPhase, detect::RawSignals)>> = HashMap::new();
 for unit in &units {
-    let key = (unit.line, /* col from unit.id */ react::col_of(&unit.id));
+    let key = (unit.line, unit.col); // unit.col is a real field (Task 4) — NEVER parse it from `id`
     if let Some((comp_id, phase)) = inherited.get(&key).cloned() {
-        // suppress this arrow as a standalone hotspot; stash its raw effects for the component.
-        let raw = detect::raw_signals(unit, &imports, &lines); // effects + risks, pre-discount
-        pending_inherit.entry(comp_id).or_default().push((phase, raw));
+        // Suppress this arrow as a standalone hotspot; stash its raw signals.
+        // Pass the owning component's ref-binding set so a `r.current = …` write inside
+        // this callback still classifies as ref-cell-write (the arrow alone can't know `r`
+        // is a useRef binding declared in the component).
+        let refs = comp_refs.get(&comp_id).cloned().unwrap_or_default();
+        let raw = detect::raw_signals(unit, &imports, &lines, &refs);
+        pending.entry(comp_id).or_default().push((phase, raw));
         continue;
     }
     let mut h = detect::analyze_unit(unit, &imports, &lines);
-    // attach React per-unit signals + EffectInRender for components:
     if react::returns_jsx(&unit.body) {
-        react::augment_component(&mut h, unit, &lines); // StateTransition, useContext, EffectInRender on own-body world effects
+        detect::augment_component(&mut h, unit, &lines);
     }
     by_id.insert(unit.id.clone(), h);
     order.push(unit.id.clone());
 }
-// 3. Fold inherited raw effects into each component and recompute.
-for (comp_id, inherited_raws) in pending_inherit {
+// 3. Fold inherited raw signals into each component, then recompute.
+for (comp_id, raws) in pending {
     if let Some(h) = by_id.get_mut(&comp_id) {
-        react::absorb_inherited(h, inherited_raws); // contained=false; Render phase -> EffectInRender; recompute own_score/max_class/risk_weight
+        detect::absorb_inherited(h, raws);
     }
 }
 for id in order { output.functions.push(by_id.remove(&id).unwrap()); }
 ```
 
-Add to `detect/mod.rs`:
-- `pub fn raw_signals(unit, imports, lines) -> RawSignals` — the `gather` effects (un-discounted) + risks, without building a `Hotspot`.
-- `pub fn augment_component(h: &mut Hotspot, unit, lines)` — push `state_transitions` + `context_reads` effects (all `contained=false`), and for each of `h`'s own world effects (`net.fs.db`/`process.control`/… i.e. base-class ≥ 5 call effects) that originate in the component's own statements, add an `EffectInRender` risk; then recompute `own_score`/`max_class`/`risk_weight`/`confidence`.
-- `pub fn absorb_inherited(h: &mut Hotspot, raws: Vec<(HookPhase, RawSignals)>)` — extend `h.effects` with each raw effect (`contained=false`, no boundary discount), extend `h.risk_features` with the raws' risks; for `HookPhase::Render`, add an `EffectInRender` risk per world effect; recompute the four scoring fields via the core functions (`own_score`, `max_class`, `weight_for_class`, `function_confidence`).
+New `react.rs` helper this uses:
+- `pub fn ref_bindings(body: &FnBodyOwned) -> HashSet<String>` — names bound by `const x = useRef(…)`; factor the Task-5 ref-binding scan so the mutation walker and this share one collector.
 
-Provide a single private helper `recompute(h: &mut Hotspot)` that recomputes `own_score`/`max_class`/`risk_weight`/`confidence` from `h.effects`/`h.risk_features`, and call it from both `augment_component` and `absorb_inherited` to stay DRY.
+Add to `detect/mod.rs` (these own `Hotspot` scoring internals, so they live **here**, not in `react.rs`):
+- `pub struct RawSignals { pub effects: Vec<Effect>, pub risks: Vec<RiskFeature> }`.
+- `pub fn raw_signals(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines, ref_bindings: &HashSet<String>) -> RawSignals` — run `gather` (refactor it to take the extra `ref_bindings` set, so `useRef` writes through an inherited callback get `subreason: ref-cell-write`) **plus** the coverage-owned `type.escape` risk (`coverage::analyze(...).has_any`) **and** `risk::detect`, returning the **pre-discount** effects + risks. Does not build a `Hotspot`.
+- `pub fn augment_component(h: &mut Hotspot, unit: &FnUnit, lines: &SpanLines)` — push `react::state_transitions` + `react::context_reads` effects (all `contained = false`); for each of `h`'s own **world** effects (predicate below) add an `EffectInRender` risk; then `recompute(h)`.
+- `pub fn absorb_inherited(h: &mut Hotspot, raws: Vec<(HookPhase, RawSignals)>)` — extend `h.effects` with each raw effect (force `contained = false`, `discounted_to = None`), extend `h.risk_features` with the raw risks; for `HookPhase::Render`, add one `EffectInRender` risk per **world** effect; then `recompute(h)`.
+- `fn world_effect(kind: EffectKind) -> bool` — an **explicit kind match**, NOT a class threshold (`env.read`/`logging`/`panic` are class 4, so `>= 5` would miss them):
+
+```rust
+matches!(kind,
+    EffectKind::NetFsDb | EffectKind::ProcessControl | EffectKind::EnvWrite
+  | EffectKind::Concurrency | EffectKind::TimeRead | EffectKind::Random
+  | EffectKind::EnvRead | EffectKind::Logging | EffectKind::Panic)
+// NOT AmbientRead — useContext reuses it and must never trigger EffectInRender.
+```
+
+- `fn recompute(h: &mut Hotspot)` — recompute `own_score` (`own_score(&weights)`), `max_class` (`max_class(&classes, risk_class)`), `risk_weight` (`weight_for_class(risk_class)`, or 0 when no risks), and `confidence` (`function_confidence(&confs)`) from `h.effects`/`h.risk_features`. Call it from both `augment_component` and `absorb_inherited` (DRY).
 
 - [ ] **Step 4: Run it, verify it passes**
 
@@ -709,7 +743,10 @@ fn snapshot_react_fixtures() {
     for name in ["counter", "effects", "uncontrolled_cell"] {
         let src = std::fs::read_to_string(format!("tests/fixtures/react/{name}.tsx")).unwrap();
         let hs = util::analyze_tsx(&src);
-        insta::assert_json_snapshot!(name, hs);
+        // dynamic snapshot name via suffix (the 2-arg assert_json_snapshot! form is version-sensitive):
+        insta::with_settings!({ snapshot_suffix => name }, {
+            insta::assert_json_snapshot!(hs);
+        });
     }
 }
 ```
@@ -750,3 +787,14 @@ git commit -m "test(ts): React acceptance fixtures + snapshots; dogfood note"
 **Type consistency:** `HookPhase`, `inherited_callbacks`, `state_transitions`, `context_reads`, `raw_signals`, `augment_component`, `absorb_inherited`, `recompute` are used consistently across Tasks 8–10. `subreason` field added in Task 2 before first use in Task 5.
 
 **Note for the executor:** Tasks 9–10 are the architecturally heavy ones; if `analyze_unit` cannot cleanly expose raw pre-discount effects, factor `gather` (already separate in `detect/mod.rs`) into the `raw_signals` entry point rather than duplicating walkers.
+
+**Corrections applied after plan review (Claude + Codex):**
+- `FnUnit` gains a `col: usize` field (Task 4); Task 9 uses `unit.col` — never parse `col` from `id` (path/symbol can contain `:`).
+- `useReducer` lazy init is `args[2]`, not `args[0]` (Task 8).
+- `augment_component`/`absorb_inherited`/`raw_signals`/`RawSignals` live in `detect/mod.rs` and are called as `detect::…`; `raw_signals` takes the owning component's ref-binding set and includes the coverage-owned `type.escape` risk (Task 9).
+- `world_effect` is an explicit `EffectKind` match (not `class >= 5`) and excludes `AmbientRead` (Task 9).
+- `Classification` gains a `subreason` field + `with_subreason` builder (Task 5); `mutation.rs` has no test module — create one modeled on `calls.rs`'s `kinds` helper.
+- Test helper `unit_with_lines` uses `parse_module` + `collect` (not `parse_and_collect`, which drops the `SourceMap`) — shared by Tasks 6–8.
+- `expr_is_jsx` restricts the binary-expr arm to logical `&&`/`||`; `memo(forwardRef(fn))` nesting is a documented miss.
+- Task 9 must preserve the `is_test_file` / `skipped_tests` skip; Task 11 uses `with_settings!{ snapshot_suffix }` for dynamic snapshot names.
+- Confirmed correct (no change): all `fxrank-core` APIs (`Effect` fields, `EffectKind`/`RiskKind` arms, `weight_for_class`/`own_score`/`max_class`/`function_confidence`/`detection_confidence`), all swc AST (`Expr::JSXElement`/`JSXFragment`/`Cond`/`Bin`/`Paren`), `Lang::Tsx`, and `Hotspot` fields.
