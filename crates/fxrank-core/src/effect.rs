@@ -147,6 +147,8 @@ pub struct Effect {
     pub evidence: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subreason: Option<String>,
     #[serde(skip)]
     pub confidence: f64,
 }
@@ -214,5 +216,26 @@ mod tests {
         assert_eq!(EffectKind::StateTransition.base_class(), 1);
         assert_eq!(RiskKind::EffectInRender.wire(), "effect.in.render");
         assert_eq!(RiskKind::EffectInRender.class(), 4);
+    }
+
+    #[test]
+    fn subreason_serializes_only_when_present() {
+        let mut e = Effect {
+            kind: EffectKind::HiddenMutation,
+            class: 3,
+            discounted_to: None,
+            weight: 3,
+            line: 1,
+            tier: Tier::Heuristic,
+            hidden: true,
+            evidence: "x".into(),
+            discount: None,
+            subreason: Some("ref-cell-write".into()),
+            confidence: 1.0,
+        };
+        let j = serde_json::to_string(&e).unwrap();
+        assert!(j.contains("\"subreason\":\"ref-cell-write\""));
+        e.subreason = None;
+        assert!(!serde_json::to_string(&e).unwrap().contains("subreason"));
     }
 }

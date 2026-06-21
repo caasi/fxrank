@@ -124,6 +124,7 @@ impl<'a> MutationWalker<'a> {
             hidden: c.hidden,
             evidence: format!("{verb} {} {base}", c.role),
             discount: None,
+            subreason: None,
             confidence: detection_confidence(c.tier, false, false),
         };
         self.effects.push((effect, c.contained));

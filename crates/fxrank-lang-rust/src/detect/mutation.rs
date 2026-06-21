@@ -126,6 +126,7 @@ impl MutationWalker {
             hidden: false,
             evidence,
             discount: Some(reason.to_string()),
+            subreason: None,
             confidence: detection_confidence(Tier::Heuristic, false, false),
         });
     }
@@ -150,6 +151,7 @@ impl MutationWalker {
             hidden,
             evidence,
             discount: None,
+            subreason: None,
             confidence: detection_confidence(tier, false, false),
         });
     }

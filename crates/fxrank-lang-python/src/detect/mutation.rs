@@ -479,6 +479,7 @@ impl MutSink<'_> {
                 hidden: false,
                 evidence,
                 discount: None,
+                subreason: None,
                 confidence: detection_confidence(tier, false, false),
             },
             contained,
