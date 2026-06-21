@@ -47,8 +47,8 @@ Modified: root `Cargo.toml` (workspace member), `crates/fxrank-cli/Cargo.toml` (
 
 Add these `#[cfg(test)]` helpers to the relevant unit-test modules as they are first needed (mirroring the Rust/TS frontends' shared `analyze_fixture`). Each is a thin view over the same pipeline — define the signature once and reuse:
 
-- `fn parse_fixture(name: &str) -> (String, libcst_native::Module)` — reads `tests/fixtures/{name}.py`, returns owned source + parsed module. (The `Module` borrows the `String`, so both are returned and must outlive the borrow.)
-- `fn scan_fixture_hotspots(name: &str) -> Vec<core::model::Hotspot>` — runs the full `PythonFrontend::analyze` on the fixture and returns `output.functions`. Used wherever a test asserts final `own_score`/`max_class`/`id`/`risk_features`.
+- `fn with_fixture<R>(name: &str, f: impl FnOnce(&str, &libcst_native::Module) -> R) -> R` — reads `tests/fixtures/{name}.py` into an owned `String`, `parse_module(&src, None).unwrap()`, and calls `f(&src, &module)` **while both are alive** (returns only owned `R`). This is the correct shape: a libcst `Module` borrows its source, so it can NOT be returned in a tuple with the `String` (self-referential — won't compile). All other helpers are built on this closure form.
+- `fn scan_fixture_hotspots(name: &str) -> Vec<core::model::Hotspot>` — runs the full `PythonFrontend::analyze` on the fixture and returns `output.functions` (owned). Used wherever a test asserts final `own_score`/`max_class`/`symbol`/`risk_features`.
 - `fn analyze_fixture(name: &str) -> std::collections::HashMap<String, Vec<(EffectKind, u8)>>` — maps each unit symbol → its `(kind, class)` effect pairs (a pre-fold view for detector tests).
 - `fn mutation_effects(name: &str) -> HashMap<String, Vec<(EffectKind, bool)>>` — symbol → `(kind, contained)` pairs (mutation-escape tests).
 - `fn risk_features(name: &str) -> HashMap<String, Vec<String>>` — symbol → risk-kind wire strings.
@@ -141,6 +141,30 @@ mod spike {
         assert_eq!(lambda_tok.start_pos.char_column_number() + 1, 5); // 1-based col of `lambda`
     }
 
+    // The frontend's lambda anchoring relies on: k-th `lambda` keyword token (source
+    // order) ↔ k-th `Lambda` node (pre-order). The review gate requires proving this
+    // bijection, including nested and multiple lambdas.
+    #[test]
+    fn lambda_token_node_ordinal_bijection() {
+        // outer lambda contains an inner lambda; plus a second top-level lambda.
+        const S: &str = "f = lambda a: (lambda b: b)\ng = lambda: 0\n";
+        let module = parse_module(S, None).unwrap();
+        let n_lambda_nodes = count_lambda_nodes_preorder(&module); // walk Expression::Lambda
+        let n_lambda_tokens = tokenize(S).unwrap().iter().filter(|t| t.string == "lambda").count();
+        assert_eq!(n_lambda_nodes, 3);
+        assert_eq!(n_lambda_tokens, n_lambda_nodes); // 1:1 cardinality
+        // and the tokens are in source order (offsets strictly increasing), so the k-th
+        // token anchors the k-th pre-order node — assert ascending byte positions:
+        let toks = tokenize(S).unwrap();
+        let offs: Vec<usize> = toks.iter().filter(|t| t.string == "lambda")
+            .map(|t| t.start_pos.byte_idx()).collect();
+        assert!(offs.windows(2).all(|w| w[0] < w[1]));
+    }
+    // Helper proves the pre-order Lambda walk; confirm the Expression::Lambda enum path.
+    fn count_lambda_nodes_preorder(_module: &libcst_native::Module) -> usize {
+        unimplemented!("walk Expression nodes pre-order, count Lambda — confirm enum path")
+    }
+
     // Helper: descend module.body to the first FunctionDef and return its name &str.
     // The exact enum path (Statement::Compound(CompoundStatement::FunctionDef) etc.)
     // is what this spike CONFIRMS — adjust to the real pinned API.
@@ -181,9 +205,9 @@ git commit -m "feat(python): libcst spike — pin 1.8.6 (pure-Rust), prove parse
 
 **Interfaces:**
 - Produces:
-  - `struct SpanIndex` with `fn new(src: &str) -> Self` and `fn line_col(&self, byte_off: usize) -> (u32, u32)` (1-based line, 1-based **char** col).
+  - `struct SpanIndex` with `fn new(src: &str) -> Self` and `fn line_col(&self, byte_off: usize) -> (usize, usize)` (1-based line, 1-based **char** col). **`usize`, matching core `Hotspot.line`/`Effect.line`/`RiskFeature.line` and libcst's `line_number()`/`char_column_number()` — so no casts are needed at `Hotspot` construction.**
   - `fn anchor_of_subslice(src: &str, sub: &str) -> usize` — byte offset of a borrowed subslice via pointer arithmetic.
-  - `fn lambda_anchors(src: &str) -> Vec<(u32, u32)>` — the (line, 1-based char col) of each `lambda` keyword token, in source order (the k-th entry anchors the k-th `Lambda` node in pre-order).
+  - `fn lambda_anchors(src: &str) -> Vec<(usize, usize)>` — the (line, 1-based char col) of each `lambda` keyword token, in source order (the k-th entry anchors the k-th `Lambda` node in pre-order).
 
 - [ ] **Step 1: Write failing tests** in `source.rs`:
 
@@ -240,15 +264,15 @@ impl<'a> SpanIndex<'a> {
         SpanIndex { src, line_starts }
     }
 
-    /// 1-based line, 1-based **char** column for a byte offset.
-    pub fn line_col(&self, byte_off: usize) -> (u32, u32) {
+    /// 1-based line, 1-based **char** column for a byte offset (`usize`, matching core).
+    pub fn line_col(&self, byte_off: usize) -> (usize, usize) {
         let line_idx = match self.line_starts.binary_search(&byte_off) {
             Ok(i) => i,
             Err(i) => i - 1,
         };
         let line_start = self.line_starts[line_idx];
         let col_chars = self.src[line_start..byte_off].chars().count();
-        ((line_idx + 1) as u32, (col_chars + 1) as u32)
+        (line_idx + 1, col_chars + 1)
     }
 }
 
@@ -258,12 +282,12 @@ pub fn anchor_of_subslice(src: &str, sub: &str) -> usize {
 }
 
 /// (line, 1-based char col) of each `lambda` keyword token, in source order.
-pub fn lambda_anchors(src: &str) -> Vec<(u32, u32)> {
+pub fn lambda_anchors(src: &str) -> Vec<(usize, usize)> {
     tokenize(src)
         .map(|toks| {
             toks.iter()
                 .filter(|t| t.string == "lambda")
-                .map(|t| (t.start_pos.line_number() as u32, (t.start_pos.char_column_number() + 1) as u32))
+                .map(|t| (t.start_pos.line_number(), t.start_pos.char_column_number() + 1))
                 .collect()
         })
         .unwrap_or_default()
@@ -290,7 +314,7 @@ git commit -m "feat(python): source.rs — SpanIndex (byte→char line:col) + su
 **Interfaces:**
 - Consumes: `source::{SpanIndex, anchor_of_subslice, lambda_anchors}`.
 - Produces:
-  - `struct FnUnit<'a> { symbol: String, line: u32, col: u32, is_async: bool, decorators: Vec<&'a Expression>, params: &'a Parameters, body: FnBody<'a> }` (exact field types per the spike API).
+  - `struct FnUnit<'a> { symbol: String, line: usize, col: usize, is_async: bool, decorators: Vec<&'a Expression>, params: &'a Parameters, body: FnBody<'a> }` (`line`/`col` are `usize` to match core `Hotspot.line`; other field types per the spike API).
   - `fn collect<'a>(module: &'a Module, src: &'a str) -> Vec<FnUnit<'a>>` — every `def`/`async def`/method/nested `def` (named, anchored via `name.value`) and every `lambda` (anchored via the k-th `lambda_anchors` entry, symbol `<lambda@L{line}C{col}>`). Nested `def`/`lambda` are their **own** units.
 
 - [ ] **Step 1: Add the `analyze_fixture` helper + a fixture.** Create `crates/fxrank-lang-python/tests/fixtures/functions.py`:
@@ -307,7 +331,8 @@ async def fetcher():
     pass
 
 g = lambda x: x * 2
-h = lambda: 0
+h = lambda: 0                # empty-ish body (no inner &str) — must still anchor
+nested = lambda a: (lambda b: b)   # outer + inner lambda, distinct anchors
 ```
 
 - [ ] **Step 2: Write the failing test** in `functions.rs`:
@@ -327,10 +352,13 @@ mod tests {
         assert!(symbols.contains(&"fetcher"));
         assert!(units.iter().any(|u| u.symbol.starts_with("<lambda@L")));
         assert!(units.iter().find(|u| u.symbol == "fetcher").unwrap().is_async);
-        // two lambdas, distinct anchors
-        let lambdas: Vec<&str> = symbols.iter().filter(|s| s.starts_with("<lambda@L")).cloned().collect();
-        assert_eq!(lambdas.len(), 2);
-        assert_ne!(lambdas[0], lambdas[1]);
+        // four lambdas (g, h, nested-outer, nested-inner), each a distinct anchor —
+        // proves empty-body (h) and nested (outer+inner) anchor via the ordinal bijection.
+        let mut lambdas: Vec<&str> = symbols.iter().filter(|s| s.starts_with("<lambda@L")).cloned().collect();
+        assert_eq!(lambdas.len(), 4);
+        lambdas.sort();
+        lambdas.dedup();
+        assert_eq!(lambdas.len(), 4, "all lambda anchors distinct");
     }
 }
 ```
@@ -365,15 +393,16 @@ git commit -m "feat(python): functions.rs — collect named + lambda FnUnits wit
 
 - [ ] **Step 1: Add `Language::Python`** to the enum in `crates/fxrank-core/src/frontend.rs` (this is the ONLY core change — adding an enum variant, not vocabulary). Run `cargo test -p fxrank-core` to confirm green.
 
-- [ ] **Step 2: Minimal `analyze_unit`** in `detect/mod.rs`: build a `Hotspot` from a `FnUnit` with empty `effects`/`risk_features`, `own_score: 0.0`, `max_class: 0`, `confidence: 1.0`, `async_boundary: unit.is_async`, `await_count: 0`. Construct the `id` as `format!("{path}:{line}:{col}:{symbol}")`. (Real gather/fold arrive in Task 7.)
+- [ ] **Step 2: Minimal `analyze_unit`** in `detect/mod.rs`: build a `Hotspot` from a `FnUnit` populating **every** required field (per `model.rs` — none default): `id: format!("{path}:{line}:{col}:{symbol}")`, `symbol: unit.symbol.clone()`, `path: path.into()`, `line: unit.line`, `max_class: 0`, `own_score: 0.0`, `risk_weight: 0`, `confidence: 1.0`, `async_boundary: unit.is_async`, `await_count: 0`, `effects: vec![]`, `risk_features: vec![]`. (Real gather/fold arrive in Task 7. `col` lives only inside `id`, not as a `Hotspot` field.)
 
 - [ ] **Step 3: Implement `PythonFrontend`** in `lib.rs`, mirroring `TsFrontend::analyze`: for each `SourceFile`, `parse_module(&file.text, None)`; on `Err` push `Diagnostic { parsed: false, .. }`; on `Ok` run `functions::collect` → `analyze_unit` per unit → push to `output.functions`. `language()` returns `Language::Python`.
 
-- [ ] **Step 4: CLI wiring** in `crates/fxrank-cli/src/main.rs`:
-  - extension routing: `"py" => Some(Route::Python)`;
-  - stdin `--lang`: `"python" => Route::Python` (single value; unknown value error message lists `python` alongside the TS dialects);
-  - `.pyi` is NOT routed (excluded — type-only);
-  - a feature-gated `run_python(...)` dispatch mirroring `run_ts`, behind `#[cfg(feature = "python")]` with a `#[cfg(not(feature = "python"))]` "no frontend" diagnostic.
+- [ ] **Step 4: CLI wiring** in `crates/fxrank-cli/src/main.rs` (these are the concrete edit sites, mirroring the TS wiring):
+  - **`Route` enum** (currently `Rust | Ts(String)`): add a `Python` variant.
+  - **`route_for_path`** (extension match): add `"py" => Some(Route::Python)`. Do NOT add `"pyi"` (type-only stubs are excluded).
+  - **stdin `--lang` match**: add `"python" => Route::Python`; extend the unknown-`--lang` error message to list `python` alongside `ts`/`tsx`/`js`/`jsx`.
+  - **`dispatch`**: add a `Route::Python` partition + a feature-gated `dispatch_python(...)` fn mirroring `dispatch_ts`, behind `#[cfg(feature = "python")]`, with a `#[cfg(not(feature = "python"))]` "no frontend" diagnostic arm (mirror the existing `dispatch_ts` / not-`ts` pair).
+  - **`--help` honesty**: update the `lang` arg doc comment (lists dialects) and the command `about` string ("Rust & TS/JS") to mention Python.
 
 - [ ] **Step 5: CLI manifest** — in `crates/fxrank-cli/Cargo.toml`:
 
@@ -398,7 +427,10 @@ fn scans_python_stdin_fragment() {
         .write_stdin("def f():\n    pass\n")
         .assert()
         .success()
-        .stdout(predicates::str::contains("\"language\""));
+        // Report has scope/summary/hotspots/diagnostics (model.rs) — NO "language" field
+        // (spec: no schema change). Assert the hotspot and its symbol instead.
+        .stdout(predicates::str::contains("\"hotspots\""))
+        .stdout(predicates::str::contains("\"symbol\":\"f\""));
 }
 ```
 
@@ -490,6 +522,16 @@ def reads_stdin():
 
 def db_write(session):
     session.commit()
+
+def in_wrapper(paths):
+    with open(paths[0]) as f:                 # with-open → net.fs.db attributed
+        return f.read()
+
+def eager_comp(urls):
+    return [requests.get(u) for u in urls]    # eager comprehension → net.fs.db charged
+
+def lazy_gen(urls):
+    return (requests.get(u) for u in urls)    # lazy genexp → element body NOT charged
 ```
 
 - [ ] **Step 2: Write the failing test** (assert the set of `(kind, class)` pairs):
@@ -499,7 +541,7 @@ def db_write(session):
 mod tests {
     use super::*;
     use fxrank_core::effect::EffectKind::*;
-    // analyze_fixture returns Vec<(symbol, Vec<(EffectKind, u8)>)>; helper in the test module.
+    // analyze_fixture returns HashMap<String, Vec<(EffectKind, u8)>>; helper in the test module.
     #[test]
     fn detects_world_effects() {
         let by_fn = analyze_fixture("calls"); // see helper
@@ -512,9 +554,16 @@ mod tests {
         assert!(env.contains(&(Random, 5)) && env.contains(&(TimeRead, 5)));
         assert!(by_fn["reads_stdin"].contains(&(EnvRead, 4)));      // input()
         assert!(by_fn["db_write"].contains(&(NetFsDb, 7)));        // session.commit() heuristic
+        // wrapper attribution: with-open and eager comprehension ARE charged...
+        assert!(by_fn["in_wrapper"].contains(&(NetFsDb, 7)));      // with open(...)
+        assert!(by_fn["eager_comp"].contains(&(NetFsDb, 7)));      // [requests.get(u) for ...]
+        // ...but a lazy genexp's element body is NOT charged (deferred execution)
+        assert!(!by_fn.get("lazy_gen").map_or(false, |e| e.contains(&(NetFsDb, 7))));
     }
 }
 ```
+
+The driver (Step 4) implements this split: it descends into `with`-items and **eager** list/set/dict-comprehension element+iterable expressions, but for a **generator expression** descends only into the outermost iterable, NOT the element/condition body (spec §wrapper attribution).
 
 - [ ] **Step 3: Run — expect FAIL.** Run: `cargo test -p fxrank-lang-python detects_world_effects`.
 
@@ -549,13 +598,13 @@ git commit -m "feat(python): detect/calls.rs + own-body recursion driver — wor
 - Consumes: `calls::detect`, `core::score::{own_score, max_class, rank_key}`, `core::confidence`.
 - Produces: a real `analyze_unit` computing `own_score`, `max_class`, function `confidence` (weakest-link min), `async_boundary`, `await_count`.
 
-- [ ] **Step 1: Write the failing test** — `io_boundary` should now score `max_class 7`, `own_score == 24.0` for the `open`+`requests`(21) + `logging`(5) + (if any local) combination per the fixture; `fetcher` async sets `async_boundary`.
+- [ ] **Step 1: Write the failing test** — `io_boundary` should now score `max_class 7`. Arithmetic check (core `CLASS_WEIGHTS = [0,1,2,3,5,8,13,21,34]`, `own_score = max + 0.5·(sum−max)`): two `NetFsDb`(7→21) effects (`open`, `requests.get`) + one `Logging`(4→5) → weights `[21,21,5]` → `21 + 0.5·(21+5) = 34.0`. Assert the robust lower bound (`>= 21.0`) so the test is not brittle to dedup decisions; `fetcher` async sets `async_boundary`.
 
 ```rust
 #[test]
 fn analyze_unit_scores_world_effects() {
     let h = scan_fixture_hotspots("calls"); // returns Vec<Hotspot>
-    let io = h.iter().find(|x| x.id.ends_with(":io_boundary")).unwrap();
+    let io = h.iter().find(|x| x.symbol == "io_boundary").unwrap(); // Hotspot.symbol field
     assert_eq!(io.max_class, 7);
     assert!(io.own_score >= 21.0);
 }
@@ -613,7 +662,7 @@ def builds_local():
 ```rust
 #[test]
 fn classifies_mutation_by_escape() {
-    let m = mutation_effects("mutation"); // Vec<(symbol, Vec<(EffectKind, bool)>)>
+    let m = mutation_effects("mutation"); // HashMap<String, Vec<(EffectKind, bool)>>
     assert!(m["uses_global"].contains(&(GlobalMutation, false)));
     assert!(m["bump"].contains(&(ThisMutation, false)));
     assert!(m["mutates_param"].contains(&(ParamMutation, false)));
@@ -651,7 +700,7 @@ git commit -am "feat(python): detect/mutation.rs — global/nonlocal/self/param/
 
 **Interfaces:**
 - Consumes: `core::score::{BoundaryCoverage, apply_boundary_discount}`.
-- Produces: `coverage::of(unit) -> Coverage` where `Coverage { boundary: BoundaryCoverage, any_in_body: bool, unknown_decorator: bool }`.
+- Produces: `coverage::of(unit) -> Coverage` where `Coverage { boundary: BoundaryCoverage, any_in_signature: bool, any_in_body: bool, unknown_decorator: bool }`. **Both** `any_in_signature` and `any_in_body` are needed: `BoundaryCoverage::None` alone cannot distinguish an explicit `x: Any` from *absent* annotations, but the spec requires signature `Any` to emit `type.escape` — so an explicit `Any` slot sets `any_in_signature` (separate from degrading coverage).
 
 - [ ] **Step 1: Fixture** `coverage.py`:
 
@@ -671,6 +720,20 @@ def body_any(x: int) -> list:
     acc = []
     acc.append(y)
     return acc
+
+def untyped(x):          # None coverage → local.mutation NOT discounted (stays class 1)
+    acc = []
+    acc.append(x)
+    return acc
+
+def partial(x: int):     # Partial (param typed, return not) → class-1 local floors to 0
+    acc = []
+    acc.append(x)
+    return acc
+
+@some_unknown_wrapper    # unknown decorator → confidence reduced, coverage intact
+def decorated(x: int) -> int:
+    return x
 ```
 
 - [ ] **Step 2: Write failing tests:**
@@ -679,22 +742,47 @@ def body_any(x: int) -> list:
 #[test]
 fn boundary_discount_zeros_contained_local_when_typed() {
     let h = scan_fixture_hotspots("coverage");
-    let ft = h.iter().find(|x| x.id.ends_with(":fully_typed")).unwrap();
+    let ft = h.iter().find(|x| x.symbol == "fully_typed").unwrap();
     assert_eq!(ft.own_score, 0.0); // local.mutation class 1 → 0 under Full coverage
 }
 
 #[test]
 fn any_emits_type_escape_and_blocks_discount() {
     let h = scan_fixture_hotspots("coverage");
-    let ba = h.iter().find(|x| x.id.ends_with(":body_any")).unwrap();
-    assert!(ba.risk_features.iter().any(|r| r.kind == "type.escape"));
+    // RiskFeature.kind is a RiskKind enum (effect.rs), not a String — compare via .wire().
+    let has_type_escape = h.iter().find(|x| x.symbol == "has_any").unwrap()
+        .risk_features.iter().any(|r| r.kind.wire() == "type.escape");
+    assert!(has_type_escape); // signature Any → type.escape
+    let ba = h.iter().find(|x| x.symbol == "body_any").unwrap();
+    assert!(ba.risk_features.iter().any(|r| r.kind.wire() == "type.escape")); // body Any → type.escape
     assert!(ba.own_score >= 1.0); // discount voided → local.mutation stays class 1
+}
+
+#[test]
+fn coverage_tiers_and_decorator_confidence() {
+    let h = scan_fixture_hotspots("coverage");
+    let score = |s: &str| h.iter().find(|x| x.symbol == s).unwrap().own_score;
+    assert_eq!(score("untyped"), 1.0); // None coverage → local.mutation stays class 1
+    assert_eq!(score("partial"), 0.0); // any coverage > None floors class-1 local to 0
+    let dec = h.iter().find(|x| x.symbol == "decorated").unwrap();
+    assert!(dec.confidence < 1.0); // unknown decorator reduces confidence
+}
+
+// Direct coverage::of unit test — self/cls exclusion + untyped *args degrade (no Hotspot
+// view exposes these). Build a tiny module and call coverage::of on each unit.
+#[test]
+fn coverage_excludes_self_and_degrades_untyped_star_args() {
+    let src = "class C:\n    def m(self, x: int) -> int:\n        return x\ndef v(*args) -> int:\n    return 0\n";
+    let cov_m = coverage_of_symbol(src, "m"); // helper: parse, find unit, coverage::of
+    assert_eq!(cov_m.boundary, BoundaryCoverage::Full); // self excluded → (x, return) both typed
+    let cov_v = coverage_of_symbol(src, "v");
+    assert_ne!(cov_v.boundary, BoundaryCoverage::Full); // untyped *args degrades coverage
 }
 ```
 
 - [ ] **Step 3: Run — expect FAIL.** Run: `cargo test -p fxrank-lang-python boundary`.
 
-- [ ] **Step 4: Implement `coverage::of`.** Slots = each parameter (excluding `self`/`cls`) + return; `*args`/`**kwargs` each one slot; a slot is typed iff it has an explicit annotation whose top-level type is not `Any`. → `None`/`Partial`/`Full`. Set `any_in_body` on a `cast(Any,...)` / `Any`-annotated local. Set `unknown_decorator` when a decorator is outside the pure allowlist (`property`, `staticmethod`, `classmethod`, `dataclass`, `functools.wraps`, framework route decorators). In `analyze_unit`: for each effect with `contained == true`, `effect.discounted_to = Some(apply_boundary_discount(class, coverage_or_None_if_any_in_body, true))` and recompute weight; emit a `type.escape`(3) risk when `Any` present (signature slot OR body); subtract a confidence step when `unknown_decorator`.
+- [ ] **Step 4: Implement `coverage::of`.** Slots = each parameter (excluding `self`/`cls`) + return; `*args`/`**kwargs` each one slot; a slot is typed iff it has an explicit annotation whose top-level type is not `Any`. → `None`/`Partial`/`Full`. Set `any_in_signature` when a slot's explicit annotation top-level type IS `Any`. Set `any_in_body` on a `cast(Any,...)` / `Any`-annotated local. Set `unknown_decorator` when a decorator is outside the pure allowlist (`property`, `staticmethod`, `classmethod`, `dataclass`, `functools.wraps`, framework route decorators). In `analyze_unit`: for each effect with `contained == true`, `effect.discounted_to = Some(apply_boundary_discount(class, if cov.any_in_body { BoundaryCoverage::None } else { cov.boundary }, true))` and recompute weight; emit a `type.escape`(3) risk when `cov.any_in_signature || cov.any_in_body`; subtract a confidence step when `cov.unknown_decorator`.
 
 - [ ] **Step 5: Run — expect PASS.** Run: `cargo test -p fxrank-lang-python boundary`.
 
@@ -736,7 +824,7 @@ def shell(cmd):
 ```rust
 #[test]
 fn detects_dynamic_code_and_shell() {
-    let r = risk_features("risk"); // Vec<(symbol, Vec<String>)> of risk kinds
+    let r = risk_features("risk"); // HashMap<String, Vec<String>> of risk kinds
     assert!(r["dyn"].contains(&"dynamic.code".to_string()));
     assert!(r["deserialize"].contains(&"dynamic.code".to_string()));
     assert!(r["shell"].contains(&"dynamic.code".to_string())); // shell=True
@@ -820,15 +908,32 @@ git commit -am "feat(python): test-code skipping (path + source-based) + --inclu
 **Interfaces:**
 - Produces: the enlarged cross-ecosystem default exclude union; `--help` prints it verbatim.
 
-- [ ] **Step 1: Write the failing test** — a directory scan over a temp tree containing `.venv/x.py` (effectful) is NOT scanned by default, and `.venv` does not appear in output; a `*_pb2.py` is excluded and counted.
+- [ ] **Step 1: Write the failing test.** `skipped_excluded` is computed in the **CLI** walk and lives on `Report.scope` (NOT on `FrontendOutput`), so this is an `assert_cmd` test over a temp directory, parsing the JSON `scope.skipped_excluded`:
 
 ```rust
 #[test]
 fn prunes_python_noise_by_default() {
-    // build temp dir: pkg/app.py (real), pkg/.venv/lib/dep.py (noise), pkg/svc_pb2.py (generated)
-    // scan pkg/ → only app.py's functions appear; skipped_excluded counts svc_pb2.py.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("app.py"), "def real():\n    open('x')\n").unwrap();
+    std::fs::create_dir_all(root.join(".venv/lib")).unwrap();
+    std::fs::write(root.join(".venv/lib/dep.py"), "def noise():\n    open('y')\n").unwrap();
+    std::fs::write(root.join("svc_pb2.py"), "def gen():\n    pass\n").unwrap();
+
+    let out = Command::cargo_bin("fxrank").unwrap()
+        .args(["scan"]).arg(root).assert().success();
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).unwrap();
+    // .venv pruned (dir prune, uncounted) → "noise" never appears
+    assert!(!json.to_string().contains("noise"));
+    // svc_pb2.py excluded (file glob) and counted
+    assert!(json["scope"]["skipped_excluded"].as_u64().unwrap() >= 1);
+    // app.py's real function still scanned
+    assert!(json.to_string().contains("real"));
 }
 ```
+
+(Add `tempfile` to `crates/fxrank-cli` dev-deps if not already present.)
 
 - [ ] **Step 2: Run — expect FAIL.** Run: `cargo test -p fxrank prunes_python_noise`.
 
@@ -897,3 +1002,4 @@ The PR triggers the spec's blocking **Copilot review gate** (re-confirm libcst A
 - Spec §CLI (.py, `--lang python`, `.pyi` excluded) → Task 4. Spec §Output schema (no new kinds; richer evidence) → Tasks 6/9/10.
 - Spec §Review gate → Task 1 Step 6 (blocking) + Task 13 Step 5.
 - Parity-first (no core vocab) → only core change is `Language::Python` (Task 4 Step 1), not vocabulary.
+- Spec's latent **Partial-vs-Full gradient** core unit test (spec §"latent in this milestone") is **already satisfied** by the existing `apply_boundary_discount` tests in `crates/fxrank-core/src/score.rs` (class-≥2 contained input: Partial→down1, Full→down2). No Python fixture can exercise it (every contained effect is class 1) and **no new core test is needed** — do not add a redundant one.
