@@ -77,6 +77,10 @@ struct MutationWalker<'a> {
     /// than `local.mutation` (TDZ makes this a runtime error for `let`/`const`,
     /// so practical impact is limited to `var` hoisting).
     locals: HashSet<String>,
+    /// Idents bound to `useRef(...)` calls (`const r = useRef(0)` → `r`).
+    /// Writes to `r.current` are `HiddenMutation` class 3 (ref-cell semantic),
+    /// not the `LocalMutation` class 1 that `locals` would produce.
+    ref_bindings: HashSet<String>,
     /// True when this unit is a class constructor (so `this.x = …` is local init).
     is_constructor: bool,
     lines: &'a SpanLines,
@@ -98,6 +102,7 @@ impl<'a> MutationWalker<'a> {
         MutationWalker {
             params,
             locals: HashSet::new(),
+            ref_bindings: HashSet::new(),
             is_constructor,
             lines,
             imports,
@@ -113,6 +118,12 @@ impl<'a> MutationWalker<'a> {
         let Some(base) = base_ident(place) else {
             return;
         };
+        // A ref binding (`const r = useRef(...)`) only qualifies when the write
+        // targets `.current` (e.g. `r.current = 5`). A bare write to `r` itself
+        // would be unusual and should not misfire as a ref-cell write.
+        if self.ref_bindings.contains(&base) && !has_current_in_chain(place) {
+            return;
+        }
         let c = self.classify(&base);
         let effect = Effect {
             kind: c.kind,
@@ -124,7 +135,7 @@ impl<'a> MutationWalker<'a> {
             hidden: c.hidden,
             evidence: format!("{verb} {} {base}", c.role),
             discount: None,
-            subreason: None,
+            subreason: c.subreason.map(String::from),
             confidence: detection_confidence(c.tier, false, false),
         };
         self.effects.push((effect, c.contained));
@@ -142,6 +153,12 @@ impl<'a> MutationWalker<'a> {
             } else {
                 Classification::new(ThisMutation, 3, false, false, Tier::Heuristic, "this field")
             }
+        } else if self.ref_bindings.contains(base) {
+            // A `useRef` binding: `.current` writes are ref-cell mutations —
+            // hidden from the signature and semantically equivalent to a
+            // captured mutable cell. Class 3, not contained.
+            Classification::new(HiddenMutation, 3, false, true, Tier::Heuristic, "ref cell")
+                .with_subreason("ref-cell-write")
         } else if self.locals.contains(base) {
             Classification::new(LocalMutation, 1, true, false, Tier::Exact, "local")
         } else if self.params.contains(base) {
@@ -164,6 +181,8 @@ struct Classification {
     tier: Tier,
     /// Role word for the evidence string (`"local"`, `"param"`, …).
     role: &'static str,
+    /// Optional sub-reason threaded into the emitted `Effect.subreason`.
+    subreason: Option<&'static str>,
 }
 
 impl Classification {
@@ -182,7 +201,13 @@ impl Classification {
             hidden,
             tier,
             role,
+            subreason: None,
         }
+    }
+
+    fn with_subreason(mut self, s: &'static str) -> Self {
+        self.subreason = Some(s);
+        self
     }
 }
 
@@ -190,6 +215,13 @@ impl Visit for MutationWalker<'_> {
     fn visit_var_declarator(&mut self, node: &VarDeclarator) {
         // Every `const`/`let`/`var` binding in the body is a function-scope local.
         collect_pat_bindings(&node.name, &mut self.locals);
+        // Additionally, if the init is a `useRef(...)` call, record the bound
+        // ident(s) as ref bindings so `.current` writes are classified correctly.
+        if let Some(init) = &node.init
+            && is_use_ref_call(init)
+        {
+            collect_pat_bindings(&node.name, &mut self.ref_bindings);
+        }
         node.visit_children_with(self);
     }
 
@@ -330,4 +362,107 @@ fn is_mutating_method(name: &str) -> bool {
             | "delete"
             | "clear"
     )
+}
+
+/// Return `true` when `expr` is a direct `useRef(...)` call (or `React.useRef(...)`).
+///
+/// Recognises both the bare form (`useRef(0)`) and the qualified form
+/// (`React.useRef(0)`). Does not require any imports — callee is matched
+/// syntactically.
+fn is_use_ref_call(expr: &Expr) -> bool {
+    let call = match expr {
+        Expr::Call(c) => c,
+        _ => return false,
+    };
+    match &call.callee {
+        Callee::Expr(callee_expr) => match callee_expr.as_ref() {
+            // bare `useRef(...)`
+            Expr::Ident(id) => id.sym.as_ref() == "useRef",
+            // qualified `React.useRef(...)`
+            Expr::Member(MemberExpr { prop, .. }) => {
+                matches!(prop, MemberProp::Ident(id) if id.sym.as_ref() == "useRef")
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Return `true` when the place expression's member chain contains `.current`
+/// at any level (e.g. `r.current` or `r.current.foo`).
+fn has_current_in_chain(expr: &Expr) -> bool {
+    match expr {
+        Expr::Member(m) => {
+            if matches!(&m.prop, MemberProp::Ident(id) if id.sym.as_ref() == "current") {
+                return true;
+            }
+            has_current_in_chain(&m.obj)
+        }
+        Expr::Paren(p) => has_current_in_chain(&p.expr),
+        Expr::TsAs(e) => has_current_in_chain(&e.expr),
+        Expr::TsNonNull(e) => has_current_in_chain(&e.expr),
+        Expr::TsTypeAssertion(e) => has_current_in_chain(&e.expr),
+        Expr::TsSatisfies(e) => has_current_in_chain(&e.expr),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::functions;
+    use crate::imports::ImportTable;
+    use crate::source::Lang;
+    use fxrank_core::effect::EffectKind;
+
+    /// Parse `src` as JS/TS, find the function named `fn_name`, run the mutation
+    /// detector, and return the `(Effect, contained)` pairs.
+    fn detect_in_fn(src: &str, fn_name: &str) -> Vec<(Effect, bool)> {
+        let (module, cm) = functions::parse_module(src, "t.ts", Lang::Ts).expect("parse");
+        let lines = SpanLines::new(cm);
+        let imports = ImportTable::from_module(&module);
+        let units = functions::collect(&module, "t.ts", &lines);
+        let unit = units
+            .iter()
+            .find(|u| u.symbol == fn_name)
+            .expect("unit not found");
+        detect(&unit.body, &unit.sig, unit.is_constructor, &lines, &imports)
+    }
+
+    /// Shorthand: parse `src`, find the first function named `C`, run detection.
+    fn detect_in(src: &str) -> Vec<(Effect, bool)> {
+        detect_in_fn(src, "C")
+    }
+
+    #[test]
+    fn useref_current_write_is_hidden_mutation() {
+        // a component body: const r = useRef(0); r.current = 5;
+        let effects = detect_in("function C(){ const r = useRef(0); r.current = 5; return null; }");
+        let e = effects
+            .iter()
+            .map(|(e, _)| e)
+            .find(|e| e.kind == EffectKind::HiddenMutation)
+            .expect("hidden mutation");
+        assert_eq!(e.effective_class(), 3);
+        assert_eq!(e.subreason.as_deref(), Some("ref-cell-write"));
+        // and it must NOT be classified as a contained local:
+        assert!(
+            effects
+                .iter()
+                .all(|(e, contained)| !(*contained && e.kind == EffectKind::HiddenMutation))
+        );
+    }
+
+    #[test]
+    fn local_write_stays_local_mutation() {
+        // a plain local write should still be LocalMutation class 1
+        let effects = detect_in("function C(){ let x = 0; x = 5; }");
+        let e = effects
+            .iter()
+            .map(|(e, _)| e)
+            .find(|e| e.kind == EffectKind::LocalMutation)
+            .expect("local mutation");
+        assert_eq!(e.effective_class(), 1);
+        assert_eq!(e.subreason, None);
+    }
 }
