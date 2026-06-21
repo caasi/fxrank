@@ -4,6 +4,7 @@ pub mod coverage;
 pub mod detect;
 pub mod functions;
 pub mod imports;
+pub mod react;
 pub mod source;
 
 use fxrank_core::frontend::{Frontend, FrontendOutput, Language, SourceFile};
