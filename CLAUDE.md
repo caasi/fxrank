@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project
 
 **FxRank** is an *effect-cost profiler for coding agents*. `fxrank scan <path>` analyzes
-Rust and TypeScript/JavaScript source and emits compact JSON ranking each function by its **own-body effect cost**
+Rust, TypeScript/JavaScript, and Python source and emits compact JSON ranking each function by its **own-body effect cost**
 (IO, mutation, panic, risk, …), so an agent can find hotspots and refactor toward purer
 cores. It is a *measuring instrument* — it reports facts (effect kind, severity class,
 discount rationale, evidence, confidence, risk), and deliberately gives **no refactoring
@@ -16,9 +16,9 @@ The differentiator from a naïve purity checker is the **containment discount**:
 *lower*; conversely `&self` + interior mutability is *hidden* and scores *higher* than an
 honest `&mut self`. Validated end-to-end (and by dogfooding — see below).
 
-Milestone A ships two frontends — Rust (`syn`) and TS/JS (`swc`) — both **primarily
-syntactic** (no borrow-checker / type inference); type-dependent signals are heuristic and
-carry a confidence penalty.
+Milestone A ships three frontends — Rust (`syn`), TS/JS (`swc`), and Python (`libcst`) —
+all **primarily syntactic** (no borrow-checker / type inference); type-dependent signals
+are heuristic and carry a confidence penalty.
 
 ## Workspace layout
 
@@ -37,6 +37,14 @@ A Cargo workspace, one shipped binary, language frontends feature-gated:
   `import` + `require` table), `coverage` (signature typed-slot coverage for the boundary
   discount), and `detect/{calls,mutation,risk}` orchestrated by `detect::analyze_unit`.
   Parses with swc, runs no type-checker (syntactic, like the Rust frontend).
+- **`crates/fxrank-lang-python`** — the `libcst`-based Python frontend (behind the
+  `python` feature). `functions` (function-unit collection for `def`/`async def`,
+  methods, nested `def`, and `lambda`, including the own-body recursion driver),
+  `imports` (module-level `import`/`from … import` table), `coverage` (signature
+  typed-slot coverage for the boundary discount), and `detect/{calls,mutation,risk}`
+  orchestrated by `detect::analyze_unit`. Parses with libcst (crate dep `libcst`, lib
+  name `libcst_native`, `default-features = false` for a pure-Rust build), syntactic
+  (no type checker), like the other frontends.
 - **`crates/fxrank-cli`** (package/binary `fxrank`) — args (clap), file discovery,
   feature-gated dispatch, compact JSON to stdout.
 
@@ -48,13 +56,16 @@ cargo test --workspace                                   # all tests (~90)
 cargo test -p fxrank-core own_score_damps_non_max_weights # one test by name
 cargo fmt --check                                        # CI gate
 cargo clippy --workspace --all-targets -- -D warnings    # CI gate — warnings are hard errors
-cargo build -p fxrank --no-default-features --features rust  # slim Rust-only build
-cargo build -p fxrank --no-default-features --features ts    # slim TS-only build
+cargo build -p fxrank --no-default-features --features rust    # slim Rust-only build
+cargo build -p fxrank --no-default-features --features ts      # slim TS-only build
+cargo build -p fxrank --no-default-features --features python  # slim Python-only build
 cargo run -p fxrank -- scan <path>                       # run the tool
 cargo run -p fxrank -- scan crates/ | jq                 # dogfood on our own source
 cargo run -p fxrank -- scan crates/ --include-tests      # score test code too (skipped by default)
+cargo run -p fxrank -- scan crates/fxrank-lang-python/src/  # dogfood the Python frontend's own Rust source
 cargo run -p fxrank -- scan <path> --exclude 'node_modules,*.min.js,*.stories.*'  # replaces the default skip list
-echo 'function f(): void {}' | cargo run -p fxrank -- scan --lang ts -  # scan a TS fragment from stdin
+echo 'function f(): void {}' | cargo run -p fxrank -- scan --lang ts -      # scan a TS fragment from stdin
+echo 'def f(): pass' | cargo run -p fxrank -- scan --lang python -           # scan a Python fragment from stdin
 cargo insta review                                       # accept snapshot test changes (insta)
 cargo install fxrank                                     # install the released binary from crates.io
 cargo install --git https://github.com/caasi/fxrank fxrank  # install the latest unreleased binary from git
@@ -67,24 +78,27 @@ fixtures. Run the first three locally before pushing.
 
 ## Releasing to crates.io
 
-The workspace publishes **four** crates; the binary `fxrank` depends on the three
-library crates, so all four are published in dependency order. Shared package metadata
+The workspace publishes **five** crates; the binary `fxrank` depends on the four
+library crates, so all five are published in dependency order. Shared package metadata
 (`license = "MIT OR Apache-2.0"`, `repository`, `authors`, `rust-version`, `keywords`,
 `categories`) lives in `[workspace.package]` and is inherited via `field.workspace =
 true`; each crate sets its own `description`. Internal deps carry both `path` and
 `version` so crates.io can resolve them. For every release bump `version` in
 **two** lockstep places: `[workspace.package].version`, **and** the `version = "X.Y.Z"`
-pin on each internal dependency (`fxrank-core`/`fxrank-lang-rust`/`fxrank-lang-ts` in
-the consuming crates' `Cargo.toml`). The internal pins are a caret range, so a stale
-one still *builds*, but the published crate would advertise the wrong (older)
-internal-dep requirement — bump both. (`cargo build` afterward refreshes `Cargo.lock`.)
+pin on each internal dependency (`fxrank-core`/`fxrank-lang-rust`/`fxrank-lang-ts`/`fxrank-lang-python`
+in the consuming crates' `Cargo.toml` — including `fxrank-lang-python/Cargo.toml`'s
+own `fxrank-core` pin and the `fxrank` binary's `fxrank-lang-python` pin). The internal
+pins are a caret range, so a stale one still *builds*, but the published crate would
+advertise the wrong (older) internal-dep requirement — bump all of them. (`cargo build`
+afterward refreshes `Cargo.lock`.)
 
 ```bash
 # one-time: cargo login <crates-token>   (or set CARGO_REGISTRY_TOKEN)
 cargo publish -p fxrank-core
 cargo publish -p fxrank-lang-rust
 cargo publish -p fxrank-lang-ts
-cargo publish -p fxrank            # the binary; depends on the three above
+cargo publish -p fxrank-lang-python
+cargo publish -p fxrank            # the binary; depends on the four above
 ```
 
 Validate `fxrank-core` first without uploading: `cargo publish -p fxrank-core
@@ -99,8 +113,8 @@ the `compose` skill) — preflight gates, ordered publish, verify, then tag/rele
 
 ```arrow
 -- Publish fxrank to crates.io. Run from repo root on `main`, in sync with origin.
--- The four crates publish in dependency order: core has no internal deps; the two
--- language frontends depend on core; the fxrank binary depends on all three.
+-- The five crates publish in dependency order: core has no internal deps; the three
+-- language frontends depend on core; the fxrank binary depends on all four.
 
 let preflight =
   (on_branch(name: main) &&& in_sync(with: "origin/main") &&& tree_clean)   -- ref: git rev-parse / status
@@ -114,7 +128,8 @@ let publish_all =
   publish(crate: "fxrank-core")                                             -- ref: cargo publish -p fxrank-core
     >>> publish(crate: "fxrank-lang-rust")                                  -- waits for index between each
     >>> publish(crate: "fxrank-lang-ts")
-    >>> publish(crate: "fxrank")                                            -- the binary; depends on the three above
+    >>> publish(crate: "fxrank-lang-python")
+    >>> publish(crate: "fxrank")                                            -- the binary; depends on the four above
 in
 let verify =
   install(crate: "fxrank")?                                                 -- ref: cargo install fxrank && fxrank scan --help
