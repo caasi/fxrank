@@ -5,6 +5,7 @@ use crate::model::{Diagnostic, Hotspot};
 pub enum Language {
     Rust,
     Ts,
+    Python,
 }
 
 pub struct SourceFile {

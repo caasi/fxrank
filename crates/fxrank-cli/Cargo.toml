@@ -18,13 +18,15 @@ path = "src/main.rs"
 fxrank-core = { path = "../fxrank-core", version = "0.1.1" }
 fxrank-lang-rust = { path = "../fxrank-lang-rust", version = "0.1.1", optional = true }
 fxrank-lang-ts = { path = "../fxrank-lang-ts", version = "0.1.1", optional = true }
+fxrank-lang-python = { path = "../fxrank-lang-python", version = "0.1.1", optional = true }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 globset = "0.4"
 [features]
-default = ["rust", "ts"]
+default = ["rust", "ts", "python"]
 rust = ["dep:fxrank-lang-rust"]
 ts = ["dep:fxrank-lang-ts"]
+python = ["dep:fxrank-lang-python"]
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

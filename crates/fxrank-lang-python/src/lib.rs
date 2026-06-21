@@ -1,0 +1,278 @@
+//! Python (libcst-based) frontend for FxRank's effect-cost profiler.
+
+pub mod coverage;
+pub mod detect;
+pub mod functions;
+pub mod imports;
+pub mod source;
+
+use fxrank_core::frontend::{Frontend, FrontendOutput, Language, SourceFile};
+use fxrank_core::model::Diagnostic;
+use libcst_native::parse_module;
+
+/// The Python language frontend.
+///
+/// When `include_tests` is `false` (the default), two skip mechanisms apply:
+///
+/// - **Path-based**: entire files whose base name matches `test_*.py` / `*_test.py` /
+///   `conftest.py`, or whose path contains a `tests/` directory segment, are skipped.
+/// - **Source-based**: within an otherwise-scanned file, units that are a `test_*`-named
+///   function, a method of a `Test*`-named class, or a method of a `unittest.TestCase`
+///   subclass are skipped.
+///
+/// Skipped units are counted in `FrontendOutput::skipped_tests`.
+/// `--include-tests` (`include_tests: true`) disables both skip mechanisms.
+pub struct PythonFrontend {
+    pub include_tests: bool,
+}
+
+impl Frontend for PythonFrontend {
+    fn language(&self) -> Language {
+        Language::Python
+    }
+
+    fn analyze(&self, files: &[SourceFile]) -> FrontendOutput {
+        let mut output = FrontendOutput::default();
+        for file in files {
+            let src = source::strip_bom(&file.text);
+            match parse_module(src, None) {
+                Err(e) => {
+                    output.diagnostics.push(Diagnostic {
+                        path: file.path.clone(),
+                        parsed: false,
+                        error: format!("{e}"),
+                    });
+                }
+                Ok(module) => {
+                    // Single borrowed pass: collect + analyze while `module`/`src`
+                    // are both alive. `analyze_unit` emits owned `Hotspot`s.
+                    let imports = imports::Imports::build(&module);
+                    // Build SpanIndex once per file; pass it into both `collect`
+                    // (for lambda-anchor line/col) and `analyze_unit` (for effect
+                    // line resolution) — no duplicate O(n) line-start indexing.
+                    let span = source::SpanIndex::new(src);
+
+                    // Tokenize once to obtain lambda anchors. `parse_module`
+                    // succeeded above, so tokenization is a strict subset and
+                    // must also succeed — `None` is a theoretically-impossible
+                    // state. We propagate failure rather than swallowing it with
+                    // `unwrap_or_default()`: an empty anchor vec would make the
+                    // count guard see `0 == 0` and silently drop every lambda.
+                    let anchors = match source::lambda_anchors(src) {
+                        Some(a) => a,
+                        None => {
+                            output.diagnostics.push(Diagnostic {
+                                path: file.path.clone(),
+                                parsed: true,
+                                error: "lambda anchoring unavailable: tokenizer failed on \
+                                        a file that parsed successfully; hotspots for this \
+                                        file are omitted to avoid mis-anchored output"
+                                    .into(),
+                            });
+                            continue;
+                        }
+                    };
+
+                    // Pass the pre-computed anchors into collect so tokenization
+                    // runs exactly once per file (no second tokenizer pass for the
+                    // mismatch guard).
+                    let (units, lambda_node_count) =
+                        functions::collect(&module, src, &span, &anchors);
+
+                    // Runtime lambda-anchor mismatch guard (node count, not emitted count).
+                    // `collect` guards the bijection with a `debug_assert_eq!`
+                    // (loud in tests/debug builds). In a release build that assert
+                    // is stripped, so we add a non-panicking runtime check here.
+                    //
+                    // CRITICAL: we compare the Lambda-NODE count (`lambda_node_count`,
+                    // which `collect` increments on every Lambda node visited, even when
+                    // `anchors.get(idx)` returns `None` and no unit is emitted) against
+                    // `anchors.len()`. Comparing emitted-unit count instead would miss
+                    // the N>M case: if there are more Lambda nodes (N) than anchors (M),
+                    // the first M emit normally, the remaining N−M are silently skipped,
+                    // and emitted(M)==anchors(M) → guard passes → silent drop. Using the
+                    // node count detects the mismatch in both directions (N<M and N>M).
+                    {
+                        let anchor_count = anchors.len();
+                        if lambda_node_count != anchor_count {
+                            output.diagnostics.push(Diagnostic {
+                                path: file.path.clone(),
+                                parsed: true,
+                                error: format!(
+                                    "lambda-anchor mismatch: CST walk found {lambda_node_count} Lambda node(s) \
+                                     but tokenizer found {anchor_count} lambda keyword(s); \
+                                     hotspots for this file are omitted to avoid mis-anchored output"
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+
+                    if !self.include_tests && is_test_file(&file.path) {
+                        // Path-based skip: the entire file is test code.
+                        output.skipped_tests += units.len();
+                    } else {
+                        for unit in &units {
+                            if !self.include_tests && unit.is_test_unit {
+                                // Source-based skip: individual test unit within a
+                                // non-test-named file.
+                                output.skipped_tests += 1;
+                            } else {
+                                output
+                                    .functions
+                                    .push(detect::analyze_unit(unit, &file.path, &imports, &span));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        output
+    }
+}
+
+/// Return `true` if `path` identifies a test file by Python convention:
+///
+/// - base name matches `test_*.py` or `*_test.py` (pytest conventions), OR
+/// - base name is `conftest.py` (pytest configuration / shared fixtures), OR
+/// - any path segment is exactly `tests` (e.g. `src/tests/foo.py`).
+pub fn is_test_file(path: &str) -> bool {
+    // Extract the base name (last path segment).
+    let base = path.split(['/', '\\']).next_back().unwrap_or(path);
+
+    // conftest.py is always a test-support file.
+    if base == "conftest.py" {
+        return true;
+    }
+
+    // test_*.py  and  *_test.py
+    if (base.starts_with("test_") || base.ends_with("_test.py")) && base.ends_with(".py") {
+        return true;
+    }
+
+    // Any segment named exactly `tests` (singular `test` is too broad).
+    path.split(['/', '\\']).any(|seg| seg == "tests")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `FrontendOutput` from the given fixture file paths.
+    ///
+    /// The path used for `is_test_file` detection is the same as the read path.
+    fn analyze_files(paths: &[&str], include_tests: bool) -> FrontendOutput {
+        let files: Vec<SourceFile> = paths
+            .iter()
+            .map(|p| {
+                let text =
+                    std::fs::read_to_string(p).unwrap_or_else(|e| panic!("cannot read {p}: {e}"));
+                SourceFile {
+                    path: p.to_string(),
+                    text,
+                }
+            })
+            .collect();
+        PythonFrontend { include_tests }.analyze(&files)
+    }
+
+    /// Build a `FrontendOutput` from a fixture file, but report it under a
+    /// different `logical_path` for `is_test_file` detection.
+    ///
+    /// This lets source-based skip tests use a fixture that lives under
+    /// `tests/fixtures/` (which would otherwise trigger the `tests/` path rule)
+    /// while controlling the path that the skip logic sees.
+    fn analyze_fixture_as(
+        fixture: &str,
+        logical_path: &str,
+        include_tests: bool,
+    ) -> FrontendOutput {
+        let text = std::fs::read_to_string(fixture)
+            .unwrap_or_else(|e| panic!("cannot read {fixture}: {e}"));
+        PythonFrontend { include_tests }.analyze(&[SourceFile {
+            path: logical_path.to_string(),
+            text,
+        }])
+    }
+
+    #[test]
+    fn skips_test_code_by_default_and_counts() {
+        // File named test_sample.py → path-based file skip.
+        let out = analyze_files(
+            &["tests/fixtures/test_sample.py"],
+            /*include_tests=*/ false,
+        );
+        assert_eq!(out.functions.len(), 0);
+        assert!(out.skipped_tests >= 1);
+
+        // With --include-tests, all units are scored.
+        let inc = analyze_files(
+            &["tests/fixtures/test_sample.py"],
+            /*include_tests=*/ true,
+        );
+        assert!(inc.functions.len() >= 3);
+    }
+
+    #[test]
+    fn source_based_skip_independent_of_path_skip() {
+        // The fixture is read from tests/fixtures/ but we report it under
+        // "src/mixed_tests.py" so the path-based skip rule doesn't apply
+        // (no test_*/conftest base name, no `tests/` segment in the logical path).
+        // Source-based rules must skip test_something, TestWidget.test_render,
+        // TestWidget.helper (ALL methods of a Test* class are skipped, even
+        // non-test_*-named ones), and MyCase.test_case (unittest.TestCase
+        // subclass method).
+        let out = analyze_fixture_as(
+            "tests/fixtures/mixed_tests.py",
+            "src/mixed_tests.py",
+            /*include_tests=*/ false,
+        );
+        let symbols: Vec<&str> = out.functions.iter().map(|h| h.symbol.as_str()).collect();
+
+        // normal_function is always kept.
+        assert!(
+            symbols.contains(&"normal_function"),
+            "normal_function must not be skipped; got: {symbols:?}"
+        );
+        // test_* function is skipped.
+        assert!(
+            !symbols.contains(&"test_something"),
+            "test_something must be skipped; got: {symbols:?}"
+        );
+        // TestWidget.test_render is skipped (method of Test* class).
+        assert!(
+            !symbols.contains(&"test_render"),
+            "test_render must be skipped; got: {symbols:?}"
+        );
+        // TestWidget.helper is skipped too: ALL methods of a Test* class are
+        // skipped, including non-test_*-named ones (spec: "Test* class → its
+        // methods skipped"). Keeping helper would violate the spec.
+        assert!(
+            !symbols.contains(&"helper"),
+            "helper must be skipped (method of Test* class TestWidget); got: {symbols:?}"
+        );
+        // MyCase.test_case is skipped (unittest.TestCase subclass method).
+        assert!(
+            !symbols.contains(&"test_case"),
+            "test_case must be skipped; got: {symbols:?}"
+        );
+        // Some units must have been skipped.
+        assert!(
+            out.skipped_tests >= 1,
+            "expected skipped_tests >= 1; got: {}",
+            out.skipped_tests
+        );
+
+        // With --include-tests, all units including test ones are returned.
+        let inc = analyze_fixture_as(
+            "tests/fixtures/mixed_tests.py",
+            "src/mixed_tests.py",
+            /*include_tests=*/ true,
+        );
+        let inc_symbols: Vec<&str> = inc.functions.iter().map(|h| h.symbol.as_str()).collect();
+        assert!(
+            inc_symbols.contains(&"test_something"),
+            "with include_tests, test_something must be scored; got: {inc_symbols:?}"
+        );
+    }
+}

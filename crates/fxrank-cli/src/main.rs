@@ -10,7 +10,7 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(
     name = "fxrank",
-    about = "Effect-rank your Rust and TypeScript/JavaScript codebase"
+    about = "Effect-rank your Rust, TypeScript/JavaScript, and Python codebase"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,7 +29,7 @@ enum Cmd {
         /// Include test functions and modules in the analysis (skipped by default).
         #[arg(long)]
         include_tests: bool,
-        /// Language dialect for stdin (`ts`, `tsx`, `js`, `jsx`). Only meaningful
+        /// Language dialect for stdin (`ts`, `tsx`, `js`, `jsx`, `python`). Only meaningful
         /// for stdin; for files/directories the extension decides the frontend.
         #[arg(long)]
         lang: Option<String>,
@@ -42,7 +42,7 @@ enum Cmd {
         #[arg(
             long,
             value_delimiter = ',',
-            default_value = "node_modules,.git,target,*.min.js,*.min.mjs,*.min.cjs,*.stories.*,mockServiceWorker.js,jest.setup.*,jest.config.*,__mocks__"
+            default_value = "node_modules,.git,target,*.min.js,*.min.mjs,*.min.cjs,*.stories.*,mockServiceWorker.js,jest.setup.*,jest.config.*,__mocks__,.venv,venv,.tox,.nox,__pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages,*_pb2.py,*_pb2_grpc.py"
         )]
         exclude: Vec<String>,
     },
@@ -59,6 +59,8 @@ enum Route {
     Rust,
     /// TS-family source; the `String` is the file extension (e.g. `"ts"`, `"tsx"`).
     Ts(String),
+    /// Python source.
+    Python,
 }
 
 /// A source file paired with the frontend it should be routed to.
@@ -128,18 +130,19 @@ fn run_scan(
             path: "stdin".into(),
             text,
         };
-        // Back-compat: stdin defaults to Rust. `--lang` selects the TS frontend
-        // with the given dialect. (`--lang` is a TS-frontend concept; there is
-        // no `--lang rust`.)
+        // Back-compat: stdin defaults to Rust. `--lang` selects the frontend
+        // for the given dialect: `ts`, `tsx`, `js`, `jsx` (TS frontend) or
+        // `python` (Python frontend). There is no `--lang rust`.
         let route = match lang.as_deref() {
             None => Route::Rust,
             Some(flag) => {
-                // We only accept the four TS dialects here; reject anything else.
+                // Accept the TS dialects (`ts`/`tsx`/`js`/`jsx`) and `python`; reject anything else.
                 match flag {
                     "ts" | "tsx" | "js" | "jsx" => Route::Ts(flag.to_owned()),
+                    "python" => Route::Python,
                     other => {
                         return Err(format!(
-                            "unknown --lang value '{other}' (expected ts, tsx, js, or jsx)"
+                            "unknown --lang value '{other}' (expected ts, tsx, js, jsx, or python)"
                         ));
                     }
                 }
@@ -213,6 +216,7 @@ fn route_for_path(path: &std::path::Path) -> Option<Route> {
     match ext {
         "rs" => Some(Route::Rust),
         "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => Some(Route::Ts(ext.to_owned())),
+        "py" => Some(Route::Python),
         _ => None,
     }
 }
@@ -364,17 +368,20 @@ fn dispatch(routed: Vec<RoutedSource>, include_tests: bool) -> FrontendOutput {
     let mut rust_sources: Vec<SourceFile> = Vec::new();
     // TS sources keyed by extension so each `Lang` dialect group runs separately.
     let mut ts_sources: Vec<(String, SourceFile)> = Vec::new();
+    let mut python_sources: Vec<SourceFile> = Vec::new();
 
     for r in routed {
         match r.route {
             Route::Rust => rust_sources.push(r.source),
             Route::Ts(ext) => ts_sources.push((ext, r.source)),
+            Route::Python => python_sources.push(r.source),
         }
     }
 
     let mut output = FrontendOutput::default();
     merge_output(&mut output, dispatch_rust(rust_sources, include_tests));
     merge_output(&mut output, dispatch_ts(ts_sources, include_tests));
+    merge_output(&mut output, dispatch_python(python_sources, include_tests));
     output
 }
 
@@ -438,6 +445,29 @@ fn dispatch_ts(sources: Vec<(String, SourceFile)>, _include_tests: bool) -> Fron
             path: src.path,
             parsed: false,
             error: format!("no frontend available for .{ext} (built without 'ts' feature)"),
+        });
+    }
+    output
+}
+
+#[cfg(feature = "python")]
+fn dispatch_python(sources: Vec<SourceFile>, include_tests: bool) -> FrontendOutput {
+    use fxrank_core::frontend::Frontend;
+    use fxrank_lang_python::PythonFrontend;
+    if sources.is_empty() {
+        return FrontendOutput::default();
+    }
+    PythonFrontend { include_tests }.analyze(&sources)
+}
+
+#[cfg(not(feature = "python"))]
+fn dispatch_python(sources: Vec<SourceFile>, _include_tests: bool) -> FrontendOutput {
+    let mut output = FrontendOutput::default();
+    for src in sources {
+        output.diagnostics.push(Diagnostic {
+            path: src.path,
+            parsed: false,
+            error: "no frontend available for .py (built without 'python' feature)".into(),
         });
     }
     output

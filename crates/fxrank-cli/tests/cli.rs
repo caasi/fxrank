@@ -853,3 +853,62 @@ fn path_glob_anchors_through_nested_dirs() {
         "keep.ts should be scanned; got: {j}"
     );
 }
+
+// ── Task 12: scan --lang python - → hotspot for the function ──
+
+#[test]
+fn scans_python_stdin_fragment() {
+    let mut cmd = Command::cargo_bin("fxrank").unwrap();
+    cmd.args(["scan", "--lang", "python", "-"])
+        .write_stdin("def f():\n    pass\n")
+        .assert()
+        .success()
+        // Report has scope/summary/hotspots/diagnostics (model.rs) — NO "language" field
+        .stdout(predicates::str::contains("\"hotspots\""))
+        .stdout(predicates::str::contains("\"symbol\":\"f\""));
+}
+
+// ── Task 12: Python corpus-hygiene defaults (.venv dir prune, *_pb2.py glob) ──
+#[test]
+fn prunes_python_noise_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // Real Python source — must appear in hotspots
+    std::fs::write(root.join("app.py"), "def real():\n    open('x')\n").unwrap();
+
+    // .venv dir — pruned by bare-literal rule (never walked, not counted)
+    std::fs::create_dir_all(root.join(".venv/lib")).unwrap();
+    std::fs::write(
+        root.join(".venv/lib/dep.py"),
+        "def noise():\n    open('y')\n",
+    )
+    .unwrap();
+
+    // *_pb2.py glob — excluded by file-glob rule (counted in skipped_excluded)
+    std::fs::write(root.join("svc_pb2.py"), "def gen():\n    pass\n").unwrap();
+
+    let out = Command::cargo_bin("fxrank")
+        .unwrap()
+        .args(["scan"])
+        .arg(root)
+        .assert()
+        .success();
+    let json: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+
+    // .venv pruned (dir prune, uncounted) → "noise" never appears in output
+    assert!(
+        !json.to_string().contains("\"noise\""),
+        ".venv/lib/dep.py must be pruned; 'noise' must not appear in output; got: {json}"
+    );
+    // svc_pb2.py excluded by *_pb2.py file glob and counted in skipped_excluded
+    assert!(
+        json["scope"]["skipped_excluded"].as_u64().unwrap_or(0) >= 1,
+        "svc_pb2.py must be counted in skipped_excluded; got: {json}"
+    );
+    // app.py's real function is still scanned
+    assert!(
+        json.to_string().contains("\"real\""),
+        "app.py must be scanned and 'real' must appear in hotspots; got: {json}"
+    );
+}

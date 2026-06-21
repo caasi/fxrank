@@ -2,10 +2,10 @@
 
 **An effect-cost profiler for coding agents.**
 
-`fxrank scan <path>` analyzes Rust and TypeScript/JavaScript source and emits compact JSON
-ranking each function by its **effect cost** — how much IO, mutation, panic, and risk it
-carries in its own body — so an agent (or a human) can find the hotspots worth refactoring
-toward a purer core.
+`fxrank scan <path>` analyzes Rust, TypeScript/JavaScript, and Python source and emits
+compact JSON ranking each function by its **effect cost** — how much IO, mutation, panic,
+and risk it carries in its own body — so an agent (or a human) can find the hotspots
+worth refactoring toward a purer core.
 
 FxRank is a *measuring instrument*, not a linter. It reports facts — effect kind, severity
 class, why a discount applied, the evidence, a confidence, and risk flags — and
@@ -40,12 +40,13 @@ cargo install fxrank
 
 Re-run with `cargo install fxrank --force` to update; `cargo uninstall fxrank` removes it.
 
-By default the binary ships **both** frontends (Rust + TS/JS). For a slimmer build, install
-just one:
+By default the binary ships **all three** frontends (Rust + TS/JS + Python). For a slimmer
+build, install just one:
 
 ```bash
-cargo install fxrank --no-default-features --features rust  # Rust only
-cargo install fxrank --no-default-features --features ts    # TS/JS only
+cargo install fxrank --no-default-features --features rust    # Rust only
+cargo install fxrank --no-default-features --features ts      # TS/JS only
+cargo install fxrank --no-default-features --features python  # Python only
 ```
 
 To install the latest unreleased version straight from git:
@@ -67,18 +68,21 @@ cargo build --release        # binary at target/release/fxrank
 ```bash
 fxrank scan src/                 # scan a directory (recurses by extension, symlink-safe)
 fxrank scan src/lib.rs           # scan one Rust file
-fxrank scan app/                 # .rs → Rust; .ts/.tsx/.js/.jsx → TS/JS frontend
+fxrank scan app/                 # .rs → Rust; .ts/.tsx/.js/.jsx → TS/JS; .py → Python
 fxrank scan src/ --limit 20      # keep only the top-20 hotspots
 cat foo.rs | fxrank scan         # read Rust from stdin
-cat foo.ts | fxrank scan --lang ts   # read TS/JS from stdin (--lang: ts, tsx, js, jsx)
+cat foo.ts | fxrank scan --lang ts      # read TS/JS from stdin (--lang: ts, tsx, js, jsx)
+cat foo.py | fxrank scan --lang python  # read Python from stdin
 ```
 
 The frontend is chosen by **file extension** for paths; `--lang` selects it for stdin.
 Other flags:
 
 - `--include-tests` — test code is **excluded by default** (`#[test]`/`#[bench]` and
-  `#[cfg(test)]` modules for Rust; `*.test.*` / `*.spec.*` / `__tests__` paths for TS/JS).
-  Pass this to score tests too.
+  `#[cfg(test)]` modules for Rust; `*.test.*` / `*.spec.*` / `__tests__` paths for TS/JS;
+  `test_*.py` / `*_test.py` / `conftest.py` files and `tests/` directory segments for
+  Python, plus source-based skipping of `test_*` functions, `Test*`-named class methods,
+  and `unittest.TestCase` subclass methods). Pass this to score tests too.
 - `--exclude a,b,c` — comma-separated patterns to skip during directory scans
   (**replaces** the default list when given). Each entry is classified by whether it
   contains a `/`:
@@ -94,7 +98,7 @@ Other flags:
   prunes are not counted). `--exclude` applies to directory scans only; an explicitly
   named file or stdin is always scanned.
 
-  Default: `node_modules,.git,target,*.min.js,*.min.mjs,*.min.cjs,*.stories.*,mockServiceWorker.js,jest.setup.*,jest.config.*,__mocks__`
+  Default (JS/TS + Python corpus hygiene): `node_modules,.git,target,*.min.js,*.min.mjs,*.min.cjs,*.stories.*,mockServiceWorker.js,jest.setup.*,jest.config.*,__mocks__,.venv,venv,.tox,.nox,__pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages,*_pb2.py,*_pb2_grpc.py`
 
 Output is **compact JSON on stdout** (built for agents — pipe through `jq` to read it):
 
@@ -186,8 +190,8 @@ The full spec lives in [`specs/001-fxrank-rust-effect-scanner.md`](specs/001-fxr
 
 **Milestone A:** a primarily-syntactic analyzer — effect & risk detection, the containment
 discount, the hidden-mutation inversion, async/confidence metadata, diagnostics, and the
-`fxrank scan` CLI. Ships **two frontends**: Rust (`syn`) and TypeScript/JavaScript (`swc`),
-each syntactic (no type-checker or borrow-checker).
+`fxrank scan` CLI. Ships **three frontends**: Rust (`syn`), TypeScript/JavaScript (`swc`),
+and Python (`libcst`), each syntactic (no type-checker or borrow-checker).
 
 Known limitations (accepted for Milestone A): own-score only (no call-graph propagation, so
 extract-method can launder a score); type-dependent signals are heuristic; macro-generated

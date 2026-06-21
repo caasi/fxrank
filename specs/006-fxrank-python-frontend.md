@@ -115,11 +115,11 @@ Wire strings come from `EffectKind::wire()` — never hand-written. Resolution u
 | --- | --- | --- | --- |
 | `net.fs.db` | 7 | **fs:** `open`, `pathlib.Path.read_text` / `write_text`, `os.*` fs ops, `shutil`, `tempfile`, `json.load` / `dump` (file-wrapped), `csv`, `pandas.read_csv` / `read_excel`. **net:** `requests.*`, `httpx.*`, `urllib`, `socket`, `aiohttp`. **db:** `sqlite3`, SQLAlchemy / ORM. Method-name writes: `session.commit()`, `.save()`, `.objects.create()`, `cursor.execute()`, `.to_csv()`, `.to_sql()` | path / heuristic |
 | `process.control` | 6 | `subprocess.*`, `os.system`, `sys.exit` | path |
-| `env.write` | 6 | `os.environ[...] = …`, `os.putenv`, `dotenv.load_dotenv()` (reads a `.env` file **and mutates `os.environ`** — the env-write footprint dominates) | heuristic |
+| `env.write` | 6 | `os.environ[...] = …`, `os.putenv`, `dotenv.load_dotenv()` (reads a `.env` file **and mutates `os.environ`** — the env-write footprint dominates) | path / heuristic |
 | `concurrency` | 6 | `threading` / `multiprocessing` / `asyncio` primitives (locks, pools, `Process`) | heuristic |
 | `time.read` | 5 | `time.time()` / `sleep`, `datetime.now()` / `today()` (easy to miss — *looks* like value construction) | path / heuristic |
 | `random` | 5 | `random.*`, `secrets.*` | path |
-| `env.read` | 4 | `os.getenv` / `os.environ.get`; **`input()`** (interactive stdin read) | heuristic / exact |
+| `env.read` | 4 | `os.getenv` / `os.environ.get`; **`input()`** (interactive stdin read) | path / exact |
 | `logging` | 4 | `logging.*`, `print()` | path / exact |
 | `panic` | 4 | bare `assert` statement; `raise` | exact |
 | `ambient.read` | 2 | `sys.argv`, `sys.platform`, module-level config reads | path |
@@ -468,7 +468,8 @@ is a plain enum flag.
   `print()`, and explicit `Any` / `cast(Any, …)` (→ `type.escape`) — bare builtin names /
   statements / syntactic tokens recognized without import resolution.
 - **`path`:** a call resolved through the `imports` table to a known module/member
-  (`requests.get`, `subprocess.run`, `os.getenv`, `random.random`, `pickle.load`).
+  (`requests.get`, `subprocess.run`, `os.getenv`, `os.putenv`, `dotenv.load_dotenv`,
+  `random.random`, `pickle.load`).
 - **`heuristic`:** method-name signals (`session.commit()`, `.save()`,
   `cursor.execute()`, `.to_sql()` → `net.fs.db`; `os.environ` access; `datetime.now`),
   monkey-patching, the boundary discount itself (we *trust* annotations; no `mypy`), and
@@ -620,6 +621,11 @@ via 3a) rather than switch parsers. This item is blocking, not advisory.
 8. **Call-graph propagation / `inherited_score`** (already deferred in 001).
 9. **`csv` / `pandas` / `sqlite3` depth** — only the common entry points (`read_csv`,
    `to_sql`) are caught now; broaden with real scans.
+10. **Block-scoped import resolution** — `Imports::build` collects imports **file-wide**
+   (including function- and class-local `import` statements) into one flat per-file table,
+   so a function-local `import` resolves call-site names. This over-approximates: an import
+   in one function can resolve a same-named call in another (the table is file-scoped, not
+   block-scoped). Acceptable for a syntactic heuristic; block-scoped resolution is deferred.
 
 ## Open questions
 

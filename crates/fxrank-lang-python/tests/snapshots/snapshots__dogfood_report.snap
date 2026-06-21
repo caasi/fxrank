@@ -1,0 +1,127 @@
+---
+source: crates/fxrank-lang-python/tests/snapshots.rs
+expression: snapshot
+---
+{
+  "hotspots": [
+    {
+      "async_boundary": false,
+      "await_count": 0,
+      "confidence": 0.9,
+      "effects": [
+        {
+          "class": 7,
+          "discounted_to": null,
+          "hidden": false,
+          "kind": "net.fs.db",
+          "tier": "exact"
+        },
+        {
+          "class": 7,
+          "discounted_to": null,
+          "hidden": false,
+          "kind": "net.fs.db",
+          "tier": "path"
+        }
+      ],
+      "max_class": 7,
+      "own_score": 31.5,
+      "risk_features": [],
+      "risk_weight": 0,
+      "symbol": "io_world"
+    },
+    {
+      "async_boundary": false,
+      "await_count": 0,
+      "confidence": 1.0,
+      "effects": [],
+      "max_class": 7,
+      "own_score": 0.0,
+      "risk_features": [
+        {
+          "class": 7,
+          "kind": "dynamic.code"
+        }
+      ],
+      "risk_weight": 21,
+      "symbol": "dynamic"
+    },
+    {
+      "async_boundary": false,
+      "await_count": 0,
+      "confidence": 0.6,
+      "effects": [
+        {
+          "class": 3,
+          "discounted_to": null,
+          "hidden": false,
+          "kind": "this.mutation",
+          "tier": "heuristic"
+        }
+      ],
+      "max_class": 3,
+      "own_score": 3.0,
+      "risk_features": [],
+      "risk_weight": 0,
+      "symbol": "update"
+    },
+    {
+      "async_boundary": false,
+      "await_count": 0,
+      "confidence": 1.0,
+      "effects": [
+        {
+          "class": 1,
+          "discounted_to": 0,
+          "hidden": false,
+          "kind": "local.mutation",
+          "tier": "exact"
+        }
+      ],
+      "max_class": 0,
+      "own_score": 0.0,
+      "risk_features": [],
+      "risk_weight": 0,
+      "symbol": "typed_local"
+    },
+    {
+      "async_boundary": false,
+      "await_count": 0,
+      "confidence": 1.0,
+      "effects": [],
+      "max_class": 0,
+      "own_score": 0.0,
+      "risk_features": [],
+      "risk_weight": 0,
+      "symbol": "<lambda@L37C13>"
+    },
+    {
+      "async_boundary": false,
+      "await_count": 0,
+      "confidence": 0.6,
+      "effects": [
+        {
+          "class": 1,
+          "discounted_to": 0,
+          "hidden": false,
+          "kind": "local.mutation",
+          "tier": "heuristic"
+        }
+      ],
+      "max_class": 0,
+      "own_score": 0.0,
+      "risk_features": [],
+      "risk_weight": 0,
+      "symbol": "__init__"
+    }
+  ],
+  "scope": {
+    "skipped_tests": 1
+  },
+  "summary": {
+    "confidence": 0.6,
+    "max_class": 7,
+    "own_score": 31.5,
+    "risk_weight": 21
+  }
+}
