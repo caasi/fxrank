@@ -3,10 +3,11 @@
 use fxrank_core::confidence::detection_confidence;
 use fxrank_core::effect::{Effect, EffectKind, Tier};
 use fxrank_core::score::weight_for_class;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use swc_ecma_ast::{ArrowExpr, Expr, Pat, ReturnStmt, VarDeclarator};
 use swc_ecma_visit::{Visit, VisitWith};
 
+use crate::detect::mutation::{collect_pat_bindings, is_use_ref_call};
 use crate::functions::FnBodyOwned;
 use crate::source::SpanLines;
 
@@ -161,6 +162,46 @@ impl Visit for StateTransitionWalker<'_> {
     // Stop descent at nested function scopes so a useState call inside a
     // callback does not attribute to the enclosing component.
     fn visit_arrow_expr(&mut self, _n: &swc_ecma_ast::ArrowExpr) {}
+    fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
+}
+
+/// Collect the names bound by `const x = useRef(…)` declarations in a component
+/// body (`x` → in the returned set).
+///
+/// Only top-level declarations in the function's own body are recognized;
+/// descent stops at nested functions/arrows so a `useRef` inside a callback is
+/// not attributed to the enclosing component. This shares the `useRef`-call and
+/// pattern-binding recognizers with the mutation walker, so the two agree on
+/// what counts as a ref binding.
+///
+/// Task 9 threads this set into the mutation detection of the component's inline
+/// hook callbacks: a `r.current = …` write inside an absorbed callback refers to
+/// a ref declared here, in the component, not the callback's own scope.
+pub fn ref_bindings(body: &FnBodyOwned) -> HashSet<String> {
+    let mut walker = RefBindingWalker {
+        bindings: HashSet::new(),
+    };
+    body.walk_with(&mut walker);
+    walker.bindings
+}
+
+struct RefBindingWalker {
+    bindings: HashSet<String>,
+}
+
+impl Visit for RefBindingWalker {
+    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
+        if let Some(init) = &node.init
+            && is_use_ref_call(init)
+        {
+            collect_pat_bindings(&node.name, &mut self.bindings);
+        }
+        node.visit_children_with(self);
+    }
+
+    // Stop descent at nested function scopes so a useRef inside a callback does
+    // not attribute to the enclosing component.
+    fn visit_arrow_expr(&mut self, _n: &ArrowExpr) {}
     fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
 }
 

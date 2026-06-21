@@ -61,7 +61,26 @@ pub fn detect(
     lines: &SpanLines,
     imports: &ImportTable,
 ) -> Vec<(Effect, bool)> {
+    detect_with_refs(body, sig, is_constructor, lines, imports, &HashSet::new())
+}
+
+/// Like [`detect`], but pre-seeds the walker's `ref_bindings` with `extra_refs`.
+///
+/// This is the inheritance path (Task 9): when an inline hook callback is
+/// absorbed into its owning component, a write to `r.current` inside the
+/// callback refers to a `const r = useRef(…)` declared in the *component* body,
+/// not the callback's own scope. Pre-seeding the component's ref-binding names
+/// lets that write still classify as `ref-cell-write` (`hidden.mutation`).
+pub fn detect_with_refs(
+    body: &FnBodyOwned,
+    sig: &FnSig,
+    is_constructor: bool,
+    lines: &SpanLines,
+    imports: &ImportTable,
+    extra_refs: &HashSet<String>,
+) -> Vec<(Effect, bool)> {
     let mut walker = MutationWalker::seed(sig, is_constructor, lines, imports);
+    walker.ref_bindings.extend(extra_refs.iter().cloned());
     body.walk_with(&mut walker);
     walker.effects
 }
@@ -316,7 +335,7 @@ fn base_ident(expr: &Expr) -> Option<String> {
 /// Handles `Ident`, array/object destructuring, defaults (`= v`), and rest
 /// (`...rest`). Best-effort for nested destructuring (the same spirit as the
 /// Rust `collect_pat_bindings`).
-fn collect_pat_bindings(pat: &Pat, out: &mut HashSet<String>) {
+pub(crate) fn collect_pat_bindings(pat: &Pat, out: &mut HashSet<String>) {
     match pat {
         Pat::Ident(b) => {
             out.insert(b.id.sym.to_string());
@@ -369,7 +388,7 @@ fn is_mutating_method(name: &str) -> bool {
 /// Recognises both the bare form (`useRef(0)`) and the qualified form
 /// (`React.useRef(0)`). Does not require any imports — callee is matched
 /// syntactically.
-fn is_use_ref_call(expr: &Expr) -> bool {
+pub(crate) fn is_use_ref_call(expr: &Expr) -> bool {
     let call = match expr {
         Expr::Call(c) => c,
         _ => return false,
