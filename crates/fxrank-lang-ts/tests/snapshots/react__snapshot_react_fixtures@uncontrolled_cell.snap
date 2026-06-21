@@ -1,0 +1,27 @@
+---
+source: crates/fxrank-lang-ts/tests/react.rs
+assertion_line: 139
+expression: snapshot
+---
+[
+  {
+    "async_boundary": false,
+    "await_count": 0,
+    "confidence": 0.6,
+    "effects": [
+      {
+        "class": 3,
+        "discounted_to": null,
+        "hidden": true,
+        "kind": "hidden.mutation",
+        "subreason": "ref-cell-write",
+        "tier": "heuristic"
+      }
+    ],
+    "max_class": 3,
+    "own_score": 3.0,
+    "risk_features": [],
+    "risk_weight": 0,
+    "symbol": "UncontrolledCell"
+  }
+]

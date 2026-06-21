@@ -229,6 +229,53 @@ output. Workaround: move test helpers inside the `#[cfg(test)] mod tests` block 
 `imports::table` and `source::test_file`). Extending test-skip to bare `#[cfg(test)] fn`
 is a Milestone-B candidate.
 
+## Dogfooding the React signals (running `.tsx` fixtures through the two-pass)
+
+The React two-pass (`lib.rs::analyze_units`) extends the TS frontend with four signal
+families. The `tests/fixtures/react/` acceptance fixtures validate each family end-to-end:
+
+- **Component inheritance** (`counter.tsx`, `effects.tsx`): inline arrows passed directly
+  to `useEffect`, `useMemo`, `useCallback`, `useLayoutEffect`, and `useState` (lazy form)
+  are absorbed into the owning component's score and suppressed as standalone hotspots.
+  The component's `max_class` rises to the highest inherited effect. No `<arrow@…>` entries
+  appear in the output for absorbed callbacks.
+
+- **`EffectInRender`** (`effects.tsx`): a `fetch` inside `useMemo(() => fetch(…))` earns
+  an `effect.in.render` risk (class 4) on the component because `useMemo` callbacks run
+  during the render phase; the same `fetch` inside `useEffect(() => fetch(…))` does NOT
+  (effect-phase callbacks are the honest baseline). The `FetchData` component in
+  `effects.tsx` carries both inherited `net.fs.db` effects (class 7) and one
+  `effect.in.render` risk, proving the phase distinction.
+
+- **`useRef` cell → hidden mutation** (`uncontrolled_cell.tsx`): a `useRef` binding whose
+  `.current` is written in the component body is detected as `hidden.mutation` (class 3)
+  with `subreason: "ref-cell-write"` and `hidden: true`. The mutation walker's
+  `ref_bindings` set is seeded at collection time, so the write is correctly distinguished
+  from a plain captured-outer-binding write (which also becomes `hidden.mutation` class 3
+  but with no subreason). For writes inside absorbed hook callbacks the owning component's
+  `ref_bindings` are threaded via `extra_refs` (see `detect::raw_signals`).
+
+- **`StateTransition`** (`counter.tsx`): every `const [v, setV] = useState(…)` declaration
+  in a component body emits a `state.transition` effect (class 1, subreason: "useState")
+  attributed to the DECLARATION LINE (not to setter call sites). The signal is "component
+  holds traced state" — the score is intentionally low (class 1) because traced state is
+  declared and bounded.
+
+**Documented misses (all Milestone-B candidates):**
+- Single-hop limit: effects inside a callback that is itself inside a recognized hook
+  callback are NOT absorbed (only the outermost arrow is a single-hop callback).
+- Custom-hook callbacks → issue #25: a `useCustomHook(() => fetch(…))` where the custom
+  hook internally calls `useEffect` is not recognized; only literal `use{Effect,Memo,…}`
+  callees match.
+- All-null components: a component that always returns `null` is not detected as a
+  component (`returns_jsx` is false) and gets no React augmentation.
+- `useMemo(() => <jsx/>)` self-referential arrow: the arrow both is a hook callback (render
+  phase) and itself returns JSX — it is suppressed as a standalone hotspot and absorbed,
+  but `returns_jsx` on the absorbed arrow body does not cause it to be treated as a
+  component (which is correct; it is not a component).
+- Namespace `React.useEffect(…)`, `React.useState(…)`, etc.: the hook recognizers match
+  bare callee identifiers only; qualified `React.*` forms are an accepted miss.
+
 ## Design artifacts & workflow
 
 Specs live in `specs/`, implementation plans in `plans/`, with matching 3-digit prefixes
