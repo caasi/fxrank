@@ -4,7 +4,7 @@ use fxrank_core::confidence::detection_confidence;
 use fxrank_core::effect::{Effect, EffectKind, Tier};
 use fxrank_core::score::weight_for_class;
 use swc_ecma_ast::{Expr, Pat, ReturnStmt, VarDeclarator};
-use swc_ecma_visit::Visit;
+use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::functions::FnBodyOwned;
 use crate::source::SpanLines;
@@ -21,6 +21,68 @@ pub fn returns_jsx(body: &FnBodyOwned) -> bool {
             v.found
         }
     }
+}
+
+/// Emit one `AmbientRead` (class 2) effect per `useContext(…)` call in the
+/// component body.
+///
+/// Only bare-ident `useContext` calls in the function's own body are recognized;
+/// descent stops at nested functions/arrows so a `useContext` inside a callback
+/// does not attribute to the enclosing component. `React.useContext(…)` member
+/// forms are an accepted Milestone-A miss — only literal callee idents match.
+///
+/// The argument is a context by React API contract; we do not resolve what it is
+/// (cross-file resolution is issue #25).
+pub fn context_reads(body: &FnBodyOwned, lines: &SpanLines) -> Vec<Effect> {
+    let mut walker = ContextReadWalker {
+        lines,
+        effects: Vec::new(),
+    };
+    body.walk_with(&mut walker);
+    walker.effects
+}
+
+struct ContextReadWalker<'a> {
+    lines: &'a SpanLines,
+    effects: Vec<Effect>,
+}
+
+impl Visit for ContextReadWalker<'_> {
+    fn visit_call_expr(&mut self, node: &swc_ecma_ast::CallExpr) {
+        // Recognize bare-ident `useContext(…)` calls only.
+        let callee_name = match &node.callee {
+            swc_ecma_ast::Callee::Expr(e) => match e.as_ref() {
+                Expr::Ident(i) => Some(i.sym.to_string()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if callee_name.as_deref() == Some("useContext") {
+            let line = self.lines.line(node.span);
+            let class: u8 = 2;
+            let confidence = detection_confidence(Tier::Heuristic, false, false);
+            self.effects.push(Effect {
+                kind: EffectKind::AmbientRead,
+                class,
+                discounted_to: None,
+                weight: weight_for_class(class),
+                line,
+                tier: Tier::Heuristic,
+                hidden: false,
+                evidence: "useContext(…)".to_string(),
+                discount: None,
+                subreason: Some("useContext-read".to_string()),
+                confidence,
+            });
+        }
+        // Recurse into the call's arguments (but not into nested fn scopes — those
+        // are stopped by the overrides below).
+        node.visit_children_with(self);
+    }
+
+    // Stop descent at nested function scopes.
+    fn visit_arrow_expr(&mut self, _n: &swc_ecma_ast::ArrowExpr) {}
+    fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
 }
 
 /// Emit one `StateTransition` (class 1) effect per literal `useState` /
@@ -154,6 +216,19 @@ mod tests {
             .find(|u| u.symbol == symbol)
             .expect("unit");
         (u, lines)
+    }
+
+    #[test]
+    fn usecontext_emits_ambient_read() {
+        let (u, lines) = unit_with_lines(
+            "function C(){ const t = useContext(Theme); return <i/>; }",
+            "C",
+        );
+        let effs = context_reads(&u.body, &lines);
+        assert_eq!(effs.len(), 1);
+        assert_eq!(effs[0].kind, EffectKind::AmbientRead);
+        assert_eq!(effs[0].class, 2);
+        assert_eq!(effs[0].subreason.as_deref(), Some("useContext-read"));
     }
 
     #[test]
