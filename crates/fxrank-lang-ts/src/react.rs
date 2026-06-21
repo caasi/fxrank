@@ -3,7 +3,8 @@
 use fxrank_core::confidence::detection_confidence;
 use fxrank_core::effect::{Effect, EffectKind, Tier};
 use fxrank_core::score::weight_for_class;
-use swc_ecma_ast::{Expr, Pat, ReturnStmt, VarDeclarator};
+use std::collections::HashMap;
+use swc_ecma_ast::{ArrowExpr, Expr, Pat, ReturnStmt, VarDeclarator};
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::functions::FnBodyOwned;
@@ -163,6 +164,123 @@ impl Visit for StateTransitionWalker<'_> {
     fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
 }
 
+/// The React lifecycle phase of an inline hook callback.
+///
+/// `Effect` — the callback runs after rendering and (for `useLayoutEffect`)
+/// synchronously after DOM mutation. `Render` — the callback runs during the
+/// render phase and must be side-effect-free.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HookPhase {
+    Effect,
+    Render,
+}
+
+/// Build a map from inline arrow `(line, col)` → [`HookPhase`] for every arrow
+/// passed **directly** as a recognized hook argument in `body`.
+///
+/// "Directly" means single-hop: only arrows that are the immediate argument to
+/// the hook call are recorded. Arrows nested inside those callbacks, or inside
+/// any other nested function scope, are not mapped.
+///
+/// # Phase rules
+/// - `useEffect`, `useLayoutEffect` → `HookPhase::Effect` for `args[0]`.
+/// - `useMemo`, `useCallback` → `HookPhase::Render` for `args[0]`.
+/// - `useState` → `HookPhase::Render` for `args[0]` only when it is an arrow
+///   (the lazy-initializer form; skipped for non-arrow initial values).
+/// - `useReducer` → `HookPhase::Render` for `args[2]` only (the optional `init`
+///   function; `args[0]` / reducer and `args[1]` / initial state are NOT mapped).
+///
+/// The `(line, col)` key is computed via `lines.line_col(arrow.span)` — the same
+/// call that `functions::collect` makes in `visit_arrow_expr` — so it matches
+/// the `FnUnit`'s `(line, col)` that Task 9 uses to look up the arrow.
+pub fn inherited_callbacks(
+    body: &FnBodyOwned,
+    lines: &SpanLines,
+) -> HashMap<(usize, usize), HookPhase> {
+    let mut walker = HookCallbackWalker {
+        lines,
+        map: HashMap::new(),
+    };
+    body.walk_with(&mut walker);
+    walker.map
+}
+
+struct HookCallbackWalker<'a> {
+    lines: &'a SpanLines,
+    map: HashMap<(usize, usize), HookPhase>,
+}
+
+/// Return the hook name from a `CallExpr` callee, if it is a bare identifier.
+fn hook_callee_name(node: &swc_ecma_ast::CallExpr) -> Option<&str> {
+    match &node.callee {
+        swc_ecma_ast::Callee::Expr(e) => match e.as_ref() {
+            Expr::Ident(i) => Some(i.sym.as_ref()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Record `arrow` in the walker's map with the given phase.
+fn record_arrow(walker: &mut HookCallbackWalker<'_>, arrow: &ArrowExpr, phase: HookPhase) {
+    let key = walker.lines.line_col(arrow.span);
+    walker.map.insert(key, phase);
+}
+
+impl Visit for HookCallbackWalker<'_> {
+    fn visit_call_expr(&mut self, node: &swc_ecma_ast::CallExpr) {
+        match hook_callee_name(node) {
+            Some("useEffect") | Some("useLayoutEffect") => {
+                // args[0] is the effect callback.
+                if let Some(arg0) = node.args.first() {
+                    if let Expr::Arrow(arrow) = arg0.expr.as_ref() {
+                        record_arrow(self, arrow, HookPhase::Effect);
+                    }
+                }
+            }
+            Some("useMemo") | Some("useCallback") => {
+                // args[0] is the memoized computation / stable callback.
+                if let Some(arg0) = node.args.first() {
+                    if let Expr::Arrow(arrow) = arg0.expr.as_ref() {
+                        record_arrow(self, arrow, HookPhase::Render);
+                    }
+                }
+            }
+            Some("useState") => {
+                // args[0] is the lazy initializer ONLY when it is an arrow.
+                // A plain value (`useState(0)`) is not a callback.
+                if let Some(arg0) = node.args.first() {
+                    if let Expr::Arrow(arrow) = arg0.expr.as_ref() {
+                        record_arrow(self, arrow, HookPhase::Render);
+                    }
+                }
+            }
+            Some("useReducer") => {
+                // args[2] is the optional `init` function (lazy initializer).
+                // args[0] = reducer, args[1] = initial state — not mapped.
+                if let Some(arg2) = node.args.get(2) {
+                    if let Expr::Arrow(arrow) = arg2.expr.as_ref() {
+                        record_arrow(self, arrow, HookPhase::Render);
+                    }
+                }
+            }
+            _ => {
+                // Not a recognized hook: recurse into the call so nested hook
+                // calls inside non-hook calls are still found. Nested fn/arrow
+                // scopes are stopped by the overrides below.
+                node.visit_children_with(self);
+            }
+        }
+        // Recognized hooks do not recurse further: hook arguments are arrow
+        // scopes which are stopped by visit_arrow_expr below anyway, and we
+        // don't want to accidentally pick up hook calls nested inside them.
+    }
+
+    // Stop descent at nested function scopes (single-hop only).
+    fn visit_arrow_expr(&mut self, _n: &ArrowExpr) {}
+    fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
+}
+
 fn expr_is_jsx(e: &Expr) -> bool {
     matches!(e, Expr::JSXElement(_) | Expr::JSXFragment(_))
         || matches!(e, Expr::Paren(p) if expr_is_jsx(&p.expr))
@@ -241,6 +359,20 @@ mod tests {
         assert_eq!(effs.len(), 1);
         assert_eq!(effs[0].kind, EffectKind::StateTransition);
         assert_eq!(effs[0].class, 1);
+    }
+
+    #[test]
+    fn maps_inline_hook_callbacks_by_phase() {
+        let (u, lines) = unit_with_lines(
+            "function C(){ useEffect(() => { fetch('/a'); }, []); \
+             const m = useMemo(() => fetch('/b'), []); return <i/>; }",
+            "C",
+        );
+        let map = inherited_callbacks(&u.body, &lines);
+        let phases: Vec<_> = map.values().copied().collect();
+        assert!(phases.contains(&HookPhase::Effect));
+        assert!(phases.contains(&HookPhase::Render));
+        assert_eq!(map.len(), 2);
     }
 
     #[test]
