@@ -1,0 +1,23 @@
+[package]
+name = "fxrank-lang-python"
+description = "Python (libcst-based) frontend for FxRank's effect-cost profiler."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+fxrank-core = { path = "../fxrank-core", version = "0.1.1" }
+libcst = { version = "1.8.6", default-features = false }
+
+[dev-dependencies]
+insta = { version = "1", features = ["json"] }
+serde_json = "1"
+
+[lints]
+workspace = true
