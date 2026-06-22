@@ -117,6 +117,9 @@ fn analyze_units(
     let mut by_id: HashMap<String, Hotspot> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut pending: HashMap<String, Vec<(react::HookPhase, detect::RawSignals)>> = HashMap::new();
+    // Shared empty set used as a borrow fallback when a component has no ref bindings.
+    // Avoids cloning the per-component HashSet<String> for every suppressed callback.
+    let empty_refs: HashSet<String> = HashSet::new();
     for unit in units {
         // `unit.col` is a real field (Task 4) — NEVER parse it out of `id`.
         let key = (unit.line, unit.col);
@@ -125,8 +128,8 @@ fn analyze_units(
             // Thread the owning component's ref-binding set so a `r.current = …`
             // write inside this callback still classifies as ref-cell-write (the
             // arrow alone can't know `r` is a useRef binding from the component).
-            let refs = comp_refs.get(&comp_id).cloned().unwrap_or_default();
-            let raw = detect::raw_signals(unit, imports, lines, &refs);
+            let refs = comp_refs.get(comp_id.as_str()).unwrap_or(&empty_refs);
+            let raw = detect::raw_signals(unit, imports, lines, refs);
             pending.entry(comp_id).or_default().push((phase, raw));
             continue;
         }
