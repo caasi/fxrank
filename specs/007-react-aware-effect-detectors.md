@@ -246,7 +246,7 @@ render-phase (`useMemo`/`useCallback`/lazy-init effects → `EffectInRender`); s
 explicitly out of scope; restricted `StateTransition` to literal `useState`/`useReducer` call sites;
 dropped the now-dead `import type` filter (detection no longer reads imports).
 
-**Note (post-Round-2 correction, caught by dogfooding):** Round 2 placed `useCallback` in the
+**Note (post-Round 2 correction, caught by dogfooding):** Round 2 placed `useCallback` in the
 render-phase alongside `useMemo` — this was a false positive. The distinction is semantic:
 `useMemo(() => compute())` calls the factory during render to produce a value; `useCallback(() =>
 handler())` only *memoizes* the function reference, whose body executes on invocation (event-time),

@@ -226,9 +226,8 @@ pub enum HookPhase {
 /// # Phase rules
 /// - `useEffect`, `useLayoutEffect` → `HookPhase::Effect` for `args[0]`.
 /// - `useCallback` → `HookPhase::Effect` for `args[0]`. React only *memoizes*
-///   the function; its body runs when the callback is *invoked* (on an event),
-///   not during render. An effect inside is event-time, like a plain `onClick`
-///   handler. Classifying it as render-phase is a false positive.
+///   the function reference; its body executes on invocation (event-time), not
+///   during render.
 /// - `useMemo` → `HookPhase::Render` for `args[0]`. React calls the factory
 ///   during render to produce the memoized value, so effects inside DO run at
 ///   render time.

@@ -217,6 +217,14 @@ fn usememo_fetch_still_effect_in_render() {
         "function C(){ const v = useMemo(() => fetch('/x'), []); return <div/>; }",
     );
     let c = hs.iter().find(|h| h.symbol == "C").expect("component C");
+    // The fetch effect must be inherited (net.fs.db class 7) — proving the render
+    // risk is attached alongside a real inherited world effect, not a spurious path.
+    assert!(
+        c.effects
+            .iter()
+            .any(|e| e.kind == fxrank_core::effect::EffectKind::NetFsDb),
+        "C must inherit the NetFsDb effect from the useMemo callback"
+    );
     assert!(
         c.risk_features
             .iter()
