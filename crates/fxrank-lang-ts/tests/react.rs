@@ -184,6 +184,47 @@ fn async_inherited_callback_propagates_await_penalty() {
     );
 }
 
+/// `useCallback` bodies run on invocation (event-time), NOT during render.
+/// A `fetch` inside a `useCallback` callback must inherit to the component at
+/// honest baseline — no `EffectInRender` risk.
+#[test]
+fn usecallback_fetch_is_not_effect_in_render() {
+    let hs = util::analyze_tsx(
+        "function C(){ const f = useCallback(() => { fetch('/x'); }, []); return <div onClick={f}/>; }",
+    );
+    let c = hs.iter().find(|h| h.symbol == "C").expect("component C");
+    // The fetch effect must be inherited (net.fs.db class 7).
+    assert!(
+        c.effects
+            .iter()
+            .any(|e| e.kind == fxrank_core::effect::EffectKind::NetFsDb),
+        "C must inherit the NetFsDb effect from the useCallback callback"
+    );
+    // But it must NOT carry EffectInRender — useCallback is event-phase.
+    assert!(
+        c.risk_features
+            .iter()
+            .all(|r| r.kind != fxrank_core::effect::RiskKind::EffectInRender),
+        "useCallback body is event-time, not render-time: C must not carry EffectInRender"
+    );
+}
+
+/// Regression guard: `useMemo` still correctly fires `EffectInRender`.
+/// A `fetch` inside a `useMemo` callback runs during render → must carry the risk.
+#[test]
+fn usememo_fetch_still_effect_in_render() {
+    let hs = util::analyze_tsx(
+        "function C(){ const v = useMemo(() => fetch('/x'), []); return <div/>; }",
+    );
+    let c = hs.iter().find(|h| h.symbol == "C").expect("component C");
+    assert!(
+        c.risk_features
+            .iter()
+            .any(|r| r.kind == fxrank_core::effect::RiskKind::EffectInRender),
+        "useMemo callback runs during render: C must carry EffectInRender"
+    );
+}
+
 /// Snapshot the full hotspot list for the three React fixture files.
 ///
 /// Dynamic snapshot suffix (the `with_settings!` form) is used because the

@@ -225,7 +225,13 @@ pub enum HookPhase {
 ///
 /// # Phase rules
 /// - `useEffect`, `useLayoutEffect` → `HookPhase::Effect` for `args[0]`.
-/// - `useMemo`, `useCallback` → `HookPhase::Render` for `args[0]`.
+/// - `useCallback` → `HookPhase::Effect` for `args[0]`. React only *memoizes*
+///   the function; its body runs when the callback is *invoked* (on an event),
+///   not during render. An effect inside is event-time, like a plain `onClick`
+///   handler. Classifying it as render-phase is a false positive.
+/// - `useMemo` → `HookPhase::Render` for `args[0]`. React calls the factory
+///   during render to produce the memoized value, so effects inside DO run at
+///   render time.
 /// - `useState` → `HookPhase::Render` for `args[0]` only when it is an arrow
 ///   (the lazy-initializer form; skipped for non-arrow initial values).
 /// - `useReducer` → `HookPhase::Render` for `args[2]` only (the optional `init`
@@ -279,11 +285,23 @@ impl Visit for HookCallbackWalker<'_> {
                     }
                 }
             }
-            Some("useMemo") | Some("useCallback") => {
-                // args[0] is the memoized computation / stable callback.
+            Some("useMemo") => {
+                // args[0] is the memoized computation: React calls this factory
+                // during render, so effects inside run at render time.
                 if let Some(arg0) = node.args.first() {
                     if let Expr::Arrow(arrow) = arg0.expr.as_ref() {
                         record_arrow(self, arrow, HookPhase::Render);
+                    }
+                }
+            }
+            Some("useCallback") => {
+                // args[0] is a memoized *handler*: React only stores the
+                // function reference; the body executes on invocation (event),
+                // NOT during render. Treat it as effect-phase (honest baseline,
+                // no EffectInRender) — same as useEffect/useLayoutEffect.
+                if let Some(arg0) = node.args.first() {
+                    if let Expr::Arrow(arrow) = arg0.expr.as_ref() {
+                        record_arrow(self, arrow, HookPhase::Effect);
                     }
                 }
             }
