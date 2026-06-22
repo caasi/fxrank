@@ -54,12 +54,12 @@ impl Visit for ContextReadWalker<'_> {
         // Recognize bare-ident `useContext(…)` calls only.
         let callee_name = match &node.callee {
             swc_ecma_ast::Callee::Expr(e) => match e.as_ref() {
-                Expr::Ident(i) => Some(i.sym.to_string()),
+                Expr::Ident(i) => Some(i.sym.as_ref()),
                 _ => None,
             },
             _ => None,
         };
-        if callee_name.as_deref() == Some("useContext") {
+        if callee_name == Some("useContext") {
             let line = self.lines.line(node.span);
             let class: u8 = 2;
             let confidence = detection_confidence(Tier::Heuristic, false, false);
@@ -124,12 +124,12 @@ impl Visit for StateTransitionWalker<'_> {
         };
         let callee_name = match &call.callee {
             swc_ecma_ast::Callee::Expr(e) => match e.as_ref() {
-                Expr::Ident(i) => Some(i.sym.to_string()),
+                Expr::Ident(i) => Some(i.sym.as_ref()),
                 _ => None,
             },
             _ => None,
         };
-        let subreason = match callee_name.as_deref() {
+        let subreason = match callee_name {
             Some("useState") => "useState",
             Some("useReducer") => "useReducer",
             _ => return,
@@ -361,7 +361,12 @@ impl Visit for JsxReturnFinder {
                 self.found = true;
             }
         }
-        // do not recurse further; returns inside nested fns are stopped below.
+        // Do NOT call visit_children_with here. This prevents the visitor from
+        // descending into the return expression's sub-expressions — however, that
+        // is NOT what stops nested-function returns from being seen. Nested
+        // function and arrow scopes are intercepted BEFORE any `return` inside
+        // them is reached, by the empty `visit_arrow_expr` / `visit_function`
+        // overrides below that terminate descent at scope boundaries.
     }
     fn visit_arrow_expr(&mut self, _n: &swc_ecma_ast::ArrowExpr) {}
     fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
