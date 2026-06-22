@@ -326,9 +326,11 @@ pub fn augment_component(h: &mut Hotspot, unit: &FnUnit, lines: &SpanLines) {
 ///
 /// Each inherited effect is forced `contained = false` / `discounted_to = None`
 /// (the component never benefits from a child's boundary discount). For a
-/// `HookPhase::Render` callback (e.g. `useMemo` / `useCallback`), each inherited
-/// world effect additionally earns an `EffectInRender` risk; `HookPhase::Effect`
-/// callbacks (`useEffect` / `useLayoutEffect`) do not — running effects there is
+/// `HookPhase::Render` callback (`useMemo` and the `useState`/`useReducer` lazy
+/// initializers — bodies that run during render), each inherited world effect
+/// additionally earns an `EffectInRender` risk; `HookPhase::Effect` callbacks
+/// (`useEffect` / `useLayoutEffect` / `useCallback`) do not — their bodies run
+/// outside render (after commit, or on invocation), so running effects there is
 /// the honest baseline.
 pub fn absorb_inherited(h: &mut Hotspot, raws: Vec<(HookPhase, RawSignals)>) {
     for (phase, raw) in raws {
