@@ -137,13 +137,26 @@ impl<'a> MutationWalker<'a> {
         let Some(base) = base_ident(place) else {
             return;
         };
-        // A ref binding (`const r = useRef(...)`) only qualifies when the write
-        // targets `.current` (e.g. `r.current = 5`). A bare write to `r` itself
-        // would be unusual and should not misfire as a ref-cell write.
-        if self.ref_bindings.contains(&base) && !has_current_in_chain(place) {
-            return;
-        }
-        let c = self.classify(&base);
+        // A ref binding (`const r = useRef(...)`) only qualifies as a ref-cell
+        // write when the place targets `.current` (e.g. `r.current = 5`).
+        // A bare reassignment of the binding itself (`r = makeRef()`) is NOT a
+        // ref-cell write — it is a normal local mutation and must not be dropped.
+        let is_ref_cell = self.ref_bindings.contains(&base) && has_current_in_chain(place);
+        let c = if is_ref_cell {
+            // Ref-cell write: hidden mutation class 3, not contained.
+            Classification::new(
+                EffectKind::HiddenMutation,
+                3,
+                false,
+                true,
+                Tier::Heuristic,
+                "ref cell",
+            )
+            .with_subreason("ref-cell-write")
+        } else {
+            // Normal classification by escape analysis (locals/params/global/captured).
+            self.classify(&base)
+        };
         let effect = Effect {
             kind: c.kind,
             class: c.class,
@@ -163,6 +176,15 @@ impl<'a> MutationWalker<'a> {
     /// The escape-classification table: map a write's base ident to its effect
     /// kind, severity class, `contained` flag, `hidden` flag, tier, and an
     /// evidence role-word.
+    ///
+    /// Note: the `ref_bindings` case is intentionally NOT handled here. Ref-cell
+    /// detection requires the full place expression (to check for `.current`), so
+    /// it is handled in `record_write` before `classify` is called. By the time
+    /// `classify` sees a ref-binding base, either it was a `.current` write (and
+    /// `record_write` already emitted the ref-cell effect and returned) or it was a
+    /// bare reassignment of the binding itself (e.g. `r = makeRef()`) and should
+    /// fall through to normal classification here — `r` is in `locals`, so it
+    /// becomes `local.mutation` class 1.
     fn classify(&self, base: &str) -> Classification {
         use EffectKind::*;
         if base == "this" {
@@ -172,12 +194,6 @@ impl<'a> MutationWalker<'a> {
             } else {
                 Classification::new(ThisMutation, 3, false, false, Tier::Heuristic, "this field")
             }
-        } else if self.ref_bindings.contains(base) {
-            // A `useRef` binding: `.current` writes are ref-cell mutations —
-            // hidden from the signature and semantically equivalent to a
-            // captured mutable cell. Class 3, not contained.
-            Classification::new(HiddenMutation, 3, false, true, Tier::Heuristic, "ref cell")
-                .with_subreason("ref-cell-write")
         } else if self.locals.contains(base) {
             Classification::new(LocalMutation, 1, true, false, Tier::Exact, "local")
         } else if self.params.contains(base) {
@@ -483,5 +499,29 @@ mod tests {
             .expect("local mutation");
         assert_eq!(e.effective_class(), 1);
         assert_eq!(e.subreason, None);
+    }
+
+    #[test]
+    fn bare_ref_reassign_is_local_not_dropped() {
+        // Fix ①: a bare reassignment of a `useRef` binding (`r = makeRef()`) must NOT
+        // be dropped. `r` is a `let`-declared local, so it should produce a LocalMutation
+        // class 1 effect, not be silently discarded and not be a ref-cell-write.
+        let effects = detect_in("function C(){ let r = useRef(0); r = makeRef(); return null; }");
+        // Must produce at least one LocalMutation (the `r = makeRef()` write).
+        let local = effects
+            .iter()
+            .find(|(e, _)| e.kind == EffectKind::LocalMutation)
+            .expect("expected a LocalMutation for bare ref reassignment — was dropped (bug)");
+        assert_eq!(local.0.effective_class(), 1);
+        assert_eq!(local.0.subreason, None);
+        // Must NOT produce a ref-cell-write for the bare reassignment.
+        let ref_cell_writes: Vec<_> = effects
+            .iter()
+            .filter(|(e, _)| e.subreason.as_deref() == Some("ref-cell-write"))
+            .collect();
+        assert!(
+            ref_cell_writes.is_empty(),
+            "bare ref reassignment wrongly classified as ref-cell-write"
+        );
     }
 }
