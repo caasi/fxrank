@@ -144,6 +144,46 @@ fn onclick_handler_is_not_effect_in_render() {
     );
 }
 
+/// An async inherited callback propagates its await metadata to the component.
+///
+/// Component `C` uses `useEffect(async () => { await fetch('/x'); }, [])`.
+/// After inheritance + absorption, `C` must have `await_count > 0`,
+/// `async_boundary == true`, and a confidence strictly lower than the sync variant
+/// `D` (which has the same `fetch` effect but no `await`).
+#[test]
+fn async_inherited_callback_propagates_await_penalty() {
+    // Async variant: useEffect callback is `async () => { await fetch('/x') }`
+    let hs_async = util::analyze_tsx(
+        "function C(){ useEffect(async () => { await fetch('/x'); }, []); return <div/>; }",
+    );
+    let c = hs_async
+        .iter()
+        .find(|h| h.symbol == "C")
+        .expect("component C");
+
+    assert!(
+        c.await_count > 0,
+        "C must have await_count > 0 (got {})",
+        c.await_count
+    );
+    assert!(c.async_boundary, "C must have async_boundary == true");
+
+    // Sync variant: same fetch but no async/await
+    let hs_sync =
+        util::analyze_tsx("function D(){ useEffect(() => { fetch('/x'); }, []); return <div/>; }");
+    let d = hs_sync
+        .iter()
+        .find(|h| h.symbol == "D")
+        .expect("component D");
+
+    assert!(
+        c.confidence < d.confidence,
+        "async variant C confidence ({}) must be strictly lower than sync variant D confidence ({})",
+        c.confidence,
+        d.confidence
+    );
+}
+
 /// Snapshot the full hotspot list for the three React fixture files.
 ///
 /// Dynamic snapshot suffix (the `with_settings!` form) is used because the

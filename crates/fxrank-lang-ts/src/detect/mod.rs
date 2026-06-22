@@ -192,9 +192,16 @@ fn count_awaits(body: &FnBodyOwned) -> usize {
 /// discount has been applied** — the component absorbs the honest, undiscounted
 /// effect of the callback it owns (it must not inherit a child's discounted
 /// score, which the boundary discount could have floored to 0).
+///
+/// `await_count` and `is_async` carry the callback's async metadata so
+/// [`absorb_inherited`] can fold them into the owning component's `await_count`
+/// and `async_boundary` fields, enabling the `0.8` await-confidence penalty to
+/// apply even when the awaits live inside an inherited callback.
 pub struct RawSignals {
     pub effects: Vec<Effect>,
     pub risks: Vec<RiskFeature>,
+    pub await_count: usize,
+    pub is_async: bool,
 }
 
 /// Harvest the pre-discount effects + risks of `unit` (an inherited hook
@@ -237,7 +244,17 @@ pub fn raw_signals(
     // Per-body risks: non-null assertion, dynamic.code, proto.pollution, html.injection.
     risks.extend(risk::detect(&unit.body, &unit.path, lines));
 
-    RawSignals { effects, risks }
+    // Capture the callback's async metadata so absorb_inherited can fold it into
+    // the owning component, propagating the await-confidence penalty.
+    let await_count = count_awaits(&unit.body);
+    let is_async = unit.is_async;
+
+    RawSignals {
+        effects,
+        risks,
+        await_count,
+        is_async,
+    }
 }
 
 /// Is `kind` a **world** effect — one that, in render phase, makes a component
@@ -324,6 +341,15 @@ pub fn absorb_inherited(h: &mut Hotspot, raws: Vec<(HookPhase, RawSignals)>) {
             h.effects.push(e);
         }
         h.risk_features.extend(raw.risks);
+        // Fold the callback's async metadata into the component so that:
+        //   - recompute() sees h.await_count > 0 and pushes the 0.8 synthetic
+        //     confidence entry (the "unresolved awaited call" penalty);
+        //   - h.async_boundary reflects that the component now "owns" async IO
+        //     through the inherited hook callback.
+        h.await_count += raw.await_count;
+        if raw.is_async || raw.await_count > 0 {
+            h.async_boundary = true;
+        }
     }
     recompute(h);
 }
