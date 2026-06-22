@@ -4,15 +4,17 @@
 //   - No EffectInRender (a ref write is not a world effect)
 //   - The component body itself contains the ref write (not a nested function)
 //     so the ref binding is visible in the component's own mutation walker.
+// Note: the RHS is an inert literal so the fixture isolates the ref-cell-write
+// signal and won't interfere when raw-DOM detection is added in a later milestone.
 
 import React, { useRef } from "react";
 
 function UncontrolledCell() {
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<number | null>(null);
 
   // Direct ref write in the component body — the "hidden mutation differentiator".
   // This is unusual in real React but demonstrates the ref-cell-write detection.
-  inputRef.current = document.getElementById("cell") as HTMLInputElement;
+  inputRef.current = 42;
 
   return (
     <div>
