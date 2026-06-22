@@ -361,7 +361,12 @@ impl Visit for JsxReturnFinder {
                 self.found = true;
             }
         }
-        // do not recurse further; returns inside nested fns are stopped below.
+        // Do NOT call visit_children_with here. This prevents the visitor from
+        // descending into the return expression's sub-expressions — however, that
+        // is NOT what stops nested-function returns from being seen. Nested
+        // function and arrow scopes are intercepted BEFORE any `return` inside
+        // them is reached, by the empty `visit_arrow_expr` / `visit_function`
+        // overrides below that terminate descent at scope boundaries.
     }
     fn visit_arrow_expr(&mut self, _n: &swc_ecma_ast::ArrowExpr) {}
     fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
