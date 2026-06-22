@@ -253,6 +253,13 @@ fn prop_name(key: &PropName) -> String {
 /// `memo(x, () => …)` (comparison function as second arg) must NOT mis-bind.
 /// Nested wrappers (`memo(forwardRef(fn))`) are a documented Milestone-A miss —
 /// the outer name is not attributed to the doubly-wrapped inner function.
+///
+/// For the **member form** (`X.memo(…)` / `X.forwardRef(…)`), only the receiver
+/// `React` is recognized (i.e. `React.memo` / `React.forwardRef`). An arbitrary
+/// `foo.memo(…)` is NOT treated as a React wrapper — only the `React` namespace
+/// identifier is allowed as the object. The bare-ident form (`memo(…)` /
+/// `forwardRef(…)`) remains unrestricted, since imports can bring those names
+/// directly into scope.
 fn react_wrapped_inner(init: Option<&Expr>) -> bool {
     let Some(Expr::Call(call)) = init else {
         return false;
@@ -260,11 +267,21 @@ fn react_wrapped_inner(init: Option<&Expr>) -> bool {
     let callee_name = match &call.callee {
         swc_ecma_ast::Callee::Expr(e) => match e.as_ref() {
             Expr::Ident(i) => Some(i.sym.to_string()),
-            // React.memo / React.forwardRef
-            Expr::Member(m) => match &m.prop {
-                swc_ecma_ast::MemberProp::Ident(i) => Some(i.sym.to_string()),
-                _ => None,
-            },
+            // Only React.memo / React.forwardRef — not arbitrary X.memo.
+            Expr::Member(m) => {
+                let receiver_is_react = matches!(
+                    m.obj.as_ref(),
+                    Expr::Ident(obj) if obj.sym.as_ref() == "React"
+                );
+                if receiver_is_react {
+                    match &m.prop {
+                        swc_ecma_ast::MemberProp::Ident(i) => Some(i.sym.to_string()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
             _ => None,
         },
         _ => None,
@@ -563,5 +580,49 @@ mod tests {
         .collect();
         assert!(names.contains(&"C".to_string()), "got {names:?}");
         assert!(names.contains(&"D".to_string()), "got {names:?}");
+    }
+
+    /// `foo.memo(fn)` — arbitrary receiver, NOT `React` — must NOT hand the outer
+    /// binding name `C` to the inner function. The inner function falls back to its
+    /// positional `<fn@…>` symbol.
+    #[test]
+    fn non_react_member_memo_does_not_rename() {
+        let units = parse_and_collect(
+            "const C = foo.memo(function () { return <i/>; });",
+            "t.tsx",
+            Lang::Tsx,
+        )
+        .unwrap();
+        let names: Vec<_> = units.iter().map(|u| u.symbol.as_str()).collect();
+        // The inner function must NOT be named "C".
+        assert!(
+            !names.contains(&"C"),
+            "inner fn wrongly took outer binding name; got {names:?}"
+        );
+        // It should fall back to a positional symbol.
+        assert!(
+            names.iter().any(|s| s.starts_with("<fn@")),
+            "expected a positional <fn@…> symbol; got {names:?}"
+        );
+    }
+
+    /// `React.memo(fn)` — qualified React namespace — MUST hand the outer binding
+    /// name `C` to the inner function (confirms the member form still works for the
+    /// real React namespace).
+    #[test]
+    fn react_qualified_memo_takes_outer_name() {
+        let names: Vec<_> = parse_and_collect(
+            "const C = React.memo(function () { return <i/>; });",
+            "t.tsx",
+            Lang::Tsx,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|u| u.symbol)
+        .collect();
+        assert!(
+            names.contains(&"C".to_string()),
+            "React.memo inner fn should take outer name; got {names:?}"
+        );
     }
 }
