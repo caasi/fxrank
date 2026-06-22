@@ -141,7 +141,17 @@ impl<'a> MutationWalker<'a> {
         // write when the place targets `.current` (e.g. `r.current = 5`).
         // A bare reassignment of the binding itself (`r = makeRef()`) is NOT a
         // ref-cell write — it is a normal local mutation and must not be dropped.
-        let is_ref_cell = self.ref_bindings.contains(&base) && has_current_in_chain(place);
+        //
+        // Guard: if `base` is a *parameter of this function*, do NOT treat it as
+        // a ref-cell write even when the name matches a component's ref binding
+        // (inherited via `detect_with_refs` / `extra_refs`). A callback param that
+        // shadows a component's ref name is a normal param write — param shadow
+        // wins over inherited ref binding. A genuine useRef binding is always a
+        // `const/let r = useRef()` declarator (a local), never a param, so this
+        // guard does not affect the component's own-body path.
+        let is_ref_cell = self.ref_bindings.contains(&base)
+            && !self.params.contains(&base)
+            && has_current_in_chain(place);
         let c = if is_ref_cell {
             // Ref-cell write: hidden mutation class 3, not contained.
             Classification::new(
@@ -549,6 +559,59 @@ mod tests {
             .expect("React.useRef should still produce a ref-cell-write");
         assert_eq!(e.effective_class(), 3);
         assert_eq!(e.kind, EffectKind::HiddenMutation);
+    }
+
+    /// Helper: parse `src`, find the function unit whose symbol starts with
+    /// `sym_prefix`, and call `detect_with_refs` on it with `extra_refs`.
+    fn detect_with_refs_in_fn(
+        src: &str,
+        sym_prefix: &str,
+        extra_refs: HashSet<String>,
+    ) -> Vec<(Effect, bool)> {
+        let (module, cm) = functions::parse_module(src, "t.ts", Lang::Ts).expect("parse");
+        let lines = SpanLines::new(cm);
+        let imports = ImportTable::from_module(&module);
+        let units = functions::collect(&module, "t.ts", &lines);
+        let unit = units
+            .iter()
+            .find(|u| u.symbol.starts_with(sym_prefix))
+            .unwrap_or_else(|| panic!("no unit with symbol starting with {sym_prefix:?}"));
+        detect_with_refs(
+            &unit.body,
+            &unit.sig,
+            unit.is_constructor,
+            &lines,
+            &imports,
+            &extra_refs,
+        )
+    }
+
+    #[test]
+    fn callback_param_shadowing_component_ref_is_not_ref_cell_write() {
+        // Bug ⑥: a callback param `r` that shadows a component's useRef binding
+        // must NOT be treated as a ref-cell write. `detect_with_refs` is called
+        // with extra_refs = {"r"} (simulating the component's ref binding), but the
+        // callback itself declares `r` as a parameter — so `r.current = 1` inside
+        // the callback body is a param write (ParamMutation class 3), NOT a
+        // HiddenMutation ref-cell-write.
+        let src = "const cb = (r) => { r.current = 1; };";
+        let extra_refs: HashSet<String> = ["r".to_string()].into_iter().collect();
+        let effects = detect_with_refs_in_fn(src, "cb", extra_refs);
+        // Must NOT produce a ref-cell-write.
+        let ref_cell_writes: Vec<_> = effects
+            .iter()
+            .filter(|(e, _)| e.subreason.as_deref() == Some("ref-cell-write"))
+            .collect();
+        assert!(
+            ref_cell_writes.is_empty(),
+            "callback param `r` shadowing component ref wrongly classified as ref-cell-write: {ref_cell_writes:?}"
+        );
+        // Must produce a ParamMutation instead.
+        let param_mut = effects
+            .iter()
+            .find(|(e, _)| e.kind == EffectKind::ParamMutation)
+            .expect("expected ParamMutation for r.current = 1 where r is a param");
+        assert_eq!(param_mut.0.effective_class(), 3);
     }
 
     #[test]
