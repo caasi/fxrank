@@ -153,6 +153,7 @@ impl CallSink<'_> {
             hidden: false,
             evidence,
             discount: None,
+            subreason: None,
             confidence,
         });
     }

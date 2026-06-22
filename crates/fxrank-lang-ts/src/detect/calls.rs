@@ -120,6 +120,7 @@ impl CallWalker<'_> {
             hidden: false,
             evidence,
             discount: None,
+            subreason: None,
             confidence,
         });
     }

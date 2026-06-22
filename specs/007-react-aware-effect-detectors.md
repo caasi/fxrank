@@ -62,7 +62,8 @@ general call-graph propagation (`inherited_score` across named calls/files, #25-
 | `useContext(x)` read | contained shared read | reuse `AmbientRead`, **class 2** | flat — no "containment credit"; `contained = false`; `origin: unconfirmed` |
 | world effect **inherited** from a `useEffect`/`useLayoutEffect` callback | declared effect (effect-phase) | the effect's own class, **no risk** | honest baseline; *lifting* removes it |
 | `useRef().current` **write** (`= …`, `++`, `.current.x = …`) | **untraced** hidden state | reuse `HiddenMutation`, **class 3**, `subreason: ref-cell-write` | the differentiator; above the setter |
-| world effect in the component's **own render body**, or **inherited** from a render-phase hook (`useMemo`/`useCallback`/`useState` lazy init) | impure render | the effect's class **+ `EffectInRender` risk** (§6) | the render-path penalty |
+| world effect **inherited** from a `useCallback` callback | declared effect (event-phase) | the effect's own class, **no risk** | `useCallback` only memoizes the function ref; the body runs on invocation, not during render — same posture as `useEffect` |
+| world effect in the component's **own render body**, or **inherited** from a render-phase hook (`useMemo`/`useState` lazy init) | impure render | the effect's class **+ `EffectInRender` risk** (§6) | the render-path penalty |
 
 Risk channel (participates in `max_class`/`rank_key` — deliberately): existing `html.injection`;
 new **`EffectInRender`** (§6).
@@ -71,12 +72,15 @@ new **`EffectInRender`** (§6).
 
 A unit that **is a component** inherits the already-computed score (effects + risks) of each
 **inline arrow passed directly to a recognized built-in hook** — `useEffect`, `useLayoutEffect`,
-`useMemo`, `useCallback`, and the `useState`/`useReducer` lazy initializer — **tagged by the hook's
+`useCallback`, `useMemo`, and the `useState`/`useReducer` lazy initializer — **tagged by the hook's
 phase**:
 
-- **effect-phase** (`useEffect`, `useLayoutEffect`): inherited world effects keep their class at
-  **honest baseline** (no `EffectInRender`).
-- **render-phase** (`useMemo`, `useCallback`, `useState`/`useReducer` lazy initializer): these run
+- **effect-phase** (`useEffect`, `useLayoutEffect`, `useCallback`): inherited world effects keep
+  their class at **honest baseline** (no `EffectInRender`). Note: `useCallback` is effect-phase
+  because React only *memoizes* the function reference; the callback body executes when the handler
+  is *invoked* (on an event), never during render. Classifying it as render-phase produces a false
+  positive. Caught by dogfooding on real codebases (see §13).
+- **render-phase** (`useMemo`, `useState`/`useReducer` lazy initializer): these run
   *during render*, so inherited world effects get **`EffectInRender`** (render-time impurity).
 
 Properties, invariants, and bounds:
@@ -117,9 +121,13 @@ Properties, invariants, and bounds:
   hook (`useToggle()`) is not recognized — accepted miss.
 - **`useEffect`/`useLayoutEffect`** → effect-phase inheritance markers (§4); zero intrinsic cost. An
   effectless one is ignored (rendering-order smell = linter territory).
-- **`useMemo`/`useCallback`** → the hook **traces state dependencies** and, used well, *lowers*
-  reasoning effort — so it is **never scored as a cost**. Only an effectful misuse *inside* the
-  callback surfaces, as render-phase `EffectInRender` (§4).
+- **`useMemo`** → the hook runs its factory *during render* to produce the memoized value; an
+  effectful factory surfaces as render-phase `EffectInRender` (§4). The hook itself is never scored
+  as a cost.
+- **`useCallback`** → the hook only *memoizes* the function reference; its body executes on
+  invocation (event-time), **not** during render. It is effect-phase (§4): inherited world effects
+  keep their honest baseline class with no `EffectInRender`. The hook itself is never scored as a
+  cost.
 - **`useContext`** → `AmbientRead` (class 2), `subreason: useContext-read`, `contained = false`,
   `origin: unconfirmed`.
 
@@ -174,15 +182,22 @@ hooks as hooks; `.current` reads; `use(promise)`; `useSyncExternalStore`; `creat
 `React.useX` calls; custom-hook callback inheritance; base-TS raw-DOM world effects and the
 `hidden`→`global` refinement; cross-file confirmation (#25).
 
+**Known Limitation (Milestone-A, accepted):** a `useMemo(() => <jsx/>)` arrow that both returns JSX
+and is a hook callback is suppressed (the inherited-callback check precedes the component branch), so
+its **JSX-returning nature is never evaluated** — it does not receive *component-only* augmentation
+(`augment_component`'s own `StateTransition` / `useContext` signals for that arrow). Its world effects
+are still absorbed into the owning component and, being render-phase, still earn `EffectInRender` —
+only the arrow's own component-level signals are skipped. Deferred to Milestone-B.
+
 ## 10. Acceptance sketch (only in-scope demonstrables)
 
 - React files detected by `.tsx`/`.jsx` or JSX syntax; detectors in `fxrank-lang-ts`; no new crate.
 - A component's `useRef().current` **write** surfaces as `HiddenMutation` (class 3), ranking **above**
   a `useState` **setter** (`StateTransition`, class 1).
 - A `fetch` **directly in a component render body** carries `EffectInRender`; the **same `fetch`
-  inside a `useEffect` callback** is inherited at honest baseline (no risk); a `fetch` inside a
-  `useMemo` callback carries `EffectInRender`. (All demonstrable without DOM.) The inherited callback
-  arrow does **not** appear as a separate duplicate hotspot.
+  inside a `useEffect` or `useCallback` callback** is inherited at honest baseline (no risk); a
+  `fetch` inside a `useMemo` callback carries `EffectInRender`. (All demonstrable without DOM.) The
+  inherited callback arrow does **not** appear as a separate duplicate hotspot.
 - **Lifting:** a child taking `value`/`onChange` props scores ~0; the parent declaring `useState`
   absorbs the `StateTransition`.
 - A component wrapped in `memo`/`forwardRef` is reported under its outer binding name.
@@ -232,6 +247,16 @@ render-phase (`useMemo`/`useCallback`/lazy-init effects → `EffectInRender`); s
 `memo`/`forwardRef` with outer-name attribution; declared re-render/memoization performance
 explicitly out of scope; restricted `StateTransition` to literal `useState`/`useReducer` call sites;
 dropped the now-dead `import type` filter (detection no longer reads imports).
+
+**Note (post-Round 2 correction, caught by dogfooding):** Round 2 placed `useCallback` in the
+render-phase alongside `useMemo` — this was a false positive. The distinction is semantic:
+`useMemo(() => compute())` calls the factory during render to produce a value; `useCallback(() =>
+handler())` only *memoizes* the function reference, whose body executes on invocation (event-time),
+exactly like a plain `onClick` handler. Dogfooding on three real codebases surfaced
+`fetch`/`setState` calls inside `useCallback` bodies wrongly receiving `EffectInRender`. Fixed:
+`useCallback` moved to effect-phase (honest baseline, no `EffectInRender`). Only `useMemo` and lazy
+initializers remain render-phase. The spec has been corrected in §3 gradient table, §4 phase rules,
+§5 per-signal dispositions, and §10 acceptance sketch.
 
 **Round 3 (convergence)** moved `StateTransition` attribution to the literal `useState`/`useReducer`
 **declaration** (the ownership signal), so the ubiquitous `onChange={setValue}` case is captured

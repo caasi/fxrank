@@ -134,6 +134,7 @@ impl<'a> CallWalker<'a> {
             hidden: false,
             evidence,
             discount: None,
+            subreason: None,
             confidence,
         });
     }

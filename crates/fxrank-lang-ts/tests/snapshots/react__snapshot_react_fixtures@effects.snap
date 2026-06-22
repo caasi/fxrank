@@ -1,0 +1,40 @@
+---
+source: crates/fxrank-lang-ts/tests/react.rs
+assertion_line: 139
+expression: snapshot
+---
+[
+  {
+    "async_boundary": false,
+    "await_count": 0,
+    "confidence": 0.9,
+    "effects": [
+      {
+        "class": 7,
+        "discounted_to": null,
+        "hidden": false,
+        "kind": "net.fs.db",
+        "subreason": null,
+        "tier": "path"
+      },
+      {
+        "class": 7,
+        "discounted_to": null,
+        "hidden": false,
+        "kind": "net.fs.db",
+        "subreason": null,
+        "tier": "path"
+      }
+    ],
+    "max_class": 7,
+    "own_score": 31.5,
+    "risk_features": [
+      {
+        "class": 4,
+        "kind": "effect.in.render"
+      }
+    ],
+    "risk_weight": 5,
+    "symbol": "FetchData"
+  }
+]

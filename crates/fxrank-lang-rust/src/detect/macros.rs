@@ -83,6 +83,7 @@ impl MacroWalker {
             hidden: false,
             evidence,
             discount: None,
+            subreason: None,
             confidence,
         });
     }
