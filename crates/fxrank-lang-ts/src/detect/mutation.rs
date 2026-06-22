@@ -637,4 +637,20 @@ mod tests {
             "bare ref reassignment wrongly classified as ref-cell-write"
         );
     }
+
+    #[test]
+    fn non_current_member_write_on_ref_binding_is_not_ref_cell_write() {
+        // A write to a non-`.current` member of a ref binding (`r.foo = x`) must
+        // NOT produce a ref-cell-write. `has_current_in_chain` returns false for
+        // `r.foo`, so it falls through to normal local-mutation classification.
+        let effects = detect_in("function C(){ const r = useRef(0); r.foo = 1; return null; }");
+        let ref_cell_writes: Vec<_> = effects
+            .iter()
+            .filter(|(e, _)| e.subreason.as_deref() == Some("ref-cell-write"))
+            .collect();
+        assert!(
+            ref_cell_writes.is_empty(),
+            "non-.current member write on ref binding wrongly classified as ref-cell-write: {ref_cell_writes:?}"
+        );
+    }
 }
