@@ -184,8 +184,10 @@ hooks as hooks; `.current` reads; `use(promise)`; `useSyncExternalStore`; `creat
 
 **Known Limitation (Milestone-A, accepted):** a `useMemo(() => <jsx/>)` arrow that both returns JSX
 and is a hook callback is suppressed (the inherited-callback check precedes the component branch), so
-its own render signals are not augmented with `EffectInRender` — the arrow's JSX-returning nature is
-never evaluated once it is claimed by `useMemo`. Deferred to Milestone-B.
+its **JSX-returning nature is never evaluated** — it does not receive *component-only* augmentation
+(`augment_component`'s own `StateTransition` / `useContext` signals for that arrow). Its world effects
+are still absorbed into the owning component and, being render-phase, still earn `EffectInRender` —
+only the arrow's own component-level signals are skipped. Deferred to Milestone-B.
 
 ## 10. Acceptance sketch (only in-scope demonstrables)
 
