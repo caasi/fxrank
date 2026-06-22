@@ -402,8 +402,9 @@ fn is_mutating_method(name: &str) -> bool {
 /// Return `true` when `expr` is a direct `useRef(...)` call (or `React.useRef(...)`).
 ///
 /// Recognises both the bare form (`useRef(0)`) and the qualified form
-/// (`React.useRef(0)`). Does not require any imports — callee is matched
-/// syntactically.
+/// (`React.useRef(0)`). The member form is restricted to a receiver ident
+/// of exactly `React` — `foo.useRef(...)` does NOT qualify. Does not require
+/// any imports — callee is matched syntactically.
 pub(crate) fn is_use_ref_call(expr: &Expr) -> bool {
     let call = match expr {
         Expr::Call(c) => c,
@@ -413,9 +414,10 @@ pub(crate) fn is_use_ref_call(expr: &Expr) -> bool {
         Callee::Expr(callee_expr) => match callee_expr.as_ref() {
             // bare `useRef(...)`
             Expr::Ident(id) => id.sym.as_ref() == "useRef",
-            // qualified `React.useRef(...)`
-            Expr::Member(MemberExpr { prop, .. }) => {
+            // qualified `React.useRef(...)` — receiver MUST be the ident `React`
+            Expr::Member(MemberExpr { obj, prop, .. }) => {
                 matches!(prop, MemberProp::Ident(id) if id.sym.as_ref() == "useRef")
+                    && matches!(obj.as_ref(), Expr::Ident(id) if id.sym.as_ref() == "React")
             }
             _ => false,
         },
@@ -499,6 +501,54 @@ mod tests {
             .expect("local mutation");
         assert_eq!(e.effective_class(), 1);
         assert_eq!(e.subreason, None);
+    }
+
+    #[test]
+    fn non_react_member_useref_is_not_ref_binding() {
+        // Fix ②: `foo.useRef(0)` is NOT a React ref binding — only bare `useRef`
+        // or `React.useRef` count. A write to `r.current` after `foo.useRef` should
+        // classify as a normal local-ish write, NOT a ref-cell-write HiddenMutation.
+        let effects =
+            detect_in("function C(){ const r = foo.useRef(0); r.current = 1; return null; }");
+        // Must NOT produce a ref-cell-write.
+        let ref_cell_writes: Vec<_> = effects
+            .iter()
+            .filter(|(e, _)| e.subreason.as_deref() == Some("ref-cell-write"))
+            .collect();
+        assert!(
+            ref_cell_writes.is_empty(),
+            "foo.useRef wrongly recognised as a React ref binding, got {ref_cell_writes:?}"
+        );
+        // The `r.current = 1` write should still produce some mutation effect
+        // (local, since `r` is a `const`-declared local).
+        let has_mutation = effects.iter().any(|(e, _)| {
+            matches!(
+                e.kind,
+                EffectKind::LocalMutation
+                    | EffectKind::HiddenMutation
+                    | EffectKind::ParamMutation
+                    | EffectKind::GlobalMutation
+            )
+        });
+        assert!(
+            has_mutation,
+            "expected some mutation effect for r.current = 1"
+        );
+    }
+
+    #[test]
+    fn react_qualified_useref_still_works() {
+        // Fix ②: `React.useRef(0)` MUST still be recognised as a ref binding, and
+        // a subsequent `r.current = 1` MUST produce a ref-cell-write HiddenMutation.
+        let effects =
+            detect_in("function C(){ const r = React.useRef(0); r.current = 1; return null; }");
+        let e = effects
+            .iter()
+            .map(|(e, _)| e)
+            .find(|e| e.subreason.as_deref() == Some("ref-cell-write"))
+            .expect("React.useRef should still produce a ref-cell-write");
+        assert_eq!(e.effective_class(), 3);
+        assert_eq!(e.kind, EffectKind::HiddenMutation);
     }
 
     #[test]
