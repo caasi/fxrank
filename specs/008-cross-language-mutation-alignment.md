@@ -29,7 +29,13 @@ All three frontends already share one architecture — established by reading
   caveat — a write before its declarator misclassifies) while Python **pre-scans**
   `global`/`nonlocal`/local-assign into sets first.
 - No lexical scope stack, no hoisting/TDZ modeling, no shadowing resolution beyond cascade
-  priority; descent **stops at nested functions** (each is its own `FnUnit`).
+  priority. **TS and Python stop descent at nested functions** (each becomes its own `FnUnit`);
+  **Rust's mutation walker descends into closures and block-local `fn` items** (it overrides no
+  `visit_*` to stop, and `functions.rs` collects only top-level/module/impl/trait fns as units),
+  so their writes are attributed to the enclosing unit. This traversal divergence is
+  acknowledged, not aligned — it is outside the F1–F5 mutation-classification scope, and means
+  Rust's set of bases reaching the F1 fallback differs from TS/Python's (a closure-captured
+  enclosing `let mut` is in the parent's `let_mut`, so it stays `local.mutation`/1, not hidden).
 - The result is an `EffectKind` with `class`/`tier`; the project's effect/score vocabulary
   (`fxrank-core`) is already shared.
 
@@ -54,9 +60,13 @@ guideline — descriptive, the post-alignment target):
 | interior-mutability / ref-cell write | `hidden.mutation` | 3 | no | yes | Heuristic | Rust, TS (+ subreason **F3**) |
 | **captured-enclosing / unresolved base** | `hidden.mutation` | 3 | no | yes | Heuristic | all (**F1**) |
 
-¹ A **plain binding/rebind** (`x = …` to a bare local name) emits **nothing** in all three —
-only a *place* mutation (`x.f = …`, `x[i] = …`, `x += …`, `x.method()`) counts. This no-emit is
-itself shared behavior, not a divergence.
+¹ All three emit `local.mutation`/1 for a *place* mutation of a local (`x.f = …`, `x[i] = …`,
+`x += …`, `x.method()`). They **differ on a plain rebind** (`x = …` to a bare local name):
+**Python emits nothing** (assignment rebinds the name, not a mutation of prior state —
+`python/.../mutation.rs:379`), while **TS and Rust emit `local.mutation`/1** (reassigning a
+declared local / `let mut` is a variable mutation — `ts/.../mutation.rs:207-208`,
+`rust/.../mutation.rs:168-175`). Honest language difference (Python name-rebinding vs TS/Rust
+variable-slot mutation), KEEP — see §2.
 ² `contained` is **not** a serialized `Effect` field — Rust's `Effect` has no containment
 channel at all (`fxrank-core/src/effect.rs`). TS and Python carry it as a **per-frontend
 side-channel** (`detect` returns `(Effect, bool)` pairs) consumed by `apply_boundary_discount`
@@ -84,6 +94,10 @@ documents them as intentional:
   (`ts/.../mutation.rs:393-410`), Python `{append,extend,insert,remove,pop,clear,sort,reverse,update,add,discard,setdefault}`
   (`python/.../mutation.rs:505-521`). These are language-appropriate vocabularies and the
   *gate* on whether a method write is even seen — honest, KEEP (not aligned).
+- **Plain rebind of a local** (`x = …` to a bare local name) — **Python no-emits** (rebinding
+  ≠ mutation; `python/.../mutation.rs:379`); **TS and Rust emit `local.mutation`/1**
+  (reassigning a declared local / `let mut` is a variable mutation). Honest semantic difference
+  (name-rebinding vs variable-slot mutation), KEEP.
 - **Destructuring-target writes are dropped in all three** (TS `assign_target_base`→`None`
   `ts/.../mutation.rs:336`; Python skips Tuple/List/Starred `python/.../mutation.rs:388-389`;
   Rust `base_ident` has no tuple/struct-target support `rust/.../mutation.rs:345`). A shared
