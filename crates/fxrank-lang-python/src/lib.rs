@@ -47,6 +47,7 @@ impl Frontend for PythonFrontend {
                     // Single borrowed pass: collect + analyze while `module`/`src`
                     // are both alive. `analyze_unit` emits owned `Hotspot`s.
                     let imports = imports::Imports::build(&module);
+                    let module_bindings = crate::imports::module_bindings(&module);
                     // Build SpanIndex once per file; pass it into both `collect`
                     // (for lambda-anchor line/col) and `analyze_unit` (for effect
                     // line resolution) — no duplicate O(n) line-start indexing.
@@ -118,9 +119,13 @@ impl Frontend for PythonFrontend {
                                 // non-test-named file.
                                 output.skipped_tests += 1;
                             } else {
-                                output
-                                    .functions
-                                    .push(detect::analyze_unit(unit, &file.path, &imports, &span));
+                                output.functions.push(detect::analyze_unit(
+                                    unit,
+                                    &file.path,
+                                    &imports,
+                                    &module_bindings,
+                                    &span,
+                                ));
                             }
                         }
                     }

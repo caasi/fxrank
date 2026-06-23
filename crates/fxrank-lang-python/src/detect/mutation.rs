@@ -17,6 +17,7 @@
 //! | `self.x.append(…)` / `self[i] = …` (any method, incl. `__init__`) | `this.mutation` | 3 | false |
 //! | write where root is a **param name**        | `param.mutation` | 3     | false     |
 //! | write where root is a **local binding**     | `local.mutation` | 1     | **true**  |
+//! | module top-level binding, content-mutated (no `global`) | `global.mutation` | 6 | false |
 //!
 //! ## Strategy
 //!
@@ -54,7 +55,12 @@ use crate::source::{SpanIndex, anchor_of_subslice};
 /// constructor init); `false` means it escapes.
 ///
 /// Task 9 consumes the `contained` flags to apply boundary-containment discounts.
-pub fn detect(unit: &FnUnit, imports: &Imports, span: &SpanIndex) -> Vec<(Effect, bool)> {
+pub fn detect(
+    unit: &FnUnit,
+    imports: &Imports,
+    module_bindings: &HashSet<String>,
+    span: &SpanIndex,
+) -> Vec<(Effect, bool)> {
     // ── Step 1: collect param names from the unit's signature ────────────────
     let params = collect_param_names(unit.params);
 
@@ -72,6 +78,7 @@ pub fn detect(unit: &FnUnit, imports: &Imports, span: &SpanIndex) -> Vec<(Effect
         nonlocals: &nonlocals,
         locals: &locals,
         imports,
+        module_bindings,
         is_init,
         span,
         effects: Vec::new(),
@@ -294,6 +301,10 @@ struct MutSink<'a> {
     /// File-wide import table — lets the cascade resolve an import-rooted write (F5)
     /// and distinguish a captured opaque binding (F1) from a known module.
     imports: &'a Imports,
+    /// Module top-level binding names (assign targets + def/class). A write whose
+    /// root is one of these — and is not a local/param/global-decl/import — is
+    /// module-shared state, escalated to `global.mutation` (the #29 analog).
+    module_bindings: &'a HashSet<String>,
     /// True when analyzing `__init__` (so `self.attr = …` is local init).
     is_init: bool,
     span: &'a SpanIndex<'a>,
@@ -474,10 +485,27 @@ impl MutSink<'_> {
             return;
         }
 
-        // F1: the root resolves to NONE of self/global/nonlocal/param/local/import —
-        // a captured outer binding (a closed-over variable, or a module-level name
-        // not declared `global`). The write escapes through an opaque channel we
-        // cannot bound syntactically → hidden.mutation (class 3, hidden:true,
+        // F2 analog (Python #29): root is a MODULE top-level binding (a
+        // module-level name / def / class) whose contents are mutated
+        // (subscript/attr/method) — module-shared state used for cross-function /
+        // cross-module communication → global.mutation (class 6, Heuristic). A
+        // bare rebind without `global` is a LOCAL (Python semantics) and already
+        // won above; an explicit `global x` rebind already hit the globals arm.
+        // So this catches exactly the content-mutation-of-module-container case.
+        if self.module_bindings.contains(&root) {
+            self.push(
+                EffectKind::GlobalMutation,
+                Tier::Heuristic,
+                line,
+                format!("{evidence} (module-level `{root}`)"),
+                false,
+            );
+            return;
+        }
+
+        // F1: the root resolves to NONE of self/global/nonlocal/param/local/import/
+        // module-binding — a captured outer (enclosing-function) binding we cannot
+        // bound syntactically → hidden.mutation (class 3, hidden:true,
         // contained:false), subreason "captured-binding". Mirrors the TS `captured`
         // hidden case (Milestone A left it un-emitted).
         self.push_hidden(line, evidence, "captured-binding");
@@ -605,12 +633,13 @@ mod tests {
         let src = std::fs::read_to_string(format!("tests/fixtures/{name}.py")).unwrap();
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let mut out: HashMap<String, Vec<(EffectKind, bool)>> = HashMap::new();
         for unit in &units {
-            let pairs = detect(unit, &imports, &span);
+            let pairs = detect(unit, &imports, &module_bindings, &span);
             out.insert(
                 unit.symbol.clone(),
                 pairs.iter().map(|(e, c)| (e.kind, *c)).collect(),
@@ -624,12 +653,13 @@ mod tests {
         let src = std::fs::read_to_string(format!("tests/fixtures/{name}.py")).unwrap();
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let mut out: HashMap<String, Vec<(EffectKind, bool, String)>> = HashMap::new();
         for unit in &units {
-            let pairs = detect(unit, &imports, &span);
+            let pairs = detect(unit, &imports, &module_bindings, &span);
             out.insert(
                 unit.symbol.clone(),
                 pairs
@@ -761,6 +791,7 @@ mod tests {
             nonlocals: &nonlocals,
             locals: &locals,
             imports: &imports,
+            module_bindings: &HashSet::new(),
             is_init: false,
             span: &span,
             effects: Vec::new(),
@@ -782,11 +813,12 @@ mod tests {
         let src = "def f(lst):\n    lst.append(1)\n";
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
         let span = crate::source::SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, src, &span, &anchors);
         let f = units.iter().find(|u| u.symbol == "f").unwrap();
-        let pairs = detect(f, &imports, &span);
+        let pairs = detect(f, &imports, &module_bindings, &span);
         assert!(
             pairs.iter().any(|(e, _)| e.kind == ParamMutation),
             "lst.append where lst is a param → ParamMutation, got: {:?}",
@@ -816,11 +848,12 @@ mod tests {
         let src = std::fs::read_to_string("tests/fixtures/mutation.py").unwrap();
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let inner = units.iter().find(|u| u.symbol == "inner").unwrap();
-        let pairs = detect(inner, &imports, &span);
+        let pairs = detect(inner, &imports, &module_bindings, &span);
         let hidden = pairs
             .iter()
             .find(|(e, _)| e.kind == HiddenMutation)
@@ -853,6 +886,55 @@ mod tests {
             append.2.contains("self.items"),
             "evidence must name the full receiver `self.items`, got: {:?}",
             append.2
+        );
+    }
+
+    fn detect_src(src: &str, fn_name: &str) -> Vec<(Effect, bool)> {
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
+        let span = crate::source::SpanIndex::new(src);
+        let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
+        let (units, _) = functions::collect(&module, src, &span, &anchors);
+        let unit = units
+            .iter()
+            .find(|u| u.symbol == fn_name)
+            .expect("unit not found");
+        detect(unit, &imports, &module_bindings, &span)
+    }
+
+    #[test]
+    fn module_level_content_mutation_is_global() {
+        // A module-level dict mutated by content (no `global` decl) is module-shared
+        // state -> global.mutation (class 6), not the hidden captured-binding fallback.
+        let src = "_cache = {}\ndef f():\n    _cache['k'] = 1\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            pairs.iter().any(|(e, c)| e.kind == GlobalMutation && !*c),
+            "module-level `_cache['k']=1` (no `global`) must be GlobalMutation(false), got: {:?}",
+            pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !pairs.iter().any(|(e, _)| e.kind == HiddenMutation),
+            "module-level content mutation must not be hidden.mutation"
+        );
+    }
+
+    #[test]
+    fn local_shadowing_module_binding_is_local() {
+        // A bare local rebind shadows the module name (Python creates a local) ->
+        // local.mutation; the shadow wins because locals are checked before the
+        // module-binding arm.
+        let src = "_cache = {}\ndef f():\n    _cache = {}\n    _cache['k'] = 1\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            pairs.iter().any(|(e, c)| e.kind == LocalMutation && *c),
+            "shadowing local `_cache` must be LocalMutation(true), got: {:?}",
+            pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !pairs.iter().any(|(e, _)| e.kind == GlobalMutation),
+            "shadowing local must not escalate to GlobalMutation"
         );
     }
 }
