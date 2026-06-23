@@ -112,7 +112,9 @@ fn store_atomic_static() {
 
 // R2 (F2): an UPPERCASE base bound NOWHERE and NOT a file-level static — the real
 // proxy-retirement discriminator. Pre-fix `is_screaming_snake("UNBOUND_THING")` is
-// true → wrongly emits global.mutation. Post-fix it is not in `statics` → dropped.
+// true → wrongly emits global.mutation. Post-fix it is not in `statics`, so it falls
+// to the F1 tail → `hidden.mutation` (subreason `captured-binding`), never global.
+// The test asserts only the *not-global* part (the proxy-retirement check).
 fn write_unbound_upper() {
     UNBOUND_THING.field = 1;
 }
