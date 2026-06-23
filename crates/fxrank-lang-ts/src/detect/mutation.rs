@@ -164,8 +164,12 @@ impl<'a> MutationWalker<'a> {
             )
             .with_subreason("ref-cell-write")
         } else {
-            // Normal classification by escape analysis (locals/params/global/captured).
-            self.classify(&base)
+            // A mutating-method receiver (verb begins with '.') is never a direct
+            // field-init even when its place is `this.<ident>` — pushing onto
+            // `this.items` mutates field contents, so it escapes. Only a true
+            // assignment target can be a contained ctor field-init.
+            let assign_like = !verb.starts_with('.');
+            self.classify(&base, place, assign_like)
         };
         let effect = Effect {
             kind: c.kind,
@@ -195,13 +199,16 @@ impl<'a> MutationWalker<'a> {
     /// bare reassignment of the binding itself (e.g. `r = makeRef()`) and should
     /// fall through to normal classification here — `r` is in `locals`, so it
     /// becomes `local.mutation` class 1.
-    fn classify(&self, base: &str) -> Classification {
+    fn classify(&self, base: &str, place: &Expr, assign_like: bool) -> Classification {
         use EffectKind::*;
         if base == "this" {
-            if self.is_constructor {
-                // Constructor initialising its own `this` — local init, contained.
+            if self.is_constructor && assign_like && direct_this_field(place) {
+                // A DIRECT field-init `this.<ident> = …` — honest, bounded local init.
                 Classification::new(LocalMutation, 1, true, false, Tier::Heuristic, "ctor this")
             } else {
+                // Normal method, OR a constructor write that is NOT a direct field-init
+                // (method receiver `this.xs.push`, subscript `this[i]`, deeper chain
+                // `this.a.b`) — escapes, not contained.
                 Classification::new(ThisMutation, 3, false, false, Tier::Heuristic, "this field")
             }
         } else if self.locals.contains(base) {
@@ -353,6 +360,44 @@ fn base_ident(expr: &Expr) -> Option<String> {
         Expr::TsTypeAssertion(e) => base_ident(&e.expr),
         Expr::TsSatisfies(e) => base_ident(&e.expr),
         _ => None,
+    }
+}
+
+/// `true` iff `place` is a DIRECT named-field place off bare `this` — `this.x`
+/// or `this.#x` (a private field init is still a direct field init). The only
+/// constructor write shape that stays a contained `local.mutation` (F4). A
+/// computed `this[i]`, a method-call receiver (`this.xs.push`), or a deeper
+/// chain (`this.a.b`) all return `false` and escape to `this.mutation`.
+fn direct_this_field(place: &Expr) -> bool {
+    match place {
+        Expr::Member(m) => {
+            // A *named* field place — `this.x` (Ident) or `this.#x` (PrivateName) —
+            // is a direct field-init. A computed `this[i]` (Computed) is a member-chain
+            // write, not a field-init, and escapes. (Match `&m.prop` by reference.)
+            if !matches!(&m.prop, MemberProp::Ident(_) | MemberProp::PrivateName(_)) {
+                return false;
+            }
+            matches!(strip_place_wrappers(&m.obj), Expr::This(_))
+        }
+        Expr::Paren(p) => direct_this_field(&p.expr),
+        Expr::TsAs(e) => direct_this_field(&e.expr),
+        Expr::TsNonNull(e) => direct_this_field(&e.expr),
+        Expr::TsTypeAssertion(e) => direct_this_field(&e.expr),
+        Expr::TsSatisfies(e) => direct_this_field(&e.expr),
+        _ => false,
+    }
+}
+
+/// Strip `Paren` / TS-only wrappers to reach the underlying receiver, mirroring
+/// what `base_ident` sees through.
+fn strip_place_wrappers(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(p) => strip_place_wrappers(&p.expr),
+        Expr::TsAs(e) => strip_place_wrappers(&e.expr),
+        Expr::TsNonNull(e) => strip_place_wrappers(&e.expr),
+        Expr::TsTypeAssertion(e) => strip_place_wrappers(&e.expr),
+        Expr::TsSatisfies(e) => strip_place_wrappers(&e.expr),
+        other => other,
     }
 }
 
@@ -652,5 +697,68 @@ mod tests {
             ref_cell_writes.is_empty(),
             "non-.current member write on ref binding wrongly classified as ref-cell-write: {ref_cell_writes:?}"
         );
+    }
+
+    #[test]
+    fn ctor_direct_field_init_stays_local_mutation() {
+        // F4: a DIRECT field-init `this.x = 1` in a constructor stays
+        // local.mutation/1/contained (MUST NOT regress).
+        let effects = detect_in_fn(
+            "class C { x = 0; constructor(){ this.x = 1; } }",
+            "C.constructor",
+        );
+        let e = effects
+            .iter()
+            .find(|(e, _)| e.kind == EffectKind::LocalMutation)
+            .expect("direct this.x = 1 must be local.mutation");
+        assert_eq!(e.0.effective_class(), 1);
+        assert!(e.1, "direct field-init must be contained == true");
+        assert!(
+            !effects
+                .iter()
+                .any(|(e, _)| e.kind == EffectKind::ThisMutation),
+            "direct field-init must not escape to this.mutation"
+        );
+    }
+
+    #[test]
+    fn ctor_method_call_on_this_escapes_to_this_mutation() {
+        // F4: a mutating-method receiver on `this` (`this.items.push(1)`) is NOT a
+        // direct field-init — escapes to this.mutation/3/not-contained.
+        let effects = detect_in_fn(
+            "class C { items = []; constructor(){ this.items.push(1); } }",
+            "C.constructor",
+        );
+        let e = effects
+            .iter()
+            .find(|(e, _)| e.kind == EffectKind::ThisMutation)
+            .expect("this.items.push(1) must escape to this.mutation");
+        assert_eq!(e.0.effective_class(), 3);
+        assert!(
+            !e.1,
+            "method-call receiver on this must be contained == false"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|(e, c)| *c && e.kind == EffectKind::LocalMutation),
+            "method-call receiver on this must not collapse to contained local.mutation"
+        );
+    }
+
+    #[test]
+    fn ctor_subscript_write_on_this_escapes_to_this_mutation() {
+        // F4: a subscript write on `this` (`this[i] = 1`) is a member-chain write,
+        // not a direct `this.<ident>` field-init — escapes to this.mutation/3.
+        let effects = detect_in_fn(
+            "class C { constructor(i: number){ this[i] = 1; } }",
+            "C.constructor",
+        );
+        let e = effects
+            .iter()
+            .find(|(e, _)| e.kind == EffectKind::ThisMutation)
+            .expect("this[i] = 1 must escape to this.mutation");
+        assert_eq!(e.0.effective_class(), 3);
+        assert!(!e.1, "subscript write on this must be contained == false");
     }
 }
