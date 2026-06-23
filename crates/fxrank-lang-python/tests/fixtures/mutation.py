@@ -41,3 +41,8 @@ class Bag:
 
     def store(self, i, v):
         self[i] = v            # ThisMutation, contained=false (subscript on self)
+
+import config  # module-level import — `config` resolves through the ImportTable
+
+def mutates_imported_module():
+    config.settings.append(1)  # F5: root `config` → import → global.mutation/6, contained=false

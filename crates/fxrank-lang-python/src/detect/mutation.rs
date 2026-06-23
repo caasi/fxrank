@@ -293,7 +293,6 @@ struct MutSink<'a> {
     locals: &'a HashSet<String>,
     /// File-wide import table — lets the cascade resolve an import-rooted write (F5)
     /// and distinguish a captured opaque binding (F1) from a known module.
-    #[allow(dead_code)]
     imports: &'a Imports,
     /// True when analyzing `__init__` (so `self.attr = …` is local init).
     is_init: bool,
@@ -458,6 +457,20 @@ impl MutSink<'_> {
         // Local binding mutation: root is locally assigned (and not global/nonlocal).
         if self.locals.contains(&root) {
             self.push(EffectKind::LocalMutation, Tier::Exact, line, evidence, true);
+            return;
+        }
+
+        // F5: root resolves through the ImportTable → module-level state (the imported
+        // module/name) escaping the function. global.mutation (class 6, Heuristic),
+        // contained=false. A same-named LOCAL already won above.
+        if self.imports.resolve(&root).is_some() {
+            self.push(
+                EffectKind::GlobalMutation,
+                Tier::Heuristic,
+                line,
+                format!("{evidence} (imported `{root}`)"),
+                false,
+            );
         }
 
         // Otherwise (captured outer / module-level binding not declared with `global`) —
@@ -774,6 +787,19 @@ mod tests {
             pairs.iter().any(|(e, _)| e.kind == ParamMutation),
             "lst.append where lst is a param → ParamMutation, got: {:?}",
             pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// F5: a write whose root resolves through the ImportTable is module-level state
+    /// escaping the function → global.mutation/6, contained=false. Inserted AFTER the
+    /// `locals` arm (a same-named local shadows the import) and BEFORE the F1 fallback.
+    #[test]
+    fn import_rooted_write_is_global_mutation() {
+        let m = mutation_effects("mutation");
+        assert!(
+            m["mutates_imported_module"].contains(&(GlobalMutation, false)),
+            "config.settings.append(…) where `config` is imported must be GlobalMutation(false), got: {:?}",
+            m["mutates_imported_module"]
         );
     }
 
