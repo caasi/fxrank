@@ -6,6 +6,45 @@ All notable changes to FxRank are documented here. The format follows
 schema may still change between releases, including patch releases — as the `id` format
 did in 0.1.1).
 
+## [0.3.0] - 2026-06-23
+
+This release aligns mutation classification across all three frontends and adds a
+cross-language rule for module-shared state. **Pre-1.0 output change:** writes that were
+previously silent or `hidden.mutation` now surface as `global.mutation`, so scores and
+rankings shift for affected code.
+
+### Changed
+
+- **Cross-language mutation-classification alignment** (spec 008, [#32]). Rust (`syn`),
+  TS/JS (`swc`), and Python (`libcst`) now classify a write against **one canonical model** —
+  the same `EffectKind`/class/`contained`/`hidden` and a shared `hidden.mutation` subreason
+  vocabulary (`interior-mut` / `ref-cell-write` / `captured-binding`) — keeping each language's
+  intentional differences, documented in
+  [`docs/mutation-classification-guideline.md`](docs/mutation-classification-guideline.md):
+  - A captured/unresolved base → `hidden.mutation`/3/`captured-binding` in all three
+    (**Python's first `HiddenMutation`** — previously a false purity).
+  - Rust scores a write to a **real `static`** (incl. `static mut` and interior-mut atomics via
+    `.store()`) as `global.mutation`/6 by the actual static-name set; the old
+    `SCREAMING_SNAKE_CASE` proxy is retired (no more uppercase-local false positives).
+  - A write whose base resolves through the import table → `global.mutation`/6 (Python/Rust).
+  - Constructor breadth (TS aligned to Python): only a **direct** field-init
+    (`this.x =` / `self.attr =`) stays contained `local.mutation`/1; method/subscript/compound/
+    update writes on the receiver escape to `this.mutation`/3.
+
+- **Module top-level binding writes → `global.mutation` (class 6), cross-language** ([#29]).
+  A write to a module top-level binding now classifies as `global.mutation`/6 in every frontend —
+  the "module var used for cross-component communication" anti-pattern — while a genuinely
+  captured *enclosing-function* local stays `hidden.mutation`/3. Realizations: Rust via the real
+  `static` set (the spec-008 F2, generalized); TS via a `const`/`let`/`var`/`function`/`class`
+  module-binding set (incl. `export` + named default, and destructuring); Python via the
+  module-level assign-target + `def`/`class` name set, covering the **content-mutation without
+  `global`** case (`_cache["k"]=1`, `shared.append(1)`) — the explicit `global x` rebind already
+  escalated. Heuristic limit (shared): a function-scoped binding shadowing a module name resolves
+  to local (flat-scope, best-effort). The Python local pre-scan recognizes all function-local
+  binding forms — assignment (incl. destructuring), augmented assign, and `for` / `with … as` /
+  `except … as` targets — while `match` patterns, comprehension scopes, and walrus (`:=`) remain
+  documented accepted misses.
+
 ## [0.2.0] - 2026-06-22
 
 ### Added
@@ -74,8 +113,11 @@ did in 0.1.1).
   skipped by default (`--include-tests` to score it).
 - Slim, feature-gated builds (`--features rust`, `--features ts`).
 
+[0.3.0]: https://github.com/caasi/fxrank/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/caasi/fxrank/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/caasi/fxrank/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/caasi/fxrank/releases/tag/v0.1.0
 [#9]: https://github.com/caasi/fxrank/issues/9
 [#14]: https://github.com/caasi/fxrank/issues/14
+[#29]: https://github.com/caasi/fxrank/issues/29
+[#32]: https://github.com/caasi/fxrank/pull/32

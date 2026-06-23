@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-fxrank-core = { path = "../fxrank-core", version = "0.2.0" }
+fxrank-core = { path = "../fxrank-core", version = "0.3.0" }
 swc_common = "23.0.2"
 swc_ecma_ast = "25.0.0"
 swc_ecma_parser = "41.1.1"
