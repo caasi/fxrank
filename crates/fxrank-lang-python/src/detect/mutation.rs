@@ -485,7 +485,7 @@ impl MutSink<'_> {
 
     /// Push a `HiddenMutation` (`hidden:true` + a `subreason`), always escaping
     /// (`contained:false`). Used for writes whose root is an opaque captured /
-    /// imported binding — the analog of the TS frontend's `captured` hidden case.
+    /// unresolved binding — the fallback after all named-binding cases are handled.
     fn push_hidden(&mut self, line: usize, evidence: String, subreason: &str) {
         let kind = EffectKind::HiddenMutation;
         let tier = Tier::Heuristic;
