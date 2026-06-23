@@ -24,6 +24,7 @@
 //! an `unsafe fn`): an `&mut` reborrow under `unsafe` may alias, so the channel
 //! is no longer trustworthy.
 
+use crate::imports::ImportTable;
 use fxrank_core::confidence::detection_confidence;
 use fxrank_core::effect::{Effect, EffectKind, Tier};
 use fxrank_core::score::{Discount, apply_discount, weight_for_class};
@@ -32,13 +33,21 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 
 /// Detect mutation effects in `block`, seeding binding sets from `sig`.
-pub fn detect(block: &syn::Block, sig: &syn::Signature) -> Vec<Effect> {
-    let mut walker = MutationWalker::seed(sig);
+///
+/// `statics` is the file-level set of real `static` item names; `imports` is the
+/// `use`-table. Both feed `record_write`'s base-resolution cascade.
+pub fn detect<'a>(
+    block: &syn::Block,
+    sig: &syn::Signature,
+    statics: &'a HashSet<String>,
+    imports: &'a ImportTable,
+) -> Vec<Effect> {
+    let mut walker = MutationWalker::seed(sig, statics, imports);
     walker.visit_block(block);
     walker.effects
 }
 
-struct MutationWalker {
+struct MutationWalker<'a> {
     /// Idents of `&mut T` typed params.
     mut_params: HashSet<String>,
     /// True when the receiver is `&mut self`.
@@ -53,11 +62,23 @@ struct MutationWalker {
     unsafe_depth: usize,
     /// True for the whole body when the fn itself is `unsafe`.
     unsafe_fn: bool,
+    /// File-level real `static` item names (`static`/`static mut`/atomics/…).
+    /// Stored for R2–R5; not yet consumed in R1.
+    #[allow(dead_code)]
+    statics: &'a HashSet<String>,
+    /// The `use`-table, for resolving a write base through an import.
+    /// Stored for R2–R5; not yet consumed in R1.
+    #[allow(dead_code)]
+    imports: &'a ImportTable,
     effects: Vec<Effect>,
 }
 
-impl MutationWalker {
-    fn seed(sig: &syn::Signature) -> Self {
+impl<'a> MutationWalker<'a> {
+    fn seed(
+        sig: &syn::Signature,
+        statics: &'a HashSet<String>,
+        imports: &'a ImportTable,
+    ) -> Self {
         let mut w = MutationWalker {
             mut_params: HashSet::new(),
             mut_self: false,
@@ -66,6 +87,8 @@ impl MutationWalker {
             locals: HashSet::new(),
             unsafe_depth: 0,
             unsafe_fn: sig.unsafety.is_some(),
+            statics,
+            imports,
             effects: Vec::new(),
         };
         for input in &sig.inputs {
@@ -251,7 +274,7 @@ fn is_mutating_method(name: &str) -> bool {
     )
 }
 
-impl<'ast> Visit<'ast> for MutationWalker {
+impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
     fn visit_local(&mut self, node: &'ast syn::Local) {
         // Track all bindings introduced by the pattern, including destructuring.
         let mut bindings = Vec::new();

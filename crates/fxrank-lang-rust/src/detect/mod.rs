@@ -90,6 +90,6 @@ fn gather(unit: &FnUnit, imports: &ImportTable, statics: &HashSet<String>) -> Ve
     let mut effects = Vec::new();
     effects.extend(calls::detect(&unit.block, imports, &unit.path, statics));
     effects.extend(macros::detect(&unit.block));
-    effects.extend(mutation::detect(&unit.block, &unit.sig));
+    effects.extend(mutation::detect(&unit.block, &unit.sig, statics, imports));
     effects
 }

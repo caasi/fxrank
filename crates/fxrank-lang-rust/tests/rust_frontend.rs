@@ -1185,3 +1185,30 @@ fn cfg_test_module_risks_skipped_by_default() {
     }]);
     assert_eq!(inc.module_risks.len(), 3); // ImplDrop + UnsafeImpl + ExternBlock
 }
+
+// ── Spec 008 R1: detect signature carries statics + imports ──────────────────
+#[test]
+fn mutation_detect_accepts_statics_and_imports() {
+    use fxrank_lang_rust::detect::mutation;
+    use fxrank_lang_rust::imports::ImportTable;
+    use std::collections::HashSet;
+
+    let file = syn::parse_file("static FOO: u32 = 0; fn f() { let mut x = 0; x = 1; }").unwrap();
+    let imports = ImportTable::from_file(&file);
+    let statics: HashSet<String> = ["FOO".to_string()].into_iter().collect();
+
+    let item_fn = file
+        .items
+        .iter()
+        .find_map(|it| match it {
+            syn::Item::Fn(f) if f.sig.ident == "f" => Some(f),
+            _ => None,
+        })
+        .expect("fn f");
+
+    let effects = mutation::detect(&item_fn.block, &item_fn.sig, &statics, &imports);
+    assert!(
+        effects.iter().any(|e| e.kind.wire() == "local.mutation"),
+        "local write still detected after signature change"
+    );
+}
