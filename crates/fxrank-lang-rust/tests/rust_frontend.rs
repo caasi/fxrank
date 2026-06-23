@@ -385,6 +385,11 @@ fn self_interior_mutation_is_hidden_mutation_no_discount() {
     assert_eq!(e.discounted_to, None, "hidden mutation is never discounted");
     assert!(e.hidden, "interior mutation through &self is hidden");
     assert_eq!(e.tier, Tier::Heuristic);
+    assert_eq!(
+        e.subreason.as_deref(),
+        Some("interior-mut"),
+        "interior-mutability hidden write carries subreason interior-mut"
+    );
 }
 
 #[test]
@@ -438,17 +443,67 @@ fn let_mut_writes_are_two_local_mutations_class_1_exact() {
 
 // ── Task 13d: global.mutation detection (class 6) ───────────────────────────
 
+// ── Task R2 (F2): real-static write → global.mutation (class 6) ───────────────
+/// A *lowercase* `static mut` written by direct assignment is global.mutation/6
+/// (casing-independent; the old proxy rejected the lowercase base).
 #[test]
-fn screaming_snake_write_is_global_mutation_class_6() {
+fn lowercase_static_mut_assign_is_global_mutation_class_6() {
     let out = analyze_fixture("mutation.rs");
-    let effects = effects_of(&out, "inc");
+    let effects = effects_of(&out, "write_lower_static_mut");
     let e = one_kind(&effects, "global.mutation");
     assert_eq!(
         e.class, 6,
         "global.mutation is class 6 (no class-4 downgrade)"
     );
-    assert_eq!(e.tier, Tier::Heuristic, "UPPERCASE proxy is heuristic");
+    assert_eq!(e.tier, Tier::Heuristic, "static write-through is heuristic");
+    assert_eq!(e.discounted_to, None, "global.mutation is never discounted");
+    assert!(!e.hidden, "a global static write is not hidden");
+}
+
+/// An interior-mutable plain `static` written via `.store()` is global.mutation/6
+/// (the interior-mutator emission site: a static base, not a shared_refs member).
+#[test]
+fn atomic_static_store_is_global_mutation_class_6() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "store_atomic_static");
+    let e = one_kind(&effects, "global.mutation");
+    assert_eq!(e.class, 6);
+    assert_eq!(e.tier, Tier::Heuristic);
     assert_eq!(e.discounted_to, None);
+    assert!(
+        effects.iter().all(|e| e.kind.wire() != "hidden.mutation"),
+        "atomic static .store() is global, not hidden"
+    );
+}
+
+/// An UPPERCASE ident bound nowhere and NOT a static must NOT be global.mutation
+/// (the proxy-retirement discriminator: the old casing heuristic flagged it).
+#[test]
+fn unbound_uppercase_non_static_is_not_global_mutation() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "write_unbound_upper");
+    assert!(
+        effects.iter().all(|e| e.kind.wire() != "global.mutation"),
+        "an UPPERCASE non-static base must not be global.mutation, got: {:?}",
+        effects.iter().map(|e| e.kind.wire()).collect::<Vec<_>>()
+    );
+}
+
+/// Regression (anti-Goodhart): a `&self` interior mutation stays hidden.mutation,
+/// NOT global.mutation, after the static rewiring (`self` is in shared_refs,
+/// checked first). Uses the existing interior-mut fixture/symbol.
+#[test]
+fn self_interior_mutation_stays_hidden_not_global() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "User::set");
+    assert!(
+        effects.iter().any(|e| e.kind.wire() == "hidden.mutation"),
+        "User::set must still emit hidden.mutation"
+    );
+    assert!(
+        effects.iter().all(|e| e.kind.wire() != "global.mutation"),
+        "User::set must NOT emit global.mutation (shared_refs checked before statics)"
+    );
 }
 
 // ── Task 13e: lexical unsafe-cancel ─────────────────────────────────────────
@@ -1184,4 +1239,92 @@ fn cfg_test_module_risks_skipped_by_default() {
         text: src.into(),
     }]);
     assert_eq!(inc.module_risks.len(), 3); // ImplDrop + UnsafeImpl + ExternBlock
+}
+
+// ── Spec 008 R1: detect signature carries statics + imports ──────────────────
+#[test]
+fn mutation_detect_accepts_statics_and_imports() {
+    use fxrank_lang_rust::detect::mutation;
+    use fxrank_lang_rust::imports::ImportTable;
+    use std::collections::HashSet;
+
+    let file = syn::parse_file("static FOO: u32 = 0; fn f() { let mut x = 0; x = 1; }").unwrap();
+    let imports = ImportTable::from_file(&file);
+    let statics: HashSet<String> = ["FOO".to_string()].into_iter().collect();
+
+    let item_fn = file
+        .items
+        .iter()
+        .find_map(|it| match it {
+            syn::Item::Fn(f) if f.sig.ident == "f" => Some(f),
+            _ => None,
+        })
+        .expect("fn f");
+
+    let effects = mutation::detect(&item_fn.block, &item_fn.sig, &statics, &imports);
+    assert!(
+        effects.iter().any(|e| e.kind.wire() == "local.mutation"),
+        "local write still detected after signature change"
+    );
+}
+
+// ── Spec 008 F1: unresolved free-binding write → hidden.mutation ─────────────
+#[test]
+fn unresolved_free_binding_write_is_hidden_mutation_class_3() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "writes_unresolved_free_binding");
+    let e = one_kind(&effects, "hidden.mutation");
+    assert_eq!(e.class, 3, "hidden.mutation is class 3");
+    assert_eq!(e.discounted_to, None, "hidden mutation is never discounted");
+    assert!(e.hidden, "an unresolved free-binding write is hidden");
+    assert_eq!(e.tier, Tier::Heuristic);
+    assert_eq!(
+        e.subreason.as_deref(),
+        Some("captured-binding"),
+        "captured-binding hidden write carries subreason captured-binding"
+    );
+}
+
+// ── Spec 008 F5: import-resolved write base → global.mutation ────────────────
+#[test]
+fn import_resolved_write_base_is_global_mutation_class_6() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "writes_imported_base");
+    let e = one_kind(&effects, "global.mutation");
+    assert_eq!(
+        e.class, 6,
+        "import-resolved write is global.mutation class 6"
+    );
+    assert_eq!(e.tier, Tier::Heuristic);
+    assert!(
+        e.evidence.contains("imported_cell"),
+        "evidence names the imported base, got: {}",
+        e.evidence
+    );
+}
+
+// ── Spec 008 FP-self: misattributed nested-receiver `self` must not emit ─────
+// global.mutation or hidden.mutation on the enclosing free fn when "self" is
+// in the ImportTable (e.g. via `use some_module::{self, …}`). The nested impl
+// method's `self.0 += 1` must be silently dropped, NOT routed through F5/F1.
+#[test]
+fn nested_impl_self_write_not_attributed_to_free_fn() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "count_awaits_fp_self");
+    assert!(
+        effects.iter().all(|e| e.kind.wire() != "global.mutation"),
+        "misattributed nested-receiver `self` write must NOT emit global.mutation, got: {:?}",
+        effects
+            .iter()
+            .map(|e| (e.kind.wire(), e.evidence.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        effects.iter().all(|e| e.kind.wire() != "hidden.mutation"),
+        "misattributed nested-receiver `self` write must NOT emit hidden.mutation, got: {:?}",
+        effects
+            .iter()
+            .map(|e| (e.kind.wire(), e.evidence.as_str()))
+            .collect::<Vec<_>>()
+    );
 }

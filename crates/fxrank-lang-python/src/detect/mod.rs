@@ -919,7 +919,7 @@ pub fn analyze_unit(unit: &FnUnit, path: &str, imports: &Imports, span: &SpanInd
     } else {
         cov.boundary
     };
-    let mut_pairs = mutation::detect(unit, span);
+    let mut_pairs = mutation::detect(unit, imports, span);
     effects.extend(mut_pairs.into_iter().map(|(mut e, contained)| {
         // Only record a discount when the boundary actually shifts the class —
         // i.e. Partial/Full coverage. `None` (incl. a typed boundary voided by a

@@ -44,6 +44,7 @@ use libcst_native::{
 use super::expr::render_expr;
 use super::{EffectSink, walk_own_body};
 use crate::functions::{FnBody, FnUnit};
+use crate::imports::Imports;
 use crate::source::{SpanIndex, anchor_of_subslice};
 
 /// Detect mutation effects in `unit`'s own body, with escape analysis.
@@ -53,7 +54,7 @@ use crate::source::{SpanIndex, anchor_of_subslice};
 /// constructor init); `false` means it escapes.
 ///
 /// Task 9 consumes the `contained` flags to apply boundary-containment discounts.
-pub fn detect(unit: &FnUnit, span: &SpanIndex) -> Vec<(Effect, bool)> {
+pub fn detect(unit: &FnUnit, imports: &Imports, span: &SpanIndex) -> Vec<(Effect, bool)> {
     // ── Step 1: collect param names from the unit's signature ────────────────
     let params = collect_param_names(unit.params);
 
@@ -70,6 +71,7 @@ pub fn detect(unit: &FnUnit, span: &SpanIndex) -> Vec<(Effect, bool)> {
         globals: &globals,
         nonlocals: &nonlocals,
         locals: &locals,
+        imports,
         is_init,
         span,
         effects: Vec::new(),
@@ -289,6 +291,9 @@ struct MutSink<'a> {
     /// Locally-assigned names (global/nonlocal names are removed from this set
     /// in the classification logic).
     locals: &'a HashSet<String>,
+    /// File-wide import table — lets the cascade resolve an import-rooted write (F5)
+    /// and distinguish a captured opaque binding (F1) from a known module.
+    imports: &'a Imports,
     /// True when analyzing `__init__` (so `self.attr = …` is local init).
     is_init: bool,
     span: &'a SpanIndex<'a>,
@@ -452,11 +457,55 @@ impl MutSink<'_> {
         // Local binding mutation: root is locally assigned (and not global/nonlocal).
         if self.locals.contains(&root) {
             self.push(EffectKind::LocalMutation, Tier::Exact, line, evidence, true);
+            return;
         }
 
-        // Otherwise (captured outer / module-level binding not declared with `global`) —
-        // no emission in Milestone A; these would be `HiddenMutation` in the TS frontend
-        // but the Python spec does not yet require that tier.
+        // F5: root resolves through the ImportTable → module-level state (the imported
+        // module/name) escaping the function. global.mutation (class 6, Heuristic),
+        // contained=false. A same-named LOCAL already won above.
+        if self.imports.resolve(&root).is_some() {
+            self.push(
+                EffectKind::GlobalMutation,
+                Tier::Heuristic,
+                line,
+                format!("{evidence} (imported `{root}`)"),
+                false,
+            );
+            return;
+        }
+
+        // F1: the root resolves to NONE of self/global/nonlocal/param/local/import —
+        // a captured outer binding (a closed-over variable, or a module-level name
+        // not declared `global`). The write escapes through an opaque channel we
+        // cannot bound syntactically → hidden.mutation (class 3, hidden:true,
+        // contained:false), subreason "captured-binding". Mirrors the TS `captured`
+        // hidden case (Milestone A left it un-emitted).
+        self.push_hidden(line, evidence, "captured-binding");
+    }
+
+    /// Push a `HiddenMutation` (`hidden:true` + a `subreason`), always escaping
+    /// (`contained:false`). Used for writes whose root is an opaque captured /
+    /// unresolved binding — the fallback after all named-binding cases are handled.
+    fn push_hidden(&mut self, line: usize, evidence: String, subreason: &str) {
+        let kind = EffectKind::HiddenMutation;
+        let tier = Tier::Heuristic;
+        let class = kind.base_class();
+        self.effects.push((
+            Effect {
+                kind,
+                class,
+                discounted_to: None,
+                weight: weight_for_class(class),
+                line,
+                tier,
+                hidden: true,
+                evidence,
+                discount: None,
+                subreason: Some(subreason.to_owned()),
+                confidence: detection_confidence(tier, false, false),
+            },
+            false,
+        ));
     }
 
     fn push(
@@ -555,12 +604,13 @@ mod tests {
     fn mutation_effects(name: &str) -> HashMap<String, Vec<(EffectKind, bool)>> {
         let src = std::fs::read_to_string(format!("tests/fixtures/{name}.py")).unwrap();
         let module = libcst_native::parse_module(&src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let mut out: HashMap<String, Vec<(EffectKind, bool)>> = HashMap::new();
         for unit in &units {
-            let pairs = detect(unit, &span);
+            let pairs = detect(unit, &imports, &span);
             out.insert(
                 unit.symbol.clone(),
                 pairs.iter().map(|(e, c)| (e.kind, *c)).collect(),
@@ -573,12 +623,13 @@ mod tests {
     fn mutation_evidence(name: &str) -> HashMap<String, Vec<(EffectKind, bool, String)>> {
         let src = std::fs::read_to_string(format!("tests/fixtures/{name}.py")).unwrap();
         let module = libcst_native::parse_module(&src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let mut out: HashMap<String, Vec<(EffectKind, bool, String)>> = HashMap::new();
         for unit in &units {
-            let pairs = detect(unit, &span);
+            let pairs = detect(unit, &imports, &span);
             out.insert(
                 unit.symbol.clone(),
                 pairs
@@ -689,6 +740,101 @@ mod tests {
             m["store"].contains(&(ThisMutation, false)),
             "`self[i] = v` must be ThisMutation(false), got: {:?}",
             m["store"]
+        );
+    }
+
+    /// PREREQ 1: MutSink can emit a HiddenMutation (hidden:true + subreason) —
+    /// the channel Python has never used. `push` stays the honest hidden:false path.
+    #[test]
+    fn push_hidden_emits_hidden_mutation_with_subreason() {
+        let params = std::collections::HashSet::new();
+        let globals = std::collections::HashSet::new();
+        let nonlocals = std::collections::HashSet::new();
+        let locals = std::collections::HashSet::new();
+        let src = "x\n";
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
+        let span = crate::source::SpanIndex::new(src);
+        let mut sink = MutSink {
+            params: &params,
+            globals: &globals,
+            nonlocals: &nonlocals,
+            locals: &locals,
+            imports: &imports,
+            is_init: false,
+            span: &span,
+            effects: Vec::new(),
+        };
+        sink.push_hidden(1, "outer_acc.append(…)".to_string(), "captured-binding");
+
+        assert_eq!(sink.effects.len(), 1);
+        let (effect, contained) = &sink.effects[0];
+        assert_eq!(effect.kind, EffectKind::HiddenMutation);
+        assert_eq!(effect.class, 3);
+        assert!(effect.hidden, "push_hidden must set hidden:true");
+        assert_eq!(effect.subreason.as_deref(), Some("captured-binding"));
+        assert!(!contained, "hidden writes escape — contained=false");
+    }
+
+    /// PREREQ 2: mutation::detect accepts the ImportTable so F5 + F1 can resolve roots.
+    #[test]
+    fn detect_accepts_imports_param() {
+        let src = "def f(lst):\n    lst.append(1)\n";
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
+        let span = crate::source::SpanIndex::new(src);
+        let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
+        let (units, _) = functions::collect(&module, src, &span, &anchors);
+        let f = units.iter().find(|u| u.symbol == "f").unwrap();
+        let pairs = detect(f, &imports, &span);
+        assert!(
+            pairs.iter().any(|(e, _)| e.kind == ParamMutation),
+            "lst.append where lst is a param → ParamMutation, got: {:?}",
+            pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// F5: a write whose root resolves through the ImportTable is module-level state
+    /// escaping the function → global.mutation/6, contained=false. Inserted AFTER the
+    /// `locals` arm (a same-named local shadows the import) and BEFORE the F1 fallback.
+    #[test]
+    fn import_rooted_write_is_global_mutation() {
+        let m = mutation_effects("mutation");
+        assert!(
+            m["mutates_imported_module"].contains(&(GlobalMutation, false)),
+            "config.settings.append(…) where `config` is imported must be GlobalMutation(false), got: {:?}",
+            m["mutates_imported_module"]
+        );
+    }
+
+    /// F1/F3: a write whose root resolves to NONE of {self, globals, nonlocals, params,
+    /// locals, import} is a captured outer/opaque binding. Pre-fix the cascade fell off
+    /// silently; now it emits hidden.mutation/3, hidden=true, contained=false, subreason
+    /// "captured-binding" (the Python analog of the TS `captured` hidden case).
+    #[test]
+    fn captured_binding_subreason_is_set() {
+        let src = std::fs::read_to_string("tests/fixtures/mutation.py").unwrap();
+        let module = libcst_native::parse_module(&src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
+        let span = crate::source::SpanIndex::new(&src);
+        let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
+        let (units, _) = functions::collect(&module, &src, &span, &anchors);
+        let inner = units.iter().find(|u| u.symbol == "inner").unwrap();
+        let pairs = detect(inner, &imports, &span);
+        let hidden = pairs
+            .iter()
+            .find(|(e, _)| e.kind == HiddenMutation)
+            .map(|(e, _)| e)
+            .expect("inner must emit a HiddenMutation");
+        assert_eq!(hidden.class, 3);
+        assert!(
+            hidden.hidden,
+            "captured-binding HiddenMutation must be hidden:true"
+        );
+        assert_eq!(hidden.subreason.as_deref(), Some("captured-binding"));
+        assert!(
+            pairs.iter().any(|(e, c)| e.kind == HiddenMutation && !*c),
+            "captured-binding write escapes — contained=false"
         );
     }
 

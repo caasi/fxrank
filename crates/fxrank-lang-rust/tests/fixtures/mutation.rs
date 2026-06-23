@@ -89,3 +89,65 @@ fn destructured_mut_param((mut a, b): &mut (i32, i32)) {
     *a = 1;
     let _ = b;
 }
+
+// R2 (F2): a *lowercase* `static mut` written by direct assignment. Proves the
+// real-static detection is casing-INDEPENDENT (pre-fix `is_screaming_snake`
+// rejects the lowercase base → dropped → no global.mutation).
+static mut counter_cell: u32 = 0;
+fn write_lower_static_mut() {
+    unsafe {
+        counter_cell = 1;
+    }
+}
+
+// R2 (F2): a plain `static` of interior-mutable type written via `.store()`. The
+// write routes through the interior-mutator branch of visit_expr_method_call, NOT
+// record_write. Pre-fix that branch only fires for `shared_refs` bases, so an
+// atomic static base is dropped → no global.mutation.
+use std::sync::atomic::{AtomicU32, Ordering};
+static HITS: AtomicU32 = AtomicU32::new(0);
+fn store_atomic_static() {
+    HITS.store(1, Ordering::Relaxed);
+}
+
+// R2 (F2): an UPPERCASE base bound NOWHERE and NOT a file-level static — the real
+// proxy-retirement discriminator. Pre-fix `is_screaming_snake("UNBOUND_THING")` is
+// true → wrongly emits global.mutation. Post-fix it is not in `statics`, so it falls
+// to the F1 tail → `hidden.mutation` (subreason `captured-binding`), never global.
+// The test asserts only the *not-global* part (the proxy-retirement check).
+fn write_unbound_upper() {
+    UNBOUND_THING.field = 1;
+}
+
+// 008-F1: `external_thing` is bound nowhere in this fn (no let/param/self) and is
+// NOT a file-level static. A write to it is an unresolved free binding → the
+// cascade tail emits hidden.mutation (class 3, hidden).
+fn writes_unresolved_free_binding() {
+    external_thing.field = 1;
+}
+
+// 008-F5: `imported_cell` is brought in by a `use`. A write whose base resolves
+// through the ImportTable is module-external ambient state → global.mutation/6.
+// Contrived: in real Rust a `use` names a type/fn, so this path is near-vacuous.
+use some_crate::imported_cell;
+fn writes_imported_base() {
+    imported_cell.field = 1;
+}
+
+// 008-FP-self: A free fn (no receiver) that contains a nested `impl` block with
+// `&mut self` methods. The `{self, …}` form in a `use` registers "self" in the
+// ImportTable; the mutation walker must NOT let a misattributed nested-receiver
+// `self` write fall through to the F5 import arm and emit global.mutation.
+// Regression for the false-positive surfaced by `fxrank scan crates/` on
+// `fxrank-lang-ts/src/detect/mod.rs` (uses `crate::react::{self, HookPhase}`).
+use some_module::{self, Helper};
+fn count_awaits_fp_self() {
+    struct AwaitCounter(usize);
+    impl SomeTrait for AwaitCounter {
+        fn visit_await(&mut self, _node: &()) {
+            self.0 += 1;
+        }
+    }
+    let mut counter = AwaitCounter(0);
+    let _ = counter.0;
+}
