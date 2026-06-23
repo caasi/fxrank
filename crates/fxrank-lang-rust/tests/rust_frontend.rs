@@ -1302,3 +1302,29 @@ fn import_resolved_write_base_is_global_mutation_class_6() {
         e.evidence
     );
 }
+
+// ── Spec 008 FP-self: misattributed nested-receiver `self` must not emit ─────
+// global.mutation or hidden.mutation on the enclosing free fn when "self" is
+// in the ImportTable (e.g. via `use some_module::{self, …}`). The nested impl
+// method's `self.0 += 1` must be silently dropped, NOT routed through F5/F1.
+#[test]
+fn nested_impl_self_write_not_attributed_to_free_fn() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "count_awaits_fp_self");
+    assert!(
+        effects.iter().all(|e| e.kind.wire() != "global.mutation"),
+        "misattributed nested-receiver `self` write must NOT emit global.mutation, got: {:?}",
+        effects
+            .iter()
+            .map(|e| (e.kind.wire(), e.evidence.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        effects.iter().all(|e| e.kind.wire() != "hidden.mutation"),
+        "misattributed nested-receiver `self` write must NOT emit hidden.mutation, got: {:?}",
+        effects
+            .iter()
+            .map(|e| (e.kind.wire(), e.evidence.as_str()))
+            .collect::<Vec<_>>()
+    );
+}

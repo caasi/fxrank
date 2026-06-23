@@ -204,10 +204,18 @@ impl<'a> MutationWalker<'a> {
                 format!("write to global {base}"),
                 None,
             );
-        } else if !self.locals.contains(&base) && self.imports.resolve(&base).is_some() {
+        } else if !self.locals.contains(&base)
+            && base != "self"
+            && self.imports.resolve(&base).is_some()
+        {
             // 008-F5: the base resolves through the `use`-table — module-external
             // ambient state → global.mutation. Near-vacuous for Rust; implemented
             // for symmetry with the TS/Python frontends.
+            //
+            // Guard: `base != "self"` prevents a misattributed nested-receiver write
+            // (e.g. `self.0 += 1` inside a nested `impl` method) from falling through
+            // here when "self" is in the ImportTable (e.g. via `use m::{self, …}`).
+            // The real `&mut self` / `&self`-interior cases are caught above.
             self.push_plain(
                 EffectKind::GlobalMutation,
                 Tier::Heuristic,
@@ -216,10 +224,13 @@ impl<'a> MutationWalker<'a> {
                 format!("write to imported {base}"),
                 None,
             );
-        } else if !self.locals.contains(&base) {
+        } else if !self.locals.contains(&base) && base != "self" {
             // 008-F1: the base resolves to no local/param/self/static binding —
             // a write to a captured/unresolved outer binding, hidden from this
             // signature → hidden.mutation (class 3, hidden). TS parity.
+            //
+            // Guard: `base != "self"` drops misattributed nested-receiver writes
+            // that reach here (same root cause as F5 guard above).
             self.push_plain(
                 EffectKind::HiddenMutation,
                 Tier::Heuristic,

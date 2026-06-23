@@ -131,3 +131,21 @@ use some_crate::imported_cell;
 fn writes_imported_base() {
     imported_cell.field = 1;
 }
+
+// 008-FP-self: A free fn (no receiver) that contains a nested `impl` block with
+// `&mut self` methods. The `{self, …}` form in a `use` registers "self" in the
+// ImportTable; the mutation walker must NOT let a misattributed nested-receiver
+// `self` write fall through to the F5 import arm and emit global.mutation.
+// Regression for the false-positive surfaced by `fxrank scan crates/` on
+// `fxrank-lang-ts/src/detect/mod.rs` (uses `crate::react::{self, HookPhase}`).
+use some_module::{self, Helper};
+fn count_awaits_fp_self() {
+    struct AwaitCounter(usize);
+    impl SomeTrait for AwaitCounter {
+        fn visit_await(&mut self, _node: &()) {
+            self.0 += 1;
+        }
+    }
+    let mut counter = AwaitCounter(0);
+    let _ = counter.0;
+}
