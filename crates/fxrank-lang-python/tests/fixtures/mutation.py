@@ -46,3 +46,10 @@ import config  # module-level import — `config` resolves through the ImportTab
 
 def mutates_imported_module():
     config.settings.append(1)  # F5: root `config` → import → global.mutation/6, contained=false
+
+def captures_outer_binding():
+    outer = []
+    def inner():
+        outer.append(1)  # F1: `outer` is none of self/global/nonlocal/param/local-here
+                         # nor an import → captured opaque binding → hidden.mutation/3
+    return inner

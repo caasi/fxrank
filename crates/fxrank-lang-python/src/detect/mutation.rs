@@ -471,17 +471,21 @@ impl MutSink<'_> {
                 format!("{evidence} (imported `{root}`)"),
                 false,
             );
+            return;
         }
 
-        // Otherwise (captured outer / module-level binding not declared with `global`) —
-        // no emission in Milestone A; these would be `HiddenMutation` in the TS frontend
-        // but the Python spec does not yet require that tier.
+        // F1: the root resolves to NONE of self/global/nonlocal/param/local/import —
+        // a captured outer binding (a closed-over variable, or a module-level name
+        // not declared `global`). The write escapes through an opaque channel we
+        // cannot bound syntactically → hidden.mutation (class 3, hidden:true,
+        // contained:false), subreason "captured-binding". Mirrors the TS `captured`
+        // hidden case (Milestone A left it un-emitted).
+        self.push_hidden(line, evidence, "captured-binding");
     }
 
     /// Push a `HiddenMutation` (`hidden:true` + a `subreason`), always escaping
     /// (`contained:false`). Used for writes whose root is an opaque captured /
     /// imported binding — the analog of the TS frontend's `captured` hidden case.
-    #[allow(dead_code)]
     fn push_hidden(&mut self, line: usize, evidence: String, subreason: &str) {
         let kind = EffectKind::HiddenMutation;
         let tier = Tier::Heuristic;
@@ -800,6 +804,37 @@ mod tests {
             m["mutates_imported_module"].contains(&(GlobalMutation, false)),
             "config.settings.append(…) where `config` is imported must be GlobalMutation(false), got: {:?}",
             m["mutates_imported_module"]
+        );
+    }
+
+    /// F1/F3: a write whose root resolves to NONE of {self, globals, nonlocals, params,
+    /// locals, import} is a captured outer/opaque binding. Pre-fix the cascade fell off
+    /// silently; now it emits hidden.mutation/3, hidden=true, contained=false, subreason
+    /// "captured-binding" (the Python analog of the TS `captured` hidden case).
+    #[test]
+    fn captured_binding_subreason_is_set() {
+        let src = std::fs::read_to_string("tests/fixtures/mutation.py").unwrap();
+        let module = libcst_native::parse_module(&src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
+        let span = crate::source::SpanIndex::new(&src);
+        let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
+        let (units, _) = functions::collect(&module, &src, &span, &anchors);
+        let inner = units.iter().find(|u| u.symbol == "inner").unwrap();
+        let pairs = detect(inner, &imports, &span);
+        let hidden = pairs
+            .iter()
+            .find(|(e, _)| e.kind == HiddenMutation)
+            .map(|(e, _)| e)
+            .expect("inner must emit a HiddenMutation");
+        assert_eq!(hidden.class, 3);
+        assert!(
+            hidden.hidden,
+            "captured-binding HiddenMutation must be hidden:true"
+        );
+        assert_eq!(hidden.subreason.as_deref(), Some("captured-binding"));
+        assert!(
+            pairs.iter().any(|(e, c)| e.kind == HiddenMutation && !*c),
+            "captured-binding write escapes — contained=false"
         );
     }
 
