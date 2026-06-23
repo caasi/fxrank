@@ -141,7 +141,7 @@ Each fix is the **same concept** handled incompatibly today. Targets per §1.1.
 
 **F2 generalized across frontends:** the rule "a write to a module top-level binding →
 `global.mutation`/6" is not Rust-specific. Rust realizes it via the real `static` set (this F2).
-TS realizes it via a `const`/`let`/`var`/`fn`/`class` module-binding set (tracked in #29).
+TS realizes it via a `const`/`let`/`var`/`fn`/`class` module-binding set (implemented via #29).
 Python realizes it via the module-level assign-target + `def`/`class` name set (content-mutation
 without `global`, the non-rebind case). The canonical rule and per-language realization are
 documented in `docs/mutation-classification-guideline.md`.
