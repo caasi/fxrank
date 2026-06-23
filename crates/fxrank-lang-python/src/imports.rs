@@ -296,16 +296,20 @@ fn root_component(path: &str) -> String {
 /// declared/import in the writing function — is a write to module-shared state,
 /// escalated to `global.mutation` (the Python analog of #29).
 ///
+/// The **function-body prescan** (`detect/mutation.rs`) now covers for/with-as/
+/// except-as locals: a `for _cache in …`, `with ctx as _cache`, or
+/// `except E as _cache` binding shadows the module-level name inside that
+/// function and is collected as a local, preventing false escalation to
+/// `global.mutation`.
+///
 /// Not collected (accepted misses, consistent with the syntactic flat-scope
 /// approximation in the other frontends): import names (handled by the F5 import
 /// arm via the `Imports` table); subscript/attribute assignment targets (not new
 /// bindings); names bound by module top-level `for`/`with … as`/`except … as`/
-/// `match` patterns; names bound only inside nested blocks/comprehensions. Edge:
-/// the per-function `prescan` collects *locals* from bare-`Name` targets only
-/// (it does not recurse into tuple targets), so a function that tuple-rebinds and
-/// then content-mutates a name that is *also* a module tuple-binding can
-/// mis-escalate — the same pre-existing limitation the import (F5) arm has; rare,
-/// accepted.
+/// `match` patterns; names bound only inside nested blocks/comprehensions.
+/// **Residual accepted limits in the prescan** (not chased): `match` pattern
+/// captures, comprehension-scope targets (Python 3 gives them their own scope),
+/// and walrus (`:=`) operator targets.
 pub fn module_bindings(module: &Module) -> HashSet<String> {
     let mut out = HashSet::new();
     for stmt in &module.body {
@@ -342,7 +346,7 @@ pub fn module_bindings(module: &Module) -> HashSet<String> {
 /// Collect bound names from an assignment target, recursing into destructuring.
 /// Attribute/Subscript targets bind no new name. Mirrors
 /// `detect::walk_assign_target_subexprs`'s enum shape.
-fn collect_target_names(target: &AssignTargetExpression, out: &mut HashSet<String>) {
+pub(crate) fn collect_target_names(target: &AssignTargetExpression, out: &mut HashSet<String>) {
     match target {
         AssignTargetExpression::Name(n) => {
             out.insert(n.value.to_owned());
@@ -363,7 +367,7 @@ fn collect_target_names(target: &AssignTargetExpression, out: &mut HashSet<Strin
 }
 
 /// A destructuring element (`(a, *rest) = …`). Mirrors `detect::walk_target_element`.
-fn collect_element_names(el: &Element, out: &mut HashSet<String>) {
+pub(crate) fn collect_element_names(el: &Element, out: &mut HashSet<String>) {
     match el {
         Element::Simple { value, .. } => collect_expr_target_names(value, out),
         Element::Starred(s) => collect_expr_target_names(&s.value, out),
@@ -371,7 +375,7 @@ fn collect_element_names(el: &Element, out: &mut HashSet<String>) {
 }
 
 /// Destructuring elements are typed as `Expression`. Mirrors `detect::walk_target_value`.
-fn collect_expr_target_names(expr: &Expression, out: &mut HashSet<String>) {
+pub(crate) fn collect_expr_target_names(expr: &Expression, out: &mut HashSet<String>) {
     match expr {
         Expression::Name(n) => {
             out.insert(n.value.to_owned());

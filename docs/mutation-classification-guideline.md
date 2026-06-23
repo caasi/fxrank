@@ -47,7 +47,8 @@ functions; Rust's mutation walker descends into closures and block-local `fn` it
   incl. `export` + named default; Python: module-level assign targets + `def`/`class` names).
   Locals/params win before module bindings (a function-scoped binding shadows a module name);
   the local-set construction is frontend-specific (TS traversal-order; Python whole-function
-  pre-scan of recognized local targets). In
+  pre-scan that recurses through tuple/list/starred destructuring and handles augmented-assign
+  targets). In
   **Python**, a `global x` *rebind* already escalates via the explicit `global`-decl arm
   (Exact); the module-binding set adds the **content-mutation without `global`** case
   (`_cache["k"]=1`, `shared.append(1)` — Heuristic). TS has no such keyword, so all module
@@ -70,6 +71,10 @@ discounted to 2). Hidden state scores above declared state.
 - **TS** — `var` hoist vs `let`/`const` TDZ unmodeled; `useRef().current` → ref-cell hidden;
   imports + `globalThis`/`window` + **module top-level bindings** (`const`/`let`/`var`/`fn`/`class`,
   incl. `export`/named-default) → global; captured enclosing-function local → hidden.
-- **Python** — `global`/`nonlocal` pre-scanned; comprehension scopes unmodeled; **module
-  top-level bindings** (module-level assign targets + `def`/`class` names) whose contents are
-  mutated → global; a genuinely captured enclosing-function local → hidden.
+- **Python** — `global`/`nonlocal` pre-scanned; prescan now also collects `for`/`async for`
+  loop targets, `with … as`/`async with … as` names, and `except … as`/`except* … as` names
+  as function-local bindings (shadowing same-named module-level names); **module top-level
+  bindings** (module-level assign targets + `def`/`class` names) whose contents are mutated
+  → global; a genuinely captured enclosing-function local → hidden.
+  **Residual accepted limits:** `match` pattern captures, comprehension-scope targets
+  (Python 3 gives them their own scope), and walrus (`:=`) operator targets.

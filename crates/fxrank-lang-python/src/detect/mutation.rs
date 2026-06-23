@@ -22,8 +22,12 @@
 //! ## Strategy
 //!
 //! 1. **Pre-scan** the function body for `global`/`nonlocal` declarations and
-//!    bare-`Name` LHS assignments — these build the `globals`, `nonlocals`, and
-//!    `locals` sets.
+//!    local bindings — `Assign`/`AnnAssign` targets (incl. tuple/list/starred
+//!    destructuring), `AugAssign` bare-`Name` targets, `for`/`async for` loop
+//!    targets, `with … as`/`async with … as` names, and `except … as` /
+//!    `except* … as` names — building the `globals`, `nonlocals`, and `locals`
+//!    sets. (Python scoping: any binding-form in a body makes the name
+//!    function-local for the whole function.)
 //! 2. **Extract** parameter names from `unit.params`.
 //! 3. **Walk** the body classifying write targets: `Assign`/`AnnAssign`/`AugAssign`
 //!    targets, and mutating method calls (`.append`, `.update`, `.add`) via
@@ -119,8 +123,16 @@ fn collect_param_names(params: &Parameters) -> HashSet<String> {
 /// Walk the body suite or lambda body expression to collect:
 /// - `globals`: names declared with `global`.
 /// - `nonlocals`: names declared with `nonlocal`.
-/// - `locals`: names introduced by bare-`Name` LHS assignments (not params,
-///   not `global`/`nonlocal` — those are resolved after this pass).
+/// - `locals`: names introduced by assignment in the function body — including
+///   `Assign`/`AnnAssign` targets (incl. tuple/list/starred destructuring),
+///   `AugAssign` bare-`Name` targets, `for`/`async for` loop targets,
+///   `with … as`/`async with … as` names, and `except … as` / `except* … as`
+///   names.  (Python scoping: any binding-form in a body makes the name
+///   function-local for the whole function.)
+///
+/// Residual accepted limits (not collected here): `match` pattern captures,
+/// comprehension-scope targets (Python 3 gives them their own scope), and
+/// walrus (`:=`) operator targets.
 ///
 /// Only scans the **own** body (does not descend into nested `def`/`lambda`).
 fn prescan_body(
@@ -188,6 +200,10 @@ fn prescan_compound(
             }
         }
         CompoundStatement::For(f) => {
+            // `for <target> in …` — the target is a Python local for the whole function
+            // (PEP 3104), whether the loop is `for` or `async for` (same node, just an
+            // `asynchronous` flag). Collect target names before recursing into the body.
+            crate::imports::collect_target_names(&f.target, locals);
             prescan_suite(&f.body, globals, nonlocals, locals);
             if let Some(orelse) = &f.orelse {
                 prescan_suite(&orelse.body, globals, nonlocals, locals);
@@ -202,6 +218,12 @@ fn prescan_compound(
         CompoundStatement::Try(t) => {
             prescan_suite(&t.body, globals, nonlocals, locals);
             for h in &t.handlers {
+                // `except SomeError as e:` — `e` is a Python local for the whole
+                // function (unlike in Python 2, it is deleted after the block, but it
+                // IS in scope inside the handler and binds the name function-locally).
+                if let Some(asname) = &h.name {
+                    crate::imports::collect_target_names(&asname.name, locals);
+                }
                 prescan_suite(&h.body, globals, nonlocals, locals);
             }
             if let Some(orelse) = &t.orelse {
@@ -214,6 +236,10 @@ fn prescan_compound(
         CompoundStatement::TryStar(t) => {
             prescan_suite(&t.body, globals, nonlocals, locals);
             for h in &t.handlers {
+                // `except* SomeError as e:` — same binding semantics as `except … as`.
+                if let Some(asname) = &h.name {
+                    crate::imports::collect_target_names(&asname.name, locals);
+                }
                 prescan_suite(&h.body, globals, nonlocals, locals);
             }
             if let Some(orelse) = &t.orelse {
@@ -224,6 +250,14 @@ fn prescan_compound(
             }
         }
         CompoundStatement::With(w) => {
+            // `with expr as <target>:` (and `async with`) — `target` is a Python local
+            // for the whole function. Both are the same `With` node with an
+            // `asynchronous` flag. Collect asname targets before recursing into the body.
+            for item in &w.items {
+                if let Some(asname) = &item.asname {
+                    crate::imports::collect_target_names(&asname.name, locals);
+                }
+            }
             prescan_suite(&w.body, globals, nonlocals, locals);
         }
         CompoundStatement::Match(m) => {
@@ -271,16 +305,22 @@ fn prescan_small(
             }
         }
         SmallStatement::Assign(a) => {
-            // Bare `Name` LHS → local binding (unless shadowed by global/nonlocal,
-            // which we resolve after this pass).
+            // Collect ALL bound names recursively through tuple/list/starred
+            // destructuring (not just bare `Name`). Python's scoping rule: any
+            // binding-assignment in a function body — including `(a, b) = …` and
+            // `[x, *rest] = …` — makes the bound names local to the whole function.
             for target in &a.targets {
-                if let AssignTargetExpression::Name(n) = &target.target {
-                    locals.insert(n.value.to_owned());
-                }
+                crate::imports::collect_target_names(&target.target, locals);
             }
         }
-        // AnnAssign `x: T = …` also introduces a local.
+        // AnnAssign `x: T = …` also introduces a local (recurse for safety,
+        // though `x: T` is always a bare Name in practice).
         SmallStatement::AnnAssign(a) => {
+            crate::imports::collect_target_names(&a.target, locals);
+        }
+        // AugAssign `x += …` binds the name locally when the target is a bare Name.
+        // Only a Name target introduces a binding; `x.attr += 1` / `x[i] += 1` do not.
+        SmallStatement::AugAssign(a) => {
             if let AssignTargetExpression::Name(n) = &a.target {
                 locals.insert(n.value.to_owned());
             }
@@ -935,6 +975,61 @@ mod tests {
         assert!(
             !pairs.iter().any(|(e, _)| e.kind == GlobalMutation),
             "shadowing local must not escalate to GlobalMutation"
+        );
+    }
+
+    /// Prescan fix (for/with-as/except-as): a name introduced by a `for` loop target
+    /// in a function body is a Python local for the WHOLE function (PEP 3104). A
+    /// module binding of the same name must be shadowed by the for-target local.
+    #[test]
+    fn for_target_shadow_stays_local() {
+        // `_cache` is a module-level binding; `for _cache in []` shadows it locally.
+        // The write `_cache['k'] = 1` inside the loop must be LocalMutation (contained),
+        // not GlobalMutation. Before the prescan fix this was GlobalMutation because
+        // the prescan did not collect for-loop targets.
+        let src = "_cache = {}\ndef f():\n    for _cache in []:\n        _cache['k'] = 1\n";
+        let pairs = detect_src(src, "f");
+        let writes: Vec<_> = pairs
+            .iter()
+            .filter(|(e, _)| {
+                matches!(
+                    e.kind,
+                    LocalMutation | GlobalMutation | HiddenMutation | ThisMutation
+                )
+            })
+            .collect();
+        assert!(
+            writes.iter().any(|(e, c)| e.kind == LocalMutation && *c),
+            "expected LocalMutation(contained=true) for for-target shadow, got: {:?}",
+            writes.iter().map(|(e, c)| (e.kind, *c)).collect::<Vec<_>>()
+        );
+        assert!(
+            !writes.iter().any(|(e, _)| e.kind == GlobalMutation),
+            "expected NO GlobalMutation for for-target shadow, got: {:?}",
+            writes.iter().map(|(e, c)| (e.kind, *c)).collect::<Vec<_>>()
+        );
+    }
+
+    /// Prescan fix: a name introduced by DESTRUCTURING assignment in a function body
+    /// is a Python local (Python scoping: any binding-assignment makes the name local
+    /// for the whole function). A module binding of the same name must be shadowed.
+    #[test]
+    fn local_destructured_shadow_stays_local() {
+        // `_cache` is a module-level binding. `f` rebinds it via tuple destructuring
+        // `(_cache,) = ({},)` — Python considers `_cache` local to `f` for the whole
+        // function. The subsequent `_cache['k'] = 1` must be LocalMutation (contained),
+        // not GlobalMutation. Before the prescan fix this was GlobalMutation because
+        // the prescan only collected bare-Name targets.
+        let src = "_cache = {}\ndef f():\n    (_cache,) = ({},)\n    _cache['k'] = 1\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            pairs.iter().any(|(e, c)| e.kind == LocalMutation && *c),
+            "destructuring-local `_cache` must be LocalMutation(true), got: {:?}",
+            pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !pairs.iter().any(|(e, _)| e.kind == GlobalMutation),
+            "destructured local must not escalate to GlobalMutation"
         );
     }
 }
