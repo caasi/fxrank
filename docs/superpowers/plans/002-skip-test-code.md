@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024, `syn` 2 (attribute inspection), `serde`/`serde_json`, `clap`.
 
-Spec: `specs/002-skip-test-code.md` — source of truth. When this plan and the spec disagree, the spec wins; fix the plan.
+Spec: `docs/superpowers/specs/002-skip-test-code.md` — source of truth. When this plan and the spec disagree, the spec wins; fix the plan.
 
 **Baseline (the "before", captured by dogfooding):** `fxrank scan crates/fxrank-lang-rust/src` currently ranks the inline `#[cfg(test)]` unit tests `qualified_builtins_match_on_last_segment`, `import_table_handles_groups`, `import_table_resolves_aliases_and_flags_glob` as the **top 3 hotspots** (all assert-only `panic`). Task 5 asserts these are gone and `scope.skipped_tests > 0`.
 

@@ -4,7 +4,7 @@
 
 **Goal:** Align the three FxRank language frontends (Rust/syn, TS/swc, Python/libcst) to behavioral parity on five drifted mutation-classification cases (F1–F5), and ship a descriptive guideline documenting the shared model + the honest language differences.
 
-**Architecture:** No shared code layer and no scope rewrite. Each frontend keeps its own `detect/mutation.rs` native walk; we patch each one's classification cascade so the *same concept* produces the *same effect* across languages, while preserving the honest per-language differences. Source of truth: `specs/008-cross-language-mutation-alignment.md`.
+**Architecture:** No shared code layer and no scope rewrite. Each frontend keeps its own `detect/mutation.rs` native walk; we patch each one's classification cascade so the *same concept* produces the *same effect* across languages, while preserving the honest per-language differences. Source of truth: `docs/superpowers/specs/008-cross-language-mutation-alignment.md`.
 
 **Tech Stack:** Rust (Cargo workspace), `syn`/`swc`/`libcst` parsers, `insta` snapshot testing, `fxrank-core` shared effect/score vocabulary.
 

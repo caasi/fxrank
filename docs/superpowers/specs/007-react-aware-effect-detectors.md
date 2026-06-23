@@ -2,7 +2,7 @@
 
 **Status:** Draft (design; two adversarial review rounds by Claude + Codex; revised twice)
 **Issue:** [#19](https://github.com/caasi/fxrank/issues/19)
-**Related:** [#25](https://github.com/caasi/fxrank/issues/25) (cross-file resolution — the deferred precision upgrade), #14 (Python receiver-state gradient — shared posture), specs/003 (TS frontend), specs/001 (scoring model + Known Limitations).
+**Related:** [#25](https://github.com/caasi/fxrank/issues/25) (cross-file resolution — the deferred precision upgrade), #14 (Python receiver-state gradient — shared posture), docs/superpowers/specs/003 (TS frontend), docs/superpowers/specs/001 (scoring model + Known Limitations).
 
 > Two review rounds. Round 1 killed the original "own-body + detection-only, for free" thesis.
 > Round 2 confirmed the rewrite and refined the core mechanism from a "roll-up re-walk" into

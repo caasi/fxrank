@@ -314,11 +314,12 @@ analog of F2 (thread a `module_bindings` set, add a `global` arm before the hidd
 
 ## Design artifacts & workflow
 
-Specs live in `specs/`, implementation plans in `plans/`, with matching 3-digit prefixes
-(`specs/001-*` ↔ `plans/001-*`). `specs/001-fxrank-rust-effect-scanner.md` is the
+Specs live in `docs/superpowers/specs/`, implementation plans in `docs/superpowers/plans/`
+(the `superpowers` skill default location), with matching 3-digit prefixes
+(`docs/superpowers/specs/001-*` ↔ `docs/superpowers/plans/001-*`). `docs/superpowers/specs/001-fxrank-rust-effect-scanner.md` is the
 source of truth for every score, class, discount, and schema field — **read it before
 changing scoring behavior**; when code and spec disagree, the spec wins. (For mutation
-classification specifically, `specs/008-cross-language-mutation-alignment.md` + the guideline
+classification specifically, `docs/superpowers/specs/008-cross-language-mutation-alignment.md` + the guideline
 above govern the cross-frontend behavior.) Its *Known
 Limitations* section records the accepted deferrals (call-graph propagation /
 `inherited_score`, FFI call-site detection, `global.mutation` class-4 downgrade, and a

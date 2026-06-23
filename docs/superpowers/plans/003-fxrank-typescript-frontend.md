@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024, `swc_ecma_parser` / `swc_ecma_ast` / `swc_ecma_visit` / `swc_common`, `clap`, `serde`, `insta`.
 
-**Spec:** `specs/003-fxrank-typescript-frontend.md` (source of truth — read it before starting; when code and spec disagree, the spec wins).
+**Spec:** `docs/superpowers/specs/003-fxrank-typescript-frontend.md` (source of truth — read it before starting; when code and spec disagree, the spec wins).
 
 **Conventions (from `CLAUDE.md` + spec):**
 - Core depends on **no parser** — `swc` must never appear in `fxrank-core`'s deps (compiler-enforced).
@@ -857,7 +857,7 @@ git push -u origin feat/ts-frontend
 - [ ] **Step 4: Open the PR** linking spec 003.
 
 ```bash
-gh pr create --title "feat: TypeScript/JavaScript frontend (spec 003)" --body "Implements specs/003-fxrank-typescript-frontend.md. Walking-skeleton-first; types lower the score via the boundary-containment discount."
+gh pr create --title "feat: TypeScript/JavaScript frontend (spec 003)" --body "Implements docs/superpowers/specs/003-fxrank-typescript-frontend.md. Walking-skeleton-first; types lower the score via the boundary-containment discount."
 ```
 
 ---

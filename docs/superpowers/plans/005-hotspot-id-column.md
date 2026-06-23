@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, Cargo workspace; swc (`swc_common::SourceMap::lookup_char_pos`) for TS; `syn` + `proc-macro2` (`Span::start() -> LineColumn`) for Rust; `insta` for snapshot tests.
 
-**Spec:** `specs/005-hotspot-id-column.md`. Read it first — it is source of truth for the format, the 1-based char-column semantics, and the anchor-consistency invariant.
+**Spec:** `docs/superpowers/specs/005-hotspot-id-column.md`. Read it first — it is source of truth for the format, the 1-based char-column semantics, and the anchor-consistency invariant.
 
 **Branch:** Implementation is code, so it goes on a feature branch (e.g. `feat/005-hotspot-id-column`), never on `main`. Docs-only Task 5 may alternatively land on `main`, but keeping it on the same branch + PR is simpler.
 
@@ -23,7 +23,7 @@
 | `crates/fxrank-lang-ts/tests/ts_frontend.rs` | **Add** #9 regression test; update one stale comment. |
 | `crates/fxrank-lang-rust/src/functions.rs` | 3 id-format sites read `start().line` + `start().column + 1`; id format → 4-field; doc comment updated. |
 | `crates/fxrank-lang-rust/tests/rust_frontend.rs` | **Add** a test pinning the `path:line:col:symbol` shape + 1-based col. |
-| `specs/001-fxrank-rust-effect-scanner.md` | Amend the `id` paragraph (~line 252) and the Function-unit rationale row (~line 525). |
+| `docs/superpowers/specs/001-fxrank-rust-effect-scanner.md` | Amend the `id` paragraph (~line 252) and the Function-unit rationale row (~line 525). |
 
 No `Hotspot`/`FnUnit` struct field is added. Snapshots (`*.snap`) are **not expected to churn** — their `summarize`/`summary` builders omit `id` — but Task 6 runs the full suite to confirm.
 
@@ -299,7 +299,7 @@ roll up), but adopts the same shape so ids don't vary by frontend."
 ## Task 4: Spec 001 amendment (docs)
 
 **Files:**
-- Modify: `specs/001-fxrank-rust-effect-scanner.md`
+- Modify: `docs/superpowers/specs/001-fxrank-rust-effect-scanner.md`
 
 - [ ] **Step 1: Amend the `id` paragraph (~line 252)**
 
@@ -312,7 +312,7 @@ Update the `id = path:line:symbol` text in that table row to `id = path:line:col
 - [ ] **Step 3: Commit**
 
 ```bash
-git add specs/001-fxrank-rust-effect-scanner.md
+git add docs/superpowers/specs/001-fxrank-rust-effect-scanner.md
 git commit -m "docs: amend spec 001 id format to path:line:col:symbol (per spec 005)"
 ```
 

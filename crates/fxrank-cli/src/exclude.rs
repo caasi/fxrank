@@ -1,7 +1,7 @@
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use std::collections::HashSet;
 
-/// Classifies and matches `--exclude` entries. See `specs/004-corpus-hygiene-excludes.md`.
+/// Classifies and matches `--exclude` entries. See `docs/superpowers/specs/004-corpus-hygiene-excludes.md`.
 ///
 /// Top-level split is on `/`; no-`/` entries are then split into literal vs wildcard:
 /// - **literal** (no `/`, no glob metachar): prunes a matching directory AND excludes

@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- **Spec is source of truth:** `specs/006-fxrank-python-frontend.md`. When code and spec disagree, the spec wins.
+- **Spec is source of truth:** `docs/superpowers/specs/006-fxrank-python-frontend.md`. When code and spec disagree, the spec wins.
 - **No new core vocabulary.** Every signal maps to an existing `EffectKind`/`RiskKind`. `fxrank-core` is NOT modified. Never hand-write wire strings — use `kind.wire()`.
 - **libcst dependency:** `libcst = { version = "1.8.6", default-features = false }`. The default `py` feature pulls PyO3 `extension-module` and breaks the binary — `default-features = false` is load-bearing.
 - **Primarily syntactic:** no `mypy`/`pyright`. Type-dependent signals are `Tier::Heuristic` and take a confidence penalty.

@@ -20,7 +20,7 @@ did in 0.1.1).
   `import` / `from … import` / `as` resolution (incl. function-local imports); and
   dynamic-code risk detection (`eval` / `exec` / `compile` / `pickle` /
   `subprocess(shell=True)` / …). Anonymous `lambda`s are collected and anchored as
-  `<lambda@LxCy>`. See `specs/006-fxrank-python-frontend.md`.
+  `<lambda@LxCy>`. See `docs/superpowers/specs/006-fxrank-python-frontend.md`.
 - **CLI / CI**: `.py` files route to the Python frontend; `--lang python` scans a
   Python fragment from stdin (`.pyi` stubs excluded). The `--exclude` default list
   gains Python corpus-hygiene entries (`.venv`, `venv`, `.tox`, `__pycache__`,
@@ -46,7 +46,7 @@ did in 0.1.1).
   `foo().then(() => {}).catch(() => {})`, nested JSX handlers, chained
   `.map()/.filter()/.find()`) collapsed to the same symbol fallback (`<arrow@L279>`)
   and therefore emitted an identical `id` — breaking addressability for any consumer
-  that keys hotspots by `id`. See `specs/005-hotspot-id-column.md`.
+  that keys hotspots by `id`. See `docs/superpowers/specs/005-hotspot-id-column.md`.
 
 ### Changed
 
@@ -70,7 +70,7 @@ did in 0.1.1).
 - The **containment discount**: `&mut`/`&self`/ownership make some effects *declared
   and bounded* (they score lower), while hidden interior mutability scores *higher*.
 - `--exclude` three-class matcher and a documented default skip list for vendored
-  bundles, Storybook stories, and test-support files (`specs/004`). Test code is
+  bundles, Storybook stories, and test-support files (`docs/superpowers/specs/004`). Test code is
   skipped by default (`--include-tests` to score it).
 - Slim, feature-gated builds (`--features rust`, `--features ts`).
 

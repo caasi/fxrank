@@ -15,7 +15,7 @@
 - All React/inherited effects are emitted `contained = false` (not boundary-discountable).
 - Every React signal is `Tier::Heuristic` and uses `detection_confidence(...)` for its confidence.
 - CI gates (run before every push): `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
-- Source of truth: `specs/007-react-aware-effect-detectors.md`. When code and spec disagree, the spec wins.
+- Source of truth: `docs/superpowers/specs/007-react-aware-effect-detectors.md`. When code and spec disagree, the spec wins.
 - Detectors stay pure (return `Vec<Effect>` / `Vec<(Effect, bool)>`); assembly lives in `detect::analyze_unit` and the new inheritance pass.
 
 ---

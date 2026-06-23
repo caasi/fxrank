@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust edition 2024; `serde`/`serde_json`; `syn` 2 (`full`, `visit`, `extra-traits`) + `proc-macro2` (`span-locations`); `clap` 4; `insta` (snapshots) + `assert_cmd`/`predicates` (CLI tests).
 
-Spec: `specs/001-fxrank-rust-effect-scanner.md` — the source of truth for every score, class, discount, and schema field. When this plan and the spec disagree, the spec wins; fix the plan.
+Spec: `docs/superpowers/specs/001-fxrank-rust-effect-scanner.md` — the source of truth for every score, class, discount, and schema field. When this plan and the spec disagree, the spec wins; fix the plan.
 
 ---
 

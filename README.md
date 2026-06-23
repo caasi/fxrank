@@ -190,7 +190,7 @@ blindly.** It only makes sense on hand-written, unminified source; the scores ar
 - **Confidence** reflects how much a signal relied on syntax-only heuristics (FxRank does
   no type inference); the function-level value is the weakest link.
 
-The full spec lives in [`specs/001-fxrank-rust-effect-scanner.md`](specs/001-fxrank-rust-effect-scanner.md).
+The full spec lives in [`docs/superpowers/specs/001-fxrank-rust-effect-scanner.md`](docs/superpowers/specs/001-fxrank-rust-effect-scanner.md).
 
 ## Status & roadmap
 

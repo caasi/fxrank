@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, `clap` (CLI), `globset` (BurntSushi/ripgrep glob engine, **new** dep in `fxrank-cli` only — core stays parser/dep-free), `serde`/`serde_json` (wire format), `assert_cmd`/`tempfile` (CLI integration tests).
 
-**Source of truth:** `specs/004-corpus-hygiene-excludes.md`. When this plan and the spec disagree, the spec wins — re-read it before changing matcher behavior.
+**Source of truth:** `docs/superpowers/specs/004-corpus-hygiene-excludes.md`. When this plan and the spec disagree, the spec wins — re-read it before changing matcher behavior.
 
 ---
 
@@ -204,7 +204,7 @@ Prepend the implementation to `crates/fxrank-cli/src/exclude.rs`:
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::HashSet;
 
-/// Classifies and matches `--exclude` entries. See `specs/004-corpus-hygiene-excludes.md`.
+/// Classifies and matches `--exclude` entries. See `docs/superpowers/specs/004-corpus-hygiene-excludes.md`.
 ///
 /// Top-level split is on `/`; no-`/` entries are then split into literal vs wildcard:
 /// - **literal** (no `/`, no glob metachar): prunes a matching directory AND excludes

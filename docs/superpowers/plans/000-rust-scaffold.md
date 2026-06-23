@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (edition 2024, stable channel), cargo built-in test harness, rustfmt, clippy, GitHub Actions.
 
-**Paired spec:** `specs/000-rust-scaffold.md`
+**Paired spec:** `docs/superpowers/specs/000-rust-scaffold.md`
 
 **Implementation note:** Per project rules, runtime code must NOT be committed to a primary branch — implement on a feature branch (ideally a worktree). The plan/spec docs themselves may live on the primary branch.
 
