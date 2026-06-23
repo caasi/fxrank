@@ -190,15 +190,23 @@ CLI → core::Report::build(scope, hotspots, diagnostics, limit)  → compact JS
   The discount touches only the mutation channel, never sibling effects.
 - **Centralize new vocabulary**: add effect kinds to `EffectKind` and risk kinds to
   `RiskKind` (both have `wire()` + class) — never hand-write wire strings at call sites.
-- **`--exclude` is a three-class matcher** (spec 004): a no-`/` literal prunes a
-  matching directory and excludes a matching file; a no-`/` glob (`*.min.js`,
-  `*.stories.*`) excludes files only (never prunes a same-named dir); a `/`-bearing
-  glob filters files by relative path. It **replaces** the default list when given.
-  The default skips vendored bundles, Storybook stories, `jest.setup`/`jest.config`,
-  `__mocks__`, and the MSW worker. Files dropped this way are counted in
-  `scope.skipped_excluded` (directory prunes are not counted — they are never read).
-  `--exclude` applies only to directory scans; an explicitly named file/stdin is
-  always scanned.
+- **`--exclude` is a three-class matcher** (spec 004, `fxrank_core::corpus::CorpusMatcher`):
+  a no-`/` literal prunes a matching directory and excludes a matching file; a no-`/` glob
+  (`*.min.js`, `*.stories.*`) excludes files only (never prunes a same-named dir); a
+  `/`-bearing glob filters files by relative path. It **replaces** the default glob list
+  when given. The **default is the union of the enabled frontends' `CorpusProfile`
+  constants** (`pub const CORPUS_PROFILE` in each `fxrank-lang-*` crate) plus a
+  language-neutral `.git` baseline (`CorpusProfile::COMMON`). In a full build this covers:
+  `target` (Rust), `node_modules`/`__mocks__`/minified bundles/stories/jest files (TS), and
+  `.venv`/`__pycache__`/build-artifact dirs/protobuf generated files (Python). A slim build
+  (`--features ts`) only includes what its enabled frontends declare. In addition, a
+  **content-marker prune** (`pyvenv.cfg` → prune that dir; from Python's profile, so present
+  whenever the `python` feature is compiled in) runs independently of `--exclude` and is
+  not disabled when `--exclude` is given. Files dropped by the
+  matcher are counted in `scope.skipped_excluded` (directory prunes and marker prunes are
+  not counted — they are never read). `--exclude` applies only to directory scans; an
+  explicitly named file/stdin is always scanned. See `docs/corpus-profile-guideline.md`
+  for the full per-language channel breakdown.
 - Tests use a shared `analyze_fixture(name)` helper reading `tests/fixtures/*.rs`
   (subdir — cargo does not compile those as test targets). Snapshot tests use `insta`.
 
