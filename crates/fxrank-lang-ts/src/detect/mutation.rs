@@ -220,6 +220,7 @@ impl<'a> MutationWalker<'a> {
         } else {
             // Captured outer/module binding — hidden from the signature.
             Classification::new(HiddenMutation, 3, false, true, Tier::Heuristic, "captured")
+                .with_subreason("captured-binding")
         }
     }
 }
@@ -760,5 +761,22 @@ mod tests {
             .expect("this[i] = 1 must escape to this.mutation");
         assert_eq!(e.0.effective_class(), 3);
         assert!(!e.1, "subscript write on this must be contained == false");
+    }
+
+    #[test]
+    fn captured_binding_write_has_captured_subreason() {
+        // F3: a captured outer-binding write (module-level `counter`, not local/param)
+        // is hidden.mutation/3 — and now carries subreason "captured-binding"
+        // (reporting only; class/kind unchanged).
+        let effects = detect_in("let counter = 0; function C(){ counter += 1; }");
+        let e = effects
+            .iter()
+            .find(|(e, _)| e.kind == EffectKind::HiddenMutation)
+            .expect("captured write must be hidden.mutation");
+        assert_eq!(e.0.effective_class(), 3);
+        assert!(e.0.hidden, "captured write stays hidden == true");
+        assert!(!e.1, "captured write stays contained == false");
+        assert_eq!(e.0.subreason.as_deref(), Some("captured-binding"));
+        assert_ne!(e.0.subreason.as_deref(), Some("ref-cell-write"));
     }
 }
