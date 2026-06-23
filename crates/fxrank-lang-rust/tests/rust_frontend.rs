@@ -1274,3 +1274,21 @@ fn unresolved_free_binding_write_is_hidden_mutation_class_3() {
     assert!(e.hidden, "an unresolved free-binding write is hidden");
     assert_eq!(e.tier, Tier::Heuristic);
 }
+
+// ── Spec 008 F5: import-resolved write base → global.mutation ────────────────
+#[test]
+fn import_resolved_write_base_is_global_mutation_class_6() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "writes_imported_base");
+    let e = one_kind(&effects, "global.mutation");
+    assert_eq!(
+        e.class, 6,
+        "import-resolved write is global.mutation class 6"
+    );
+    assert_eq!(e.tier, Tier::Heuristic);
+    assert!(
+        e.evidence.contains("imported_cell"),
+        "evidence names the imported base, got: {}",
+        e.evidence
+    );
+}

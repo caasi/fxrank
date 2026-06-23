@@ -66,8 +66,6 @@ struct MutationWalker<'a> {
     /// File-level real `static` item names (`static`/`static mut`/atomics/…).
     statics: &'a HashSet<String>,
     /// The `use`-table, for resolving a write base through an import.
-    /// Stored for R3–R5; not yet consumed in R2.
-    #[allow(dead_code)]
     imports: &'a ImportTable,
     effects: Vec<Effect>,
 }
@@ -202,6 +200,17 @@ impl<'a> MutationWalker<'a> {
                 false,
                 line,
                 format!("write to global {base}"),
+            );
+        } else if !self.locals.contains(&base) && self.imports.resolve(&base).is_some() {
+            // 008-F5: the base resolves through the `use`-table — module-external
+            // ambient state → global.mutation. Near-vacuous for Rust; implemented
+            // for symmetry with the TS/Python frontends.
+            self.push_plain(
+                EffectKind::GlobalMutation,
+                Tier::Heuristic,
+                false,
+                line,
+                format!("write to imported {base}"),
             );
         } else if !self.locals.contains(&base) {
             // 008-F1: the base resolves to no local/param/self/static binding —

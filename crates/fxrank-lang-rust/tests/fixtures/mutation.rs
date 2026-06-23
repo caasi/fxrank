@@ -123,3 +123,11 @@ fn write_unbound_upper() {
 fn writes_unresolved_free_binding() {
     external_thing.field = 1;
 }
+
+// 008-F5: `imported_cell` is brought in by a `use`. A write whose base resolves
+// through the ImportTable is module-external ambient state → global.mutation/6.
+// Contrived: in real Rust a `use` names a type/fn, so this path is near-vacuous.
+use some_crate::imported_cell;
+fn writes_imported_base() {
+    imported_cell.field = 1;
+}
