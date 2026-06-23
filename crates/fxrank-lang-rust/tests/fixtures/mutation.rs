@@ -116,3 +116,10 @@ fn store_atomic_static() {
 fn write_unbound_upper() {
     UNBOUND_THING.field = 1;
 }
+
+// 008-F1: `external_thing` is bound nowhere in this fn (no let/param/self) and is
+// NOT a file-level static. A write to it is an unresolved free binding → the
+// cascade tail emits hidden.mutation (class 3, hidden).
+fn writes_unresolved_free_binding() {
+    external_thing.field = 1;
+}

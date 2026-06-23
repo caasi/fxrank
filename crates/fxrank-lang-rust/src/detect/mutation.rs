@@ -203,6 +203,17 @@ impl<'a> MutationWalker<'a> {
                 line,
                 format!("write to global {base}"),
             );
+        } else if !self.locals.contains(&base) {
+            // 008-F1: the base resolves to no local/param/self/static binding —
+            // a write to a captured/unresolved outer binding, hidden from this
+            // signature → hidden.mutation (class 3, hidden). TS parity.
+            self.push_plain(
+                EffectKind::HiddenMutation,
+                Tier::Heuristic,
+                true,
+                line,
+                format!("write to captured binding {base}"),
+            );
         }
     }
 }

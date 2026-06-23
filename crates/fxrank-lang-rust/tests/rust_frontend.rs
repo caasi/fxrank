@@ -1262,3 +1262,15 @@ fn mutation_detect_accepts_statics_and_imports() {
         "local write still detected after signature change"
     );
 }
+
+// ── Spec 008 F1: unresolved free-binding write → hidden.mutation ─────────────
+#[test]
+fn unresolved_free_binding_write_is_hidden_mutation_class_3() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "writes_unresolved_free_binding");
+    let e = one_kind(&effects, "hidden.mutation");
+    assert_eq!(e.class, 3, "hidden.mutation is class 3");
+    assert_eq!(e.discounted_to, None, "hidden mutation is never discounted");
+    assert!(e.hidden, "an unresolved free-binding write is hidden");
+    assert_eq!(e.tier, Tier::Heuristic);
+}
