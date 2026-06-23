@@ -17,8 +17,9 @@
 //! - an interior-mutability mutator (`borrow_mut`, `set`, …) on a `shared_refs`
 //!   base → `hidden.mutation` (class 3, hidden, no discount).
 //! - base in `let_mut` → `local.mutation` (class 1, exact).
-//! - base is an UPPERCASE ident bound nowhere → `global.mutation` (class 6,
-//!   heuristic — the SCREAMING_SNAKE convention is our proxy for a `static mut`).
+//! - base is a file-level `static` item (not a local/param) → `global.mutation`
+//!   (class 6, heuristic — written by assignment, a mutating method, or an
+//!   interior-mutability mutator like `.store()` on an atomic static).
 //!
 //! The discount is *cancelled* when the write sits inside an `unsafe` block (or
 //! an `unsafe fn`): an `&mut` reborrow under `unsafe` may alias, so the channel
@@ -63,22 +64,16 @@ struct MutationWalker<'a> {
     /// True for the whole body when the fn itself is `unsafe`.
     unsafe_fn: bool,
     /// File-level real `static` item names (`static`/`static mut`/atomics/…).
-    /// Stored for R2–R5; not yet consumed in R1.
-    #[allow(dead_code)]
     statics: &'a HashSet<String>,
     /// The `use`-table, for resolving a write base through an import.
-    /// Stored for R2–R5; not yet consumed in R1.
+    /// Stored for R3–R5; not yet consumed in R2.
     #[allow(dead_code)]
     imports: &'a ImportTable,
     effects: Vec<Effect>,
 }
 
 impl<'a> MutationWalker<'a> {
-    fn seed(
-        sig: &syn::Signature,
-        statics: &'a HashSet<String>,
-        imports: &'a ImportTable,
-    ) -> Self {
+    fn seed(sig: &syn::Signature, statics: &'a HashSet<String>, imports: &'a ImportTable) -> Self {
         let mut w = MutationWalker {
             mut_params: HashSet::new(),
             mut_self: false,
@@ -196,12 +191,11 @@ impl<'a> MutationWalker<'a> {
                 line,
                 format!("write to local {base}"),
             );
-        } else if !self.locals.contains(&base) && is_screaming_snake(&base) {
-            // HEURISTIC: a write to an ident bound in no local/param/let-mut set
-            // that follows SCREAMING_SNAKE_CASE is taken as a `static mut` write.
-            // We don't thread the file-level `static` set into this detector, so
-            // the UPPERCASE convention is the proxy. The class-4 module-private
-            // downgrade is DEFERRED per spec — always class 6.
+        } else if !self.locals.contains(&base) && self.statics.contains(&base) {
+            // F2: base is bound in no local/param/let-mut set but IS a file-level
+            // `static` — a real static write (direct/compound assignment, or a
+            // mutating method like `STATIC_VEC.push`). Class-4 module-private
+            // downgrade DEFERRED per spec — always class 6.
             self.push_plain(
                 EffectKind::GlobalMutation,
                 Tier::Heuristic,
@@ -256,15 +250,6 @@ fn collect_pat_bindings(pat: &syn::Pat, out: &mut Vec<(String, bool)>) {
     }
 }
 
-/// SCREAMING_SNAKE_CASE: all-uppercase with only letters, digits, underscores,
-/// and at least one letter (so a bare `_` or `1` is not mistaken for a const).
-fn is_screaming_snake(name: &str) -> bool {
-    name.chars().any(|c| c.is_ascii_uppercase())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-}
-
 /// Mutating methods whose receiver-base we treat as a write target.
 /// Conservative collection-mutation set; receiver type is unknown, so heuristic.
 fn is_mutating_method(name: &str) -> bool {
@@ -313,13 +298,14 @@ impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
         let method = node.method.to_string();
         let line = node.span().start().line;
         if is_interior_mutator(&method) {
-            // Hidden mutation: an interior-mutability mutator on a shared `&`
-            // base (a `&T` param, or `self` when the receiver is `&self`).
             let base = base_ident(&node.receiver);
             if base
                 .as_deref()
                 .is_some_and(|b| self.shared_refs.contains(b))
             {
+                // Hidden mutation through a shared `&` base (`&T` param, or `self`
+                // when the receiver is `&self`). Checked FIRST so the anti-Goodhart
+                // `&self` interior-mut case stays `hidden`.
                 let base = base.expect("checked Some above");
                 self.push_plain(
                     EffectKind::HiddenMutation,
@@ -327,6 +313,20 @@ impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
                     true,
                     line,
                     format!(".{method} on shared &{base}"),
+                );
+            } else if base.as_deref().is_some_and(|b| self.statics.contains(b)) {
+                // F2: the receiver base is a file-level static written via an
+                // interior-mutability mutator (`.store()`/`.swap()`/`.fetch_*` on an
+                // atomic, `.set()` on a Cell/OnceLock, `.borrow_mut()` on a RefCell)
+                // → global.mutation, class 6. (Mutex/RwLock `.lock()` is NOT in
+                // is_interior_mutator and is not caught — see the task note.)
+                let base = base.expect("checked Some above");
+                self.push_plain(
+                    EffectKind::GlobalMutation,
+                    Tier::Heuristic,
+                    false,
+                    line,
+                    format!("interior write to global {base} via .{method}"),
                 );
             }
         } else if is_mutating_method(&method) {

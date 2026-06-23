@@ -438,17 +438,67 @@ fn let_mut_writes_are_two_local_mutations_class_1_exact() {
 
 // ── Task 13d: global.mutation detection (class 6) ───────────────────────────
 
+// ── Task R2 (F2): real-static write → global.mutation (class 6) ───────────────
+/// A *lowercase* `static mut` written by direct assignment is global.mutation/6
+/// (casing-independent; the old proxy rejected the lowercase base).
 #[test]
-fn screaming_snake_write_is_global_mutation_class_6() {
+fn lowercase_static_mut_assign_is_global_mutation_class_6() {
     let out = analyze_fixture("mutation.rs");
-    let effects = effects_of(&out, "inc");
+    let effects = effects_of(&out, "write_lower_static_mut");
     let e = one_kind(&effects, "global.mutation");
     assert_eq!(
         e.class, 6,
         "global.mutation is class 6 (no class-4 downgrade)"
     );
-    assert_eq!(e.tier, Tier::Heuristic, "UPPERCASE proxy is heuristic");
+    assert_eq!(e.tier, Tier::Heuristic, "static write-through is heuristic");
+    assert_eq!(e.discounted_to, None, "global.mutation is never discounted");
+    assert!(!e.hidden, "a global static write is not hidden");
+}
+
+/// An interior-mutable plain `static` written via `.store()` is global.mutation/6
+/// (the interior-mutator emission site: a static base, not a shared_refs member).
+#[test]
+fn atomic_static_store_is_global_mutation_class_6() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "store_atomic_static");
+    let e = one_kind(&effects, "global.mutation");
+    assert_eq!(e.class, 6);
+    assert_eq!(e.tier, Tier::Heuristic);
     assert_eq!(e.discounted_to, None);
+    assert!(
+        effects.iter().all(|e| e.kind.wire() != "hidden.mutation"),
+        "atomic static .store() is global, not hidden"
+    );
+}
+
+/// An UPPERCASE ident bound nowhere and NOT a static must NOT be global.mutation
+/// (the proxy-retirement discriminator: the old casing heuristic flagged it).
+#[test]
+fn unbound_uppercase_non_static_is_not_global_mutation() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "write_unbound_upper");
+    assert!(
+        effects.iter().all(|e| e.kind.wire() != "global.mutation"),
+        "an UPPERCASE non-static base must not be global.mutation, got: {:?}",
+        effects.iter().map(|e| e.kind.wire()).collect::<Vec<_>>()
+    );
+}
+
+/// Regression (anti-Goodhart): a `&self` interior mutation stays hidden.mutation,
+/// NOT global.mutation, after the static rewiring (`self` is in shared_refs,
+/// checked first). Uses the existing interior-mut fixture/symbol.
+#[test]
+fn self_interior_mutation_stays_hidden_not_global() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "User::set");
+    assert!(
+        effects.iter().any(|e| e.kind.wire() == "hidden.mutation"),
+        "User::set must still emit hidden.mutation"
+    );
+    assert!(
+        effects.iter().all(|e| e.kind.wire() != "global.mutation"),
+        "User::set must NOT emit global.mutation (shared_refs checked before statics)"
+    );
 }
 
 // ── Task 13e: lexical unsafe-cancel ─────────────────────────────────────────

@@ -89,3 +89,30 @@ fn destructured_mut_param((mut a, b): &mut (i32, i32)) {
     *a = 1;
     let _ = b;
 }
+
+// R2 (F2): a *lowercase* `static mut` written by direct assignment. Proves the
+// real-static detection is casing-INDEPENDENT (pre-fix `is_screaming_snake`
+// rejects the lowercase base → dropped → no global.mutation).
+static mut counter_cell: u32 = 0;
+fn write_lower_static_mut() {
+    unsafe {
+        counter_cell = 1;
+    }
+}
+
+// R2 (F2): a plain `static` of interior-mutable type written via `.store()`. The
+// write routes through the interior-mutator branch of visit_expr_method_call, NOT
+// record_write. Pre-fix that branch only fires for `shared_refs` bases, so an
+// atomic static base is dropped → no global.mutation.
+use std::sync::atomic::{AtomicU32, Ordering};
+static HITS: AtomicU32 = AtomicU32::new(0);
+fn store_atomic_static() {
+    HITS.store(1, Ordering::Relaxed);
+}
+
+// R2 (F2): an UPPERCASE base bound NOWHERE and NOT a file-level static — the real
+// proxy-retirement discriminator. Pre-fix `is_screaming_snake("UNBOUND_THING")` is
+// true → wrongly emits global.mutation. Post-fix it is not in `statics` → dropped.
+fn write_unbound_upper() {
+    UNBOUND_THING.field = 1;
+}
