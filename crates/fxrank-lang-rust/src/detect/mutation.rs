@@ -20,6 +20,10 @@
 //! - base is a file-level `static` item (not a local/param) → `global.mutation`
 //!   (class 6, heuristic — written by assignment, a mutating method, or an
 //!   interior-mutability mutator like `.store()` on an atomic static).
+//! - base (other than `self`) resolves through the `use`-table → `global.mutation`
+//!   (class 6, heuristic; near-vacuous in Rust — a `use` names a type/fn path).
+//! - any remaining unresolved base (other than `self`) → `hidden.mutation`
+//!   (class 3, hidden, subreason `captured-binding` — a captured/opaque write).
 //!
 //! The discount is *cancelled* when the write sits inside an `unsafe` block (or
 //! an `unsafe fn`): an `&mut` reborrow under `unsafe` may alias, so the channel
