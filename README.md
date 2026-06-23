@@ -27,6 +27,12 @@ sneaky `&self` + `borrow_mut()` one. That anti-Goodhart inversion is the whole t
 TS/JS frontend applies an analogous **boundary discount** driven by how much of a
 function's signature is typed — an `any` at the boundary poisons it.
 
+All three frontends — Rust, TS/JS, and Python — classify mutation against **one canonical
+model**: the same effect kinds and classes, the same anti-Goodhart inversion, and a shared
+`hidden.mutation` subreason vocabulary, while keeping each language's honest differences. The
+shared model and those intentional differences are documented in
+[`docs/mutation-classification-guideline.md`](docs/mutation-classification-guideline.md).
+
 ## Install
 
 Requires a stable Rust toolchain (edition 2024, Rust ≥ 1.85). If you don't have one,
@@ -191,7 +197,10 @@ The full spec lives in [`specs/001-fxrank-rust-effect-scanner.md`](specs/001-fxr
 **Milestone A:** a primarily-syntactic analyzer — effect & risk detection, the containment
 discount, the hidden-mutation inversion, async/confidence metadata, diagnostics, and the
 `fxrank scan` CLI. Ships **three frontends**: Rust (`syn`), TypeScript/JavaScript (`swc`),
-and Python (`libcst`), each syntactic (no type-checker or borrow-checker).
+and Python (`libcst`), each syntactic (no type-checker or borrow-checker). Mutation
+classification is **aligned across all three frontends** (spec 008): real `static`/import
+facts are threaded into detection, and captured/unresolved, global, and constructor-init
+writes are classified consistently — see the guideline above.
 
 Known limitations (accepted for Milestone A): own-score only (no call-graph propagation, so
 extract-method can launder a score); type-dependent signals are heuristic; macro-generated

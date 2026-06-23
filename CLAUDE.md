@@ -251,8 +251,9 @@ families. The `tests/fixtures/react/` acceptance fixtures validate each family e
   `.current` is written in the component body is detected as `hidden.mutation` (class 3)
   with `subreason: "ref-cell-write"` and `hidden: true`. The mutation walker's
   `ref_bindings` set is seeded at collection time, so the write is correctly distinguished
-  from a plain captured-outer-binding write (which also becomes `hidden.mutation` class 3
-  but with no subreason). For writes inside absorbed hook callbacks the owning component's
+  from a plain captured-outer-binding write (also `hidden.mutation` class 3, but with
+  `subreason: "captured-binding"` since spec 008 — see *Cross-language mutation alignment*
+  below). For writes inside absorbed hook callbacks the owning component's
   `ref_bindings` are threaded via `extra_refs` (see `detect::raw_signals`).
 
 - **`StateTransition`** (`counter.tsx`): every `const [v, setV] = useState(…)` declaration
@@ -276,12 +277,49 @@ families. The `tests/fixtures/react/` acceptance fixtures validate each family e
 - Namespace `React.useEffect(…)`, `React.useState(…)`, etc.: the hook recognizers match
   bare callee identifiers only; qualified `React.*` forms are an accepted miss.
 
+## Cross-language mutation alignment (spec 008)
+
+The three `detect/mutation.rs` mutation detectors (Rust/TS/Python) are **aligned to one
+canonical model**: the same write *concept* produces the same `EffectKind`/class/`contained`/
+`hidden` across frontends, with a consistent `hidden.mutation` subreason vocabulary —
+`interior-mut` (interior mutability through a shared `&`/receiver), `captured-binding`
+(a captured/unresolved base), `ref-cell-write` (TS `useRef().current`). The descriptive
+**source of truth is `docs/mutation-classification-guideline.md`** (the shared model + the
+intentional per-language differences that are *kept*, not unified).
+
+Each frontend keeps its **own native walk** — there is no shared classifier crate. What changed:
+the real file-level **`static` set** and the **`ImportTable`** are now threaded into
+`mutation::detect` (Rust gets both; Python gets imports), and the classification cascade consults
+them. Concretely (the F1–F5 of spec 008):
+- **F1** — a captured/unresolved base (none of own-local/param/receiver/static/import) →
+  `hidden.mutation`/3/`captured-binding` in all three (this is **Python's first `HiddenMutation`**;
+  before, Python silently emitted nothing — a false purity).
+- **F2** — Rust scores a write to a **real `static`** (incl. `static mut` and interior-mutable
+  atomics via `.store()`) as `global.mutation`/6 by the actual static-name set; the old
+  `SCREAMING_SNAKE_CASE` proxy is **retired** (no more UPPERCASE-local false positives).
+- **F5** — a write whose base resolves through the import table → `global.mutation`/6 (Python/Rust;
+  near-vacuous for Rust). Guard: a misattributed `self` base (e.g. from `use m::{self, …}` putting
+  `self` in the import table) is **not** globalized — it's dropped.
+- **F4** — in a TS/Python constructor only a **direct** field-init (`this.x = …` / `self.attr = …`,
+  a plain `=`) stays contained `local.mutation`/1; method/subscript/compound/update writes on the
+  receiver (`this.x.push()`, `this[i]=`, `this.x += 1`, `this.x++`) escape to `this.mutation`/3.
+- **Honest differences kept** (do not "fix"): Rust mut-channel discount vs TS/Python typed-boundary
+  discount; Python `nonlocal`→`this.mutation`/Exact; plain rebind (Python no-emit vs TS/Rust
+  `local.mutation`); per-language mutating-method allowlists.
+
+**Known remaining gap → issue #29:** a TS **module-top-level** binding that is *not* an import
+(a bare `const sharedMap`/`let shared`) written from a function still lands in the `hidden.mutation`
+catch-all rather than `global.mutation`/6. #29 is now a small, well-patterned task — the direct
+analog of F2 (thread a `module_bindings` set, add a `global` arm before the hidden tail).
+
 ## Design artifacts & workflow
 
 Specs live in `specs/`, implementation plans in `plans/`, with matching 3-digit prefixes
 (`specs/001-*` ↔ `plans/001-*`). `specs/001-fxrank-rust-effect-scanner.md` is the
 source of truth for every score, class, discount, and schema field — **read it before
-changing scoring behavior**; when code and spec disagree, the spec wins. Its *Known
+changing scoring behavior**; when code and spec disagree, the spec wins. (For mutation
+classification specifically, `specs/008-cross-language-mutation-alignment.md` + the guideline
+above govern the cross-frontend behavior.) Its *Known
 Limitations* section records the accepted deferrals (call-graph propagation /
 `inherited_score`, FFI call-site detection, `global.mutation` class-4 downgrade, and a
 full semantic/type-resolution pass).
