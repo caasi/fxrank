@@ -18,6 +18,7 @@
 - **KEEP behaviors must stay byte-identical** (spec §2 honest differences): Rust mut-channel discount + unsafe-cancel; TS/Python typed-boundary discount; Python `global`→`global.mutation`/Exact and `nonlocal`→`this.mutation`/Exact/not-hidden; `self.attr=` in `__init__`→`local.mutation`/contained vs `self.x.append()`→`this.mutation`; plain bare-name rebind (Python no-emit / TS+Rust `local.mutation`); per-language mutating-method allowlists; destructuring-target drops.
 - **`hidden.mutation` subreason vocabulary (consistent across frontends):** `"interior-mut"` (Rust interior-mutability), `"captured-binding"` (the captured/unresolved fallback — all three frontends), `"ref-cell-write"` (TS `useRef().current` — unchanged).
 - **Canonical effect facts (the alignment targets):** `local.mutation`=class 1/contained; `param.mutation`=class 3; `this.mutation`=class 3; `global.mutation`=class 6; `hidden.mutation`=class 3/hidden. (From `fxrank-core/src/effect.rs`.)
+- **Running specific tests:** `cargo test` takes a **single** filter positional. Where a step lists several test names, run them via a shared-substring filter when one exists (e.g. `cargo test -p fxrank-lang-ts ctor_`) or run the whole package (`cargo test -p <pkg>`) — the listed names are the tests that must **fail** (RED) or **pass** (GREEN); confirm each in the output. Do not pass multiple bare filters in one `cargo test` invocation.
 
 **Task order:** Rust (R1–R5) → Python (P1–P4) → TS (T1–T2) → Conformance (C) → Dogfood (D) → Guideline (G). The three frontend sections are independent (separate crates/commits) and may be done in any order; the guideline is written last so it documents the *realized* behavior (this reorders spec §8, which listed the guideline first — intentional: a descriptive doc should reflect what shipped).
 
@@ -147,14 +148,22 @@ In `detect/mod.rs`, change `gather` line 93 from `effects.extend(mutation::detec
 
 > **Replaces** the existing test `screaming_snake_write_is_global_mutation_class_6` (in
 > `tests/rust_frontend.rs`), which asserted the casing proxy. **`collect_static_names` (lib.rs)
-> already collects ALL `static` items** — it matches `syn::Item::Static(_)` unconditionally, so
+> collects all *top-level/file-level* `static` items** — it matches `syn::Item::Static(_)`, so
 > both `static mut X` and a plain `static X: AtomicU32` are in the set; no extension needed.
+> (It does **not** recurse into inline `mod { … }` blocks, so a `static` declared inside a nested
+> inline module is not collected — an accepted edge-case gap, same as the `statics` set already
+> used by `calls::detect`.)
 > **F2 has two emission sites:** (1) `record_write`'s cascade for *assignment / mutating-method*
 > writes to a static, and (2) the **interior-mutator branch** of `visit_expr_method_call` for an
-> *interior-mutable* static (atomic / `Mutex`) written via `.store()`/`.lock()` — which never
-> reaches `record_write`. `shared_refs` is checked **before** `statics` so the anti-Goodhart
-> `&self` interior-mut case stays `hidden.mutation`. No committed `.snap` changes (snapshots
-> analyze only `worked_cases.rs`, which has no static writes).
+> *interior-mutable* static written via an `is_interior_mutator` method — which never reaches
+> `record_write`. That method set is `{borrow_mut, set, replace, store, swap, fetch_*}`, so it
+> catches **atomics** (`.store()`/`.swap()`/`.fetch_*`), **`Cell`/`OnceLock`** (`.set()`),
+> **`RefCell`** (`.borrow_mut()`). It does **NOT** catch `Mutex`/`RwLock` via `.lock()`/`.read()`/
+> `.write()` (`lock`/`read`/`write` are not in `is_interior_mutator`) — those statics remain
+> uncaught; **expanding `is_interior_mutator` is out of scope here** because it would also change
+> the `&self` hidden-mutation behavior. `shared_refs` is checked **before** `statics` so the
+> anti-Goodhart `&self` interior-mut case stays `hidden.mutation`. No committed `.snap` changes
+> (snapshots analyze only `worked_cases.rs`, which has no static writes).
 
 **Files:**
 - Modify: `crates/fxrank-lang-rust/src/detect/mutation.rs` (`record_write` static arm; the `is_interior_mutator` branch of `visit_expr_method_call`; delete `is_screaming_snake`; module doc)
@@ -263,7 +272,7 @@ fn self_interior_mutation_stays_hidden_not_global() {
 > Adjust `"User::set"` to whatever symbol the existing `&self` interior-mutability fixture uses
 > in `tests/fixtures/mutation.rs` (the one the canary `hidden_mutation_scores_higher_than_declared_mut_self` exercises).
 
-- [ ] **Step 2: Run, verify RED** — `cargo test -p fxrank-lang-rust lowercase_static_mut_assign_is_global_mutation_class_6 atomic_static_store_is_global_mutation_class_6 unbound_uppercase_non_static_is_not_global_mutation`. Expected: the two `*_is_global_mutation_class_6` tests fail with `expected exactly one global.mutation effect, got []` (lowercase rejected by the proxy; atomic base not in `shared_refs`); `unbound_uppercase_non_static…` fails because `is_screaming_snake("UNBOUND_THING")` is true → a spurious `global.mutation` IS present. (`self_interior_mutation_stays_hidden_not_global` passes already — canary baseline.)
+- [ ] **Step 2: Run, verify RED** — `cargo test -p fxrank-lang-rust` (whole package). Expected: the two `*_is_global_mutation_class_6` tests fail with `expected exactly one global.mutation effect, got []` (lowercase rejected by the proxy; atomic base not in `shared_refs`); `unbound_uppercase_non_static_is_not_global_mutation` fails because `is_screaming_snake("UNBOUND_THING")` is true → a spurious `global.mutation` IS present. (`self_interior_mutation_stays_hidden_not_global` passes already — canary baseline.)
 
 - [ ] **Step 3: Implement — site 1 (`record_write` cascade)** — replace the `is_screaming_snake` arm:
 
@@ -301,9 +310,11 @@ fn self_interior_mutation_stays_hidden_not_global() {
                     format!(".{method} on shared &{base}"),
                 );
             } else if base.as_deref().is_some_and(|b| self.statics.contains(b)) {
-                // F2: the receiver base is a file-level interior-mutable `static`
-                // (atomic / `Mutex` / `OnceLock` / `RwLock`) written via `.store()` /
-                // `.lock()` / etc. → global.mutation, class 6.
+                // F2: the receiver base is a file-level static written via an
+                // interior-mutability mutator (`.store()`/`.swap()`/`.fetch_*` on an
+                // atomic, `.set()` on a Cell/OnceLock, `.borrow_mut()` on a RefCell)
+                // → global.mutation, class 6. (Mutex/RwLock `.lock()` is NOT in
+                // is_interior_mutator and is not caught — see the task note.)
                 let base = base.expect("checked Some above");
                 self.push_plain(
                     EffectKind::GlobalMutation,
@@ -328,7 +339,7 @@ fn self_interior_mutation_stays_hidden_not_global() {
 
 (R3 replaces the cascade fall-through; for now a non-local non-static base is still dropped.)
 
-- [ ] **Step 6: Run, verify GREEN** — `cargo test -p fxrank-lang-rust lowercase_static_mut_assign_is_global_mutation_class_6 atomic_static_store_is_global_mutation_class_6 unbound_uppercase_non_static_is_not_global_mutation self_interior_mutation_stays_hidden_not_global` (all pass), then `cargo test -p fxrank-lang-rust` (full crate — esp. the canary `hidden_mutation_scores_higher_than_declared_mut_self`).
+- [ ] **Step 6: Run, verify GREEN** — `cargo test -p fxrank-lang-rust` (whole crate). Expected: all four new tests pass (`lowercase_static_mut_assign_…`, `atomic_static_store_…`, `unbound_uppercase_non_static_…`, `self_interior_mutation_stays_hidden_not_global`) **and** the canary `hidden_mutation_scores_higher_than_declared_mut_self` still passes.
 - [ ] **Step 7: Snapshot review** — `cargo insta test -p fxrank-lang-rust --review`. Expected: **no pending** (snapshots use `worked_cases.rs`, untouched).
 - [ ] **Step 8: Clippy + fmt** — `cargo clippy -p fxrank-lang-rust --all-targets -- -D warnings && cargo fmt --check` (confirms `is_screaming_snake` is fully removed, not orphaned).
 - [ ] **Step 9: Commit** — `git commit -m "feat(rust): F2 — real-static (incl. atomic) writes → global.mutation/6, retire SCREAMING_SNAKE proxy"`
@@ -1046,7 +1057,7 @@ fn strip_place_wrappers(expr: &Expr) -> &Expr {
 
 - [ ] **Step 1: Confirm the per-frontend parity tests exist and name the same canonical facts.** Verify these tests are present and green (added in R/P/T):
   - F1 captured→`hidden.mutation`/3/hidden: Rust `unresolved_free_binding_write_is_hidden_mutation_class_3`, TS `captured_binding_write_has_captured_subreason`, Python `captured_binding_subreason_is_set`.
-  - F2 real-static→`global.mutation`/6 + UPPERCASE-local NOT global: Rust `lowercase_static_store_is_global_mutation_class_6`, `uppercase_non_static_write_is_not_global_mutation`.
+  - F2 real-static→`global.mutation`/6 + UPPERCASE-non-static NOT global: Rust `lowercase_static_mut_assign_is_global_mutation_class_6`, `atomic_static_store_is_global_mutation_class_6`, `unbound_uppercase_non_static_is_not_global_mutation`, `self_interior_mutation_stays_hidden_not_global`.
   - F4 ctor direct vs method/subscript: TS `ctor_direct_field_init_stays_local_mutation`, `ctor_method_call_on_this_escapes_to_this_mutation`, `ctor_subscript_write_on_this_escapes_to_this_mutation` (Python reference: `self_method_and_subscript_mutations_escape_even_in_init`).
   - F5 import→`global.mutation`/6: Rust `import_resolved_write_base_is_global_mutation_class_6`, Python `import_rooted_write_is_global_mutation`.
   - Run them per package (cargo accepts only **one** filter substring per invocation):
@@ -1089,7 +1100,7 @@ fn strip_place_wrappers(expr: &Expr) -> &Expr {
   cargo run -p fxrank -- scan crates/ | jq '.hotspots[] | {id, own_score}' > /tmp/008-rust-after.json
   diff <(jq -S . /tmp/008-rust-before.json) <(jq -S . /tmp/008-rust-after.json) || true
   ```
-  Expected: the only deltas are the intended ones — Python functions gaining `hidden`/`global` effects (were pure); Rust **unresolved UPPERCASE non-static bases** moving `global`→`hidden` (uppercase *locals* stay `local.mutation`) and real statics (incl. atomic/`Mutex`) now caught as `global`; TS constructor method/subscript writes moving `local`→`this.mutation`. **No unexplained movement.**
+  Expected: the only deltas are the intended ones — Python functions gaining `hidden`/`global` effects (were pure); Rust **unresolved UPPERCASE non-static bases** moving `global`→`hidden` (uppercase *locals* stay `local.mutation`) and real statics now caught as `global` (incl. atomics via `.store()` etc.; **not** `Mutex`/`RwLock` `.lock()`, which `is_interior_mutator` does not cover); TS constructor method/subscript writes moving `local`→`this.mutation`. **No unexplained movement.**
 
 - [ ] **Step 3: Write `docs/008-dogfood-deltas.md`** — a short bullet list: for each frontend, the functions whose ranking moved and which F-number caused it. If any movement is unexplained, **stop** — it is a bug, not a delta; fix the responsible task before proceeding.
 
