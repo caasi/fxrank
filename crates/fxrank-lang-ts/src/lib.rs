@@ -9,8 +9,29 @@ pub mod source;
 
 use std::collections::{HashMap, HashSet};
 
+use fxrank_core::CorpusProfile;
 use fxrank_core::frontend::{Frontend, FrontendOutput, Language, SourceFile};
 use fxrank_core::model::{Diagnostic, Hotspot};
+
+/// TypeScript/JavaScript corpus hygiene.
+///
+/// `__mocks__` is a directory → placed in `prune_dirs` (channel honesty).
+/// Behaviorally identical under the flat union — a bare literal prunes+excludes
+/// either way — but this keeps `exclude_file_globs` = "things that never prune a dir".
+pub const CORPUS_PROFILE: CorpusProfile = CorpusProfile {
+    prune_dirs: &["node_modules", "__mocks__"],
+    exclude_file_globs: &[
+        "*.min.js",
+        "*.min.mjs",
+        "*.min.cjs",
+        "*.stories.*",
+        "mockServiceWorker.js",
+        "jest.setup.*",
+        "jest.config.*",
+    ],
+    test_file_globs: &["*.test.*", "*.spec.*", "__tests__"],
+    prune_marker_files: &[],
+};
 
 use crate::functions::FnUnit;
 use crate::imports::ImportTable;
@@ -41,6 +62,10 @@ pub struct TsFrontend {
 impl Frontend for TsFrontend {
     fn language(&self) -> Language {
         Language::Ts
+    }
+
+    fn corpus_profile(&self) -> CorpusProfile {
+        CORPUS_PROFILE
     }
 
     fn analyze(&self, files: &[SourceFile]) -> FrontendOutput {
@@ -163,21 +188,50 @@ fn analyze_units(
 
 /// Return `true` if `path` identifies a test file by convention.
 ///
-/// A file is a test file when:
-/// - the file name contains `.test.` or `.spec.` (e.g. `foo.test.ts`, `bar.spec.tsx`), OR
-/// - any path segment is exactly `__tests__` (e.g. `src/__tests__/foo.ts`).
+/// Delegates to a `CorpusMatcher` built from `CORPUS_PROFILE.test_file_globs`:
+/// - `*.test.*` / `*.spec.*` match by base-name glob (e.g. `foo.test.ts`), OR
+/// - `__tests__` as a bare literal matches any path segment (e.g. `src/__tests__/foo.ts`).
 ///
 /// Only these two well-established JS/TS conventions are checked. Stdin
 /// (`"stdin"`) and ordinary `.ts`/`.js` files are never test files.
 pub fn is_test_file(path: &str) -> bool {
-    // Use the file name only for the infix check (avoid matching `.test.` in a
-    // directory component like `my.test.project/app.ts`). Split on both `/` and
-    // `\` so a Windows directory like `my.test.project\app.ts` isn't false-matched.
-    let file_name = path.split(['/', '\\']).next_back().unwrap_or(path);
-    if file_name.contains(".test.") || file_name.contains(".spec.") {
-        return true;
+    use std::sync::OnceLock;
+    static M: OnceLock<fxrank_core::CorpusMatcher> = OnceLock::new();
+    M.get_or_init(|| fxrank_core::CorpusMatcher::test_matcher(CORPUS_PROFILE.test_file_globs))
+        .matches_test_file(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corpus_profile_method_returns_const() {
+        use fxrank_core::frontend::Frontend;
+        let p = TsFrontend::default().corpus_profile();
+        assert_eq!(p.prune_dirs, CORPUS_PROFILE.prune_dirs);
+        assert_eq!(p.test_file_globs, CORPUS_PROFILE.test_file_globs);
     }
-    // Any path segment equal to `__tests__` marks the whole file as a test file.
-    // Split on both `/` and `\` to handle Windows paths (e.g. `src\__tests__\foo.ts`).
-    path.split(['/', '\\']).any(|seg| seg == "__tests__")
+
+    #[test]
+    fn is_test_file_characterization() {
+        for p in [
+            "a.test.ts",
+            "a.spec.tsx",
+            "x.b.test.js",
+            "src/__tests__/a.ts",
+            "a/__tests__/b/c.ts",
+        ] {
+            assert!(is_test_file(p), "expected test file: {p}");
+        }
+        for p in [
+            "app.ts",
+            "src/app.tsx",
+            "my.test.project/app.ts",
+            "testdata.ts",
+            "a.contest.ts",
+        ] {
+            assert!(!is_test_file(p), "expected NON-test file: {p}");
+        }
+    }
 }

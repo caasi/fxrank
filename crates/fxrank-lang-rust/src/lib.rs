@@ -4,10 +4,20 @@ pub mod detect;
 pub mod functions;
 pub mod imports;
 
+use fxrank_core::CorpusProfile;
 use fxrank_core::frontend::{Frontend, FrontendOutput, Language, SourceFile};
 use fxrank_core::model::Diagnostic;
 use imports::ImportTable;
 use std::collections::HashSet;
+
+/// Rust corpus hygiene. `target` is the build dir; unit tests are SOURCE-based
+/// (`#[test]`/`#[cfg(test)]`, handled in `analyze`), so no `test_file_globs`.
+pub const CORPUS_PROFILE: CorpusProfile = CorpusProfile {
+    prune_dirs: &["target"],
+    exclude_file_globs: &[],
+    test_file_globs: &[],
+    prune_marker_files: &[],
+};
 
 /// The Rust language frontend.
 ///
@@ -30,6 +40,10 @@ pub struct RustFrontend {
 impl Frontend for RustFrontend {
     fn language(&self) -> Language {
         Language::Rust
+    }
+
+    fn corpus_profile(&self) -> CorpusProfile {
+        CORPUS_PROFILE
     }
 
     fn analyze(&self, files: &[SourceFile]) -> FrontendOutput {
@@ -97,4 +111,20 @@ fn collect_static_names(file: &syn::File) -> HashSet<String> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corpus_profile_method_returns_const() {
+        use fxrank_core::frontend::Frontend;
+        let p = RustFrontend {
+            include_tests: false,
+        }
+        .corpus_profile();
+        assert_eq!(p.prune_dirs, CORPUS_PROFILE.prune_dirs);
+        assert_eq!(p.test_file_globs, CORPUS_PROFILE.test_file_globs);
+    }
 }
