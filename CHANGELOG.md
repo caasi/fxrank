@@ -31,7 +31,7 @@ rankings shift for affected code.
     (`this.x =` / `self.attr =`) stays contained `local.mutation`/1; method/subscript/compound/
     update writes on the receiver escape to `this.mutation`/3.
 
-- **Module top-level binding writes → `global.mutation` (class 6), cross-language** ([#29]).
+- **Module top-level binding writes → `global.mutation` (class 6), cross-language** ([#29], [#33]).
   A write to a module top-level binding now classifies as `global.mutation`/6 in every frontend —
   the "module var used for cross-component communication" anti-pattern — while a genuinely
   captured *enclosing-function* local stays `hidden.mutation`/3. Realizations: Rust via the real
@@ -121,3 +121,4 @@ rankings shift for affected code.
 [#14]: https://github.com/caasi/fxrank/issues/14
 [#29]: https://github.com/caasi/fxrank/issues/29
 [#32]: https://github.com/caasi/fxrank/pull/32
+[#33]: https://github.com/caasi/fxrank/pull/33
