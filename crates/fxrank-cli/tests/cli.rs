@@ -813,6 +813,79 @@ fn exclude_mixes_glob_literal_and_path_glob() {
     );
 }
 
+// ── Task 021 (Task 3): pyvenv.cfg content-marker prunes arbitrarily-named venv dirs ──
+
+/// A dir containing `pyvenv.cfg` is a venv root regardless of its name.
+/// Files inside are NOT walked, NOT counted in `skipped_excluded`.
+/// Scanning the venv root *directly* also yields no hotspots.
+#[test]
+fn pyvenv_cfg_marker_prunes_arbitrarily_named_venv() {
+    let tmp = TempDir::new().expect("tmp");
+    let root = tmp.path();
+
+    // A normal source file outside the venv (must appear in hotspots)
+    std::fs::write(root.join("app.py"), "def real():\n    open('x')\n").unwrap();
+
+    // An arbitrarily-named venv dir (weirdenv/) with pyvenv.cfg inside
+    let venv = root.join("weirdenv");
+    std::fs::create_dir_all(&venv).unwrap();
+    std::fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    // A routable Python file inside that must NOT appear in output
+    std::fs::write(venv.join("hidden.py"), "def shouldnotappear():\n    pass\n").unwrap();
+
+    // --- Scan the parent dir: weirdenv/ must be pruned (not counted in skipped_excluded) ---
+    let out = fxrank().arg("scan").arg(root).output().expect("ran");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+
+    let hotspots = j["hotspots"].as_array().expect("hotspots array");
+    // app.py outside weirdenv/ must be present in hotspots
+    assert!(
+        hotspots
+            .iter()
+            .any(|h| h["path"].as_str().is_some_and(|p| p.ends_with("app.py"))),
+        "app.py outside weirdenv/ must still be scanned; got: {j}"
+    );
+    // weirdenv/ and hidden.py inside it must NOT appear in any hotspot path
+    assert!(
+        hotspots.iter().all(|h| {
+            h["path"]
+                .as_str()
+                .is_none_or(|p| !p.contains("weirdenv") && !p.contains("hidden.py"))
+        }),
+        "weirdenv/ must be pruned by pyvenv.cfg marker; no venv path must appear; got: {j}"
+    );
+    // Marker prunes are NOT counted in skipped_excluded
+    assert_eq!(
+        j["scope"]["skipped_excluded"].as_u64(),
+        Some(0),
+        "marker prunes must not increment skipped_excluded; got: {j}"
+    );
+
+    // --- Scan the venv root directly: no hotspots (the marker check covers the root itself) ---
+    let out2 = fxrank().arg("scan").arg(&venv).output().expect("ran");
+    assert!(
+        out2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let j2: serde_json::Value = serde_json::from_slice(&out2.stdout).expect("valid JSON");
+    assert_eq!(
+        j2["scope"]["files"].as_u64(),
+        Some(0),
+        "scanning weirdenv/ (venv root) directly must walk 0 files; got: {j2}"
+    );
+    assert_eq!(
+        j2["hotspots"].as_array().map(|a| a.len()),
+        Some(0),
+        "scanning weirdenv/ (venv root) directly must yield no hotspots; got: {j2}"
+    );
+}
+
 // ── Task 004 follow-up: path glob anchors relative to scan root through nested dirs ──
 #[test]
 fn path_glob_anchors_through_nested_dirs() {

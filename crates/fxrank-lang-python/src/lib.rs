@@ -6,9 +6,35 @@ pub mod functions;
 pub mod imports;
 pub mod source;
 
+use fxrank_core::CorpusProfile;
 use fxrank_core::frontend::{Frontend, FrontendOutput, Language, SourceFile};
 use fxrank_core::model::Diagnostic;
 use libcst_native::parse_module;
+
+/// Python corpus hygiene.
+///
+/// Virtual-environment and build-artifact directories are pruned so that
+/// `fxrank scan .` on a Python project doesn't descend into installed packages.
+/// `pyvenv.cfg` marks a venv root for content-based pruning (`prune_marker_files`).
+pub const CORPUS_PROFILE: CorpusProfile = CorpusProfile {
+    prune_dirs: &[
+        ".venv",
+        "venv",
+        ".tox",
+        ".nox",
+        "__pycache__",
+        ".eggs",
+        "build",
+        "dist",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "site-packages",
+    ],
+    exclude_file_globs: &["*_pb2.py", "*_pb2_grpc.py"],
+    test_file_globs: &["test_*.py", "*_test.py", "conftest.py", "tests"],
+    prune_marker_files: &["pyvenv.cfg"],
+};
 
 /// The Python language frontend.
 ///
@@ -29,6 +55,10 @@ pub struct PythonFrontend {
 impl Frontend for PythonFrontend {
     fn language(&self) -> Language {
         Language::Python
+    }
+
+    fn corpus_profile(&self) -> CorpusProfile {
+        CORPUS_PROFILE
     }
 
     fn analyze(&self, files: &[SourceFile]) -> FrontendOutput {
@@ -136,27 +166,17 @@ impl Frontend for PythonFrontend {
     }
 }
 
-/// Return `true` if `path` identifies a test file by Python convention:
+/// Return `true` if `path` identifies a test file by Python convention.
 ///
-/// - base name matches `test_*.py` or `*_test.py` (pytest conventions), OR
-/// - base name is `conftest.py` (pytest configuration / shared fixtures), OR
-/// - any path segment is exactly `tests` (e.g. `src/tests/foo.py`).
+/// Delegates to a `CorpusMatcher` built from `CORPUS_PROFILE.test_file_globs`:
+/// - `test_*.py` / `*_test.py` match by base-name glob (pytest conventions), OR
+/// - `conftest.py` matches exactly (pytest fixtures / configuration), OR
+/// - `tests` as a bare literal matches any path segment (e.g. `src/tests/foo.py`).
 pub fn is_test_file(path: &str) -> bool {
-    // Extract the base name (last path segment).
-    let base = path.split(['/', '\\']).next_back().unwrap_or(path);
-
-    // conftest.py is always a test-support file.
-    if base == "conftest.py" {
-        return true;
-    }
-
-    // test_*.py  and  *_test.py
-    if (base.starts_with("test_") || base.ends_with("_test.py")) && base.ends_with(".py") {
-        return true;
-    }
-
-    // Any segment named exactly `tests` (singular `test` is too broad).
-    path.split(['/', '\\']).any(|seg| seg == "tests")
+    use std::sync::OnceLock;
+    static M: OnceLock<fxrank_core::CorpusMatcher> = OnceLock::new();
+    M.get_or_init(|| fxrank_core::CorpusMatcher::test_matcher(CORPUS_PROFILE.test_file_globs))
+        .matches_test_file(path)
 }
 
 #[cfg(test)]
@@ -279,5 +299,38 @@ mod tests {
             inc_symbols.contains(&"test_something"),
             "with include_tests, test_something must be scored; got: {inc_symbols:?}"
         );
+    }
+
+    #[test]
+    fn corpus_profile_method_returns_const() {
+        use fxrank_core::frontend::Frontend;
+        let p = PythonFrontend {
+            include_tests: false,
+        }
+        .corpus_profile();
+        assert_eq!(p.prune_dirs, CORPUS_PROFILE.prune_dirs);
+        assert_eq!(p.test_file_globs, CORPUS_PROFILE.test_file_globs);
+    }
+
+    #[test]
+    fn is_test_file_characterization() {
+        for p in [
+            "test_views.py",
+            "views_test.py",
+            "conftest.py",
+            "pkg/tests/helpers.py",
+            "tests/x.py",
+        ] {
+            assert!(is_test_file(p), "expected test file: {p}");
+        }
+        for p in [
+            "views.py",
+            "pkg/mytests/foo.py",
+            "tests.py",
+            "contest.py",
+            "test_views.txt",
+        ] {
+            assert!(!is_test_file(p), "expected NON-test file: {p}");
+        }
     }
 }

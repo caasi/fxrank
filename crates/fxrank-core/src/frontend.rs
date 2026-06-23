@@ -26,6 +26,11 @@ pub trait Frontend {
     /// Parse the sources and emit per-symbol effect observations (with evidence
     /// and locations). Un-parseable files become diagnostics, not panics.
     fn analyze(&self, files: &[SourceFile]) -> FrontendOutput;
+    /// The frontend's corpus-hygiene profile (prune dirs, exclude globs, test-file
+    /// globs, content-marker prunes). Default: empty. See `docs/corpus-profile-guideline.md`.
+    fn corpus_profile(&self) -> crate::corpus::CorpusProfile {
+        crate::corpus::CorpusProfile::EMPTY
+    }
 }
 
 #[cfg(test)]

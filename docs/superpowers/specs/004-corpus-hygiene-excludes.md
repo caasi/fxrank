@@ -66,8 +66,15 @@ Out of scope (deferred, Milestone-B candidates):
 
 | Layer | Where it lives | Flag | Owns |
 | --- | --- | --- | --- |
-| File-discovery exclude | CLI (`main.rs` walk) | `--exclude` (replace) | **general ecosystem file noise**: vendored, minified (named), stories, generated, JS test-support |
+| File-discovery exclude | CLI (`main.rs` walk) + **frontend `CorpusProfile` declarations** | `--exclude` (replace) | **general ecosystem file noise**: vendored, minified (named), stories, generated, JS test-support |
 | Test-skip | frontends (`is_test`/`is_test_file`) | `--include-tests` | the **test mechanism**: Rust `#[test]`/`#[cfg(test)]`, TS `.test.`/`.spec.`/`__tests__` |
+
+The **default skip list is no longer a CLI-hardcoded string** — it is the union of each
+enabled frontend's `CorpusProfile` declaration (`pub const CORPUS_PROFILE: CorpusProfile`
+in `crates/fxrank-lang-{rust,ts,python}/src/lib.rs`) plus the language-neutral
+`CorpusProfile::COMMON` (`.git`). The CLI's `default_exclude_entries()` performs this
+union at startup when `--exclude` is absent. See `docs/corpus-profile-guideline.md` for
+the full per-language table and per-channel semantics.
 
 They own distinct concerns and no new flag is introduced. If a path would match both
 layers (e.g. `src/__tests__/foo.stories.tsx`), the **discovery exclude wins** because
@@ -111,19 +118,23 @@ the footgun where `--exclude jest.setup.js` would otherwise be read as a directo
 name and silently skip nothing — a no-`/` entry matches *files* too.
 
 **Override semantics: replace (unchanged from today).** Passing `--exclude` replaces
-the entire default list. The defaults are printed in `--help` so an agent can copy
-and extend them. (Additive semantics + an escape hatch were considered and rejected:
+the default glob/literal list (the union of the enabled frontends' `CorpusProfile`s; the
+always-on `pyvenv.cfg` marker prune is separate and unaffected). The default is now
+computed at startup from those profiles rather than hardcoded, so `--help` describes it
+but no longer prints the literal list verbatim — see `docs/corpus-profile-guideline.md`
+for the per-language entries an agent can copy. (Additive semantics + an escape hatch were considered and rejected:
 the "restate the whole list to add one entry" cost falls only on humans typing by
 hand, not on the agent that is the primary consumer.)
 
 **Implementation choice:** use the `globset` crate (BurntSushi / ripgrep — the
-gold-standard, actively-maintained glob engine). It lives only in `fxrank-cli` (core
-stays parser- and dependency-free). Partition the entries three ways: (1) **literal**
-no-`/` names → a `HashSet<String>`, used for **both** directory pruning and file
-exclusion by base-name equality; (2) **wildcard** no-`/` globs → a `GlobSet` matched
-against each **file** base name (file exclusion only — never prunes); (3) `/`-bearing
-entries → a `GlobSet` matched against the `/`-normalized relative path (file exclusion
-only).
+gold-standard, actively-maintained glob engine). The three-class matcher now lives in
+`fxrank_core::corpus::CorpusMatcher` (relocated from the CLI in spec 021 so the walk
+and the frontend `test_file_globs` matcher share one implementation). Partition the
+entries three ways: (1) **literal** no-`/` names → a `HashSet<String>`, used for
+**both** directory pruning and file exclusion by base-name equality; (2) **wildcard**
+no-`/` globs → a `GlobSet` matched against each **file** base name (file exclusion
+only — never prunes); (3) `/`-bearing entries → a `GlobSet` matched against the
+`/`-normalized relative path (file exclusion only).
 
 **`--exclude` applies to directory scans only.** A single explicit file
 (`fxrank scan a.min.js`) and stdin (`scan --lang ts -`) are **always honored** — an
@@ -134,16 +145,23 @@ is a no-op there by design.)
 
 ## Default exclude list (per-language)
 
-The effective default is the union across languages. A no-`/` filename glob is
-matched on the base name, so `*.stories.*` *can* lexically match a hypothetical
-`foo.stories.rs`; this residual cross-language overlap is accepted (the names are JS
-conventions; collisions in real Rust trees are vanishingly rare and, for the
-directory entry `__mocks__`, harmless). The defaults are **all no-`/` entries**:
+**As of spec 021, the defaults are frontend-declared `CorpusProfile` constants
+unioned by the CLI**, not a hardcoded string. See `docs/corpus-profile-guideline.md`
+for the full per-frontend channel breakdown. The effective union in a full
+(`rust`+`ts`+`python`) build is equivalent to the original default list extended with
+the Python ecosystem entries. A TS-only or Rust-only binary's union is smaller —
+only the enabled frontends' profiles are included, plus `CorpusProfile::COMMON`.
 
-- **Common (all languages):** `node_modules`, `.git`, `target`
-- **TS / JS ecosystem:** `*.min.js`, `*.min.mjs`, `*.min.cjs`, `*.stories.*`,
-  `mockServiceWorker.js`, `jest.setup.*`, `jest.config.*`, `__mocks__`
-- **Rust ecosystem:** (none beyond common — `target` already covers it)
+The four `CorpusProfile` channels cover two distinct skip kinds:
+- `prune_dirs` + `exclude_file_globs` → fed into `CorpusMatcher` (file-discovery exclude)
+- `test_file_globs` → applied by the frontend to route files into `skipped_tests`
+- `prune_marker_files` → always-on content-marker dir-prune, independent of `--exclude`
+
+A no-`/` filename glob is matched on the base name, so `*.stories.*` *can* lexically
+match a hypothetical `foo.stories.rs`; this residual cross-language overlap is accepted
+(the names are JS conventions; collisions in real Rust trees are vanishingly rare and,
+for the directory entry `__mocks__`, harmless). The defaults are **all no-`/` entries**
+(in the `prune_dirs` and `exclude_file_globs` channels).
 
 This resolves:
 
@@ -158,7 +176,11 @@ This resolves:
 - **N5** via `mockServiceWorker.js` (the specific generated file; a broad `public/`
   prune is *not* applied — `public/` hosts hand-written source too).
 
-The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min.cjs,*.stories.*,mockServiceWorker.js,jest.setup.*,jest.config.*,__mocks__`.
+**Content-marker prune (new in spec 021):** the Python frontend declares
+`prune_marker_files: &["pyvenv.cfg"]`. A directory that *contains* `pyvenv.cfg` is
+pruned at walk-entry time, catching arbitrarily-named virtual environments that
+`prune_dirs` cannot enumerate. This prune runs independently of `--exclude` and is
+always on when the `python` feature is compiled in.
 
 ## Behavior
 
@@ -182,9 +204,10 @@ The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min
 
 ## Architecture
 
-- **CLI (`fxrank-cli`).** The `--exclude` arg keeps its comma `value_delimiter` and a
-  `default_value` updated to the documented union string. In `run_scan`, build the
-  matcher from the entries via the three-way partition described under *Implementation
+- **CLI (`fxrank-cli`).** The `--exclude` arg keeps its comma `value_delimiter`; it has
+  **no `default_value`** (it is `Option<Vec<String>>`) — when absent, `default_exclude_entries()`
+  computes the union of the enabled frontends' `CorpusProfile`s at startup. In `run_scan`, build
+  the matcher from the entries via the three-way partition described under *Implementation
   choice* above: no-`/` literals → a `HashSet<String>`; no-`/` wildcards → a
   `globset::GlobSet`; `/`-bearing entries → a second `globset::GlobSet`. Empty entries
   (from `--exclude ''` or a trailing comma) are **ignored** (inert) before
@@ -290,9 +313,11 @@ The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo fmt --check` all green.
 - All slim builds still compile (`--features rust`, `--features ts`, no-features) —
-  `globset` is in `fxrank-cli`, present under every feature combination.
+  `globset` now lives in `fxrank-core` (home of the relocated `CorpusMatcher`), so it is
+  present under every feature combination.
 - `fxrank scan <repo>` on a Storybook library now surfaces real components at the
-  top (stories gone); `--help` documents the default exclude list verbatim.
+  top (stories gone); `--help` describes the default exclude behavior (the literal union
+  is no longer printed verbatim — see `docs/corpus-profile-guideline.md`).
 
 ## Decisions
 
@@ -301,7 +326,7 @@ The literal default string is `node_modules,.git,target,*.min.js,*.min.mjs,*.min
 | Stance | Skip noise by default, opt-out via `--exclude` | Out-of-box reports are usable; an agent shouldn't sift vendored/story/setup noise. |
 | Matcher classification | Split on `/`; among no-`/`, only **literal** names prune directories, **wildcard** names match files only; `/` → full-path glob (file filter) | Lets users mix literal filenames and filename globs; removes both the "bare filename silently prunes nothing" and "filename glob silently prunes a dir" footguns. |
 | Glob engine | `globset` (ripgrep), CLI-only; a literal `HashSet` + two `GlobSet`s | Gold-standard, maintained; core stays parser/dep-free. |
-| Override | Replace (unchanged); defaults in `--help` | The restate cost falls on humans, not the agent consumer; simplest model. |
+| Override | Replace (unchanged); default union computed from frontend `CorpusProfile`s (documented in the guideline, not printed verbatim in `--help`) | The restate cost falls on humans, not the agent consumer; simplest model. |
 | N3 test-support placement | `--exclude` default list, not test-skip | They are JS-ecosystem *files*, not the test *mechanism*; keeps `--include-tests` clean. |
 | Minified detector | Patterns only, no density heuristic; cover `.min.{js,mjs,cjs}` | Zero magic, zero false-skip; minified code isn't a target. |
 | N2 ID collision | Deferred | Only occurs in minified files we now skip; tool targets unminified source. |

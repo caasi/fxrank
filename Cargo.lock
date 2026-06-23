@@ -340,7 +340,6 @@ dependencies = [
  "fxrank-lang-python",
  "fxrank-lang-rust",
  "fxrank-lang-ts",
- "globset",
  "predicates",
  "serde_json",
  "tempfile",
@@ -350,6 +349,7 @@ dependencies = [
 name = "fxrank-core"
 version = "0.3.0"
 dependencies = [
+ "globset",
  "serde",
  "serde_json",
 ]

@@ -1,5 +1,3 @@
-mod exclude;
-
 use clap::{Parser, Subcommand};
 use fxrank_core::frontend::{FrontendOutput, SourceFile};
 use fxrank_core::model::{Diagnostic, Report, Scope};
@@ -33,18 +31,12 @@ enum Cmd {
         /// for stdin; for files/directories the extension decides the frontend.
         #[arg(long)]
         lang: Option<String>,
-        /// Patterns to skip during directory scans (comma-separated; replaces the
-        /// default list when provided). Classified by `/`: a no-`/` literal prunes a
-        /// matching directory and excludes a matching file; a no-`/` glob (`*.min.js`,
-        /// `*.stories.*`) excludes files only; a `/`-bearing glob (`src/legacy/**`)
-        /// filters files by path. An entry cannot contain a comma (the list delimiter),
-        /// so brace alternation with commas (`*.{js,ts}`) must be split into entries.
-        #[arg(
-            long,
-            value_delimiter = ',',
-            default_value = "node_modules,.git,target,*.min.js,*.min.mjs,*.min.cjs,*.stories.*,mockServiceWorker.js,jest.setup.*,jest.config.*,__mocks__,.venv,venv,.tox,.nox,__pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages,*_pb2.py,*_pb2_grpc.py"
-        )]
-        exclude: Vec<String>,
+        /// Patterns to skip during directory scans (comma-separated; REPLACES the
+        /// default union of the enabled frontends' corpus profiles when provided).
+        /// Classified by `/` (spec 004): no-`/` literal prunes a dir + excludes a file;
+        /// no-`/` glob excludes files only; `/`-bearing glob filters files by path.
+        #[arg(long, value_delimiter = ',')]
+        exclude: Option<Vec<String>>,
     },
 }
 
@@ -101,7 +93,7 @@ fn run_scan(
     limit: Option<usize>,
     include_tests: bool,
     lang: Option<String>,
-    exclude: Vec<String>,
+    exclude: Option<Vec<String>>,
 ) -> Result<Report, String> {
     // Accumulated read-error diagnostics (files that exist but couldn't be read).
     let mut read_errors: Vec<Diagnostic> = Vec::new();
@@ -170,10 +162,19 @@ fn run_scan(
             // Directory branch — the ONLY place the matcher is built.
             // A bad glob surfaces here as a JSON error (non-zero exit).
             // Single-file/stdin branches above never consult --exclude.
-            let matcher = exclude::ExcludeMatcher::build(&exclude)?;
+            let exclude_entries = exclude.unwrap_or_else(default_exclude_entries);
+            let matcher = fxrank_core::CorpusMatcher::build(&exclude_entries)?; // invalid glob → JSON error
+            // Content-marker prunes are computed independently of --exclude (always on).
+            let markers = default_prune_markers();
             let label = p.to_string_lossy().into_owned();
-            let routed =
-                collect_source_files(&p, &p, &mut read_errors, &matcher, &mut skipped_excluded);
+            let routed = collect_source_files(
+                &p,
+                &p,
+                &mut read_errors,
+                &matcher,
+                &mut skipped_excluded,
+                &markers,
+            );
             (label, routed)
         }
     };
@@ -209,6 +210,45 @@ fn run_scan(
     ))
 }
 
+// `allow(unused_mut)`: in a no-feature build all the `push`es below are cfg'd out,
+// leaving `v` never-mutated. Slim builds run `cargo build`, not clippy -D warnings,
+// but keep them warning-clean anyway.
+#[allow(unused_mut)]
+fn default_corpus_profiles() -> Vec<fxrank_core::CorpusProfile> {
+    let mut v = vec![fxrank_core::CorpusProfile::COMMON];
+    #[cfg(feature = "rust")]
+    v.push(fxrank_lang_rust::CORPUS_PROFILE);
+    #[cfg(feature = "ts")]
+    v.push(fxrank_lang_ts::CORPUS_PROFILE);
+    #[cfg(feature = "python")]
+    v.push(fxrank_lang_python::CORPUS_PROFILE);
+    v
+}
+
+/// Union the prune-dir + exclude-file channels into a sorted, deduped entry list
+/// for `CorpusMatcher::build` (the default when `--exclude` is absent).
+fn default_exclude_entries() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in default_corpus_profiles() {
+        out.extend(p.prune_dirs.iter().map(|s| s.to_string()));
+        out.extend(p.exclude_file_globs.iter().map(|s| s.to_string()));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Union of content-marker file names whose presence prunes a directory.
+fn default_prune_markers() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in default_corpus_profiles() {
+        out.extend(p.prune_marker_files.iter().map(|s| s.to_string()));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Decide which frontend a path's extension routes to. Returns `None` for
 /// extensions no frontend handles.
 fn route_for_path(path: &std::path::Path) -> Option<Route> {
@@ -223,14 +263,15 @@ fn route_for_path(path: &std::path::Path) -> Option<Route> {
 
 /// Walk `dir` recursively, collecting every routable source file (`.rs` plus the
 /// JS/TS family) as a `RoutedSource`. Files that can't be read are pushed to
-/// `read_errors` instead. The `ExcludeMatcher` prunes directories and excludes
+/// `read_errors` instead. The `CorpusMatcher` prunes directories and excludes
 /// files; `root` is the scan root used to compute root-relative paths for path globs.
 fn collect_source_files(
     dir: &std::path::Path,
     root: &std::path::Path,
     read_errors: &mut Vec<Diagnostic>,
-    matcher: &exclude::ExcludeMatcher,
+    matcher: &fxrank_core::CorpusMatcher,
     skipped_excluded: &mut usize,
+    markers: &[String],
 ) -> Vec<RoutedSource> {
     let mut sources = Vec::new();
     walk_dir(
@@ -240,6 +281,7 @@ fn collect_source_files(
         read_errors,
         matcher,
         skipped_excluded,
+        markers,
     );
     sources
 }
@@ -252,9 +294,17 @@ fn walk_dir(
     root: &std::path::Path,
     sources: &mut Vec<RoutedSource>,
     read_errors: &mut Vec<Diagnostic>,
-    matcher: &exclude::ExcludeMatcher,
+    matcher: &fxrank_core::CorpusMatcher,
     skipped_excluded: &mut usize,
+    markers: &[String],
 ) {
+    // Content-marker prune: a dir containing e.g. `pyvenv.cfg` is a venv root,
+    // regardless of its name (`myenv/`, `.env3/`). Catches arbitrarily-named venvs,
+    // and (because this runs at walk_dir entry) the scan root itself.
+    if markers.iter().any(|m| dir.join(m).is_file()) {
+        return;
+    }
+
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -304,7 +354,15 @@ fn walk_dir(
                     if matcher.dir_pruned(&dir_name.to_string_lossy()) {
                         continue;
                     }
-                    walk_dir(&path, root, sources, read_errors, matcher, skipped_excluded);
+                    walk_dir(
+                        &path,
+                        root,
+                        sources,
+                        read_errors,
+                        matcher,
+                        skipped_excluded,
+                        markers,
+                    );
                 } else if file_type.is_file() {
                     // Route by extension; skip files no frontend handles.
                     if let Some(route) = route_for_path(&path) {
@@ -471,4 +529,49 @@ fn dispatch_python(sources: Vec<SourceFile>, _include_tests: bool) -> FrontendOu
         });
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(all(feature = "rust", feature = "ts", feature = "python"))]
+    fn full_build_union_equals_old_default_value() {
+        // The verbatim pre-#21 default_value (spec 004 + the #14 interim Python add).
+        let mut old: Vec<String> = "node_modules,.git,target,*.min.js,*.min.mjs,*.min.cjs,\
+*.stories.*,mockServiceWorker.js,jest.setup.*,jest.config.*,__mocks__,.venv,venv,.tox,.nox,\
+__pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages,*_pb2.py,\
+*_pb2_grpc.py"
+            .split(',')
+            .map(|s| s.to_string())
+            .collect();
+        old.sort();
+        old.dedup();
+        assert_eq!(
+            default_exclude_entries(),
+            old,
+            "union default drifted from the old --exclude list"
+        );
+        assert_eq!(default_prune_markers(), vec!["pyvenv.cfg".to_string()]);
+    }
+
+    #[test]
+    #[cfg(all(feature = "ts", not(feature = "rust"), not(feature = "python")))]
+    fn ts_only_union_excludes_other_ecosystems() {
+        let e = default_exclude_entries();
+        assert!(e.iter().any(|x| x == "node_modules") && e.iter().any(|x| x == ".git"));
+        assert!(
+            !e.iter().any(|x| x == "target"),
+            "Rust default leaked into TS-only build"
+        );
+        assert!(
+            !e.iter().any(|x| x == ".venv"),
+            "Python default leaked into TS-only build"
+        );
+        assert!(
+            default_prune_markers().is_empty(),
+            "pyvenv.cfg leaked into TS-only build"
+        );
+    }
 }
