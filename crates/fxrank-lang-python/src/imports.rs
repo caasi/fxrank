@@ -28,11 +28,11 @@
 //! usage; actual call-site detection (e.g. `importlib.import_module(…)`) is
 //! handled by `detect/risk.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use libcst_native::{
-    AssignTargetExpression, CompoundStatement, Expression, ImportNames, Module, NameOrAttribute,
-    OrElse, SmallStatement, Statement, Suite,
+    AssignTargetExpression, CompoundStatement, Element, Expression, ImportNames, Module,
+    NameOrAttribute, OrElse, SmallStatement, Statement, Suite,
 };
 
 /// A resolved import table built from import statements anywhere in a `Module`
@@ -286,6 +286,111 @@ fn root_component(path: &str) -> String {
     path.split('.').next().unwrap_or(path).to_owned()
 }
 
+// ─── module top-level binding collector ───────────────────────────────────────
+
+/// Collect the names introduced by **module top-level** statements of `module`:
+/// assignment targets (`x = …`, `x: T = …`, and destructured `a, b = …` /
+/// `[x, y] = …` / `*rest, last = …`), `def` names, and `class` names. Only the
+/// module body is scanned; names bound inside function bodies are not collected.
+/// A write whose root is one of these — when it is not a local/param/`global`-
+/// declared/import in the writing function — is a write to module-shared state,
+/// escalated to `global.mutation` (the Python analog of #29).
+///
+/// Not collected (accepted misses, consistent with the syntactic flat-scope
+/// approximation in the other frontends): import names (handled by the F5 import
+/// arm via the `Imports` table); subscript/attribute assignment targets (not new
+/// bindings); names bound by module top-level `for`/`with … as`/`except … as`/
+/// `match` patterns; names bound only inside nested blocks/comprehensions. Edge:
+/// the per-function `prescan` collects *locals* from bare-`Name` targets only
+/// (it does not recurse into tuple targets), so a function that tuple-rebinds and
+/// then content-mutates a name that is *also* a module tuple-binding can
+/// mis-escalate — the same pre-existing limitation the import (F5) arm has; rare,
+/// accepted.
+pub fn module_bindings(module: &Module) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for stmt in &module.body {
+        match stmt {
+            Statement::Simple(line) => {
+                for small in &line.body {
+                    match small {
+                        SmallStatement::Assign(a) => {
+                            for target in &a.targets {
+                                collect_target_names(&target.target, &mut out);
+                            }
+                        }
+                        SmallStatement::AnnAssign(a) => {
+                            collect_target_names(&a.target, &mut out);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Statement::Compound(c) => match c {
+                CompoundStatement::FunctionDef(f) => {
+                    out.insert(f.name.value.to_owned());
+                }
+                CompoundStatement::ClassDef(c) => {
+                    out.insert(c.name.value.to_owned());
+                }
+                _ => {}
+            },
+        }
+    }
+    out
+}
+
+/// Collect bound names from an assignment target, recursing into destructuring.
+/// Attribute/Subscript targets bind no new name. Mirrors
+/// `detect::walk_assign_target_subexprs`'s enum shape.
+fn collect_target_names(target: &AssignTargetExpression, out: &mut HashSet<String>) {
+    match target {
+        AssignTargetExpression::Name(n) => {
+            out.insert(n.value.to_owned());
+        }
+        AssignTargetExpression::Tuple(t) => {
+            for el in &t.elements {
+                collect_element_names(el, out);
+            }
+        }
+        AssignTargetExpression::List(l) => {
+            for el in &l.elements {
+                collect_element_names(el, out);
+            }
+        }
+        AssignTargetExpression::StarredElement(s) => collect_expr_target_names(&s.value, out),
+        AssignTargetExpression::Attribute(_) | AssignTargetExpression::Subscript(_) => {}
+    }
+}
+
+/// A destructuring element (`(a, *rest) = …`). Mirrors `detect::walk_target_element`.
+fn collect_element_names(el: &Element, out: &mut HashSet<String>) {
+    match el {
+        Element::Simple { value, .. } => collect_expr_target_names(value, out),
+        Element::Starred(s) => collect_expr_target_names(&s.value, out),
+    }
+}
+
+/// Destructuring elements are typed as `Expression`. Mirrors `detect::walk_target_value`.
+fn collect_expr_target_names(expr: &Expression, out: &mut HashSet<String>) {
+    match expr {
+        Expression::Name(n) => {
+            out.insert(n.value.to_owned());
+        }
+        Expression::Tuple(t) => {
+            for el in &t.elements {
+                collect_element_names(el, out);
+            }
+        }
+        Expression::List(l) => {
+            for el in &l.elements {
+                collect_element_names(el, out);
+            }
+        }
+        Expression::StarredElement(s) => collect_expr_target_names(&s.value, out),
+        _ => {}
+    }
+}
+
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -369,5 +474,45 @@ mod tests {
         );
         assert_eq!(i.resolve("run"), Some("subprocess.run"));
         assert!(i.has_dynamic());
+    }
+
+    #[test]
+    fn module_bindings_collects_top_level_only() {
+        let src = "\
+import config\n\
+_counter = 0\n\
+shared_map = {}\n\
+A, B = 1, 2\n\
+[x, y] = [3, 4]\n\
+def helper():\n    inner_local = 1\n    return inner_local\n\
+class Box:\n    pass\n";
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let mb = module_bindings(&module);
+        // Bare names, destructured tuple/list targets, def + class names all collected:
+        for name in [
+            "_counter",
+            "shared_map",
+            "A",
+            "B",
+            "x",
+            "y",
+            "helper",
+            "Box",
+        ] {
+            assert!(
+                mb.contains(name),
+                "expected module binding `{name}`, got {mb:?}"
+            );
+        }
+        // Function-body locals are NOT collected:
+        assert!(
+            !mb.contains("inner_local"),
+            "function-body local leaked into module_bindings"
+        );
+        // Imported names live in the Imports table, not here:
+        assert!(
+            !mb.contains("config"),
+            "imported name leaked into module_bindings"
+        );
     }
 }
