@@ -19,17 +19,24 @@
 //! | `this` in a normal method                  | `this.mutation`  | 3     | no        | no     |
 //! | `b` ∈ body-declared locals                 | `local.mutation` | 1     | **yes**   | no     |
 //! | `b` ∈ params                               | `param.mutation` | 3     | no        | no     |
-//! | `globalThis` / `window` / imported binding | `global.mutation`| 6     | no        | no     |
-//! | otherwise (captured outer / module-level)  | `hidden.mutation`| 3     | no        | **yes**|
+//! | `globalThis`/`window`/imported/module binding | `global.mutation`| 6  | no     | no     |
+//! | otherwise (captured enclosing-function local) | `hidden.mutation`| 3 | no    | **yes**|
 //!
-//! Note: only `globalThis`, `window`, and imported bindings are recognised as
-//! `global.mutation`; other host globals (`document`, `navigator`, …) currently
-//! fall through to `hidden.mutation` (full DOM coverage is a deferred Milestone-B item).
+//! Note: `globalThis`, `window`, imported bindings, and **module top-level
+//! bindings** are recognised as `global.mutation`; other host globals
+//! (`document`, `navigator`, …) currently fall through to `hidden.mutation`
+//! (full DOM coverage is a deferred Milestone-B item).
 //!
-//! The `contained` bool is returned alongside each `Effect`; Task 9's
-//! boundary-containment discount is its sole consumer. Per spec Deferred #3 a
-//! captured enclosing-local and a module-level binding are *both*
-//! `hidden.mutation` here — we do not distinguish them in Milestone A.
+//! The `contained` bool is returned alongside each `Effect`; the boundary
+//! discount is its sole consumer. Per spec 003 Deferred #3 (issue #29) a write
+//! whose base is a **module top-level binding** (`module_bindings`) is escalated
+//! to `global.mutation` (class 6) — the "module var used for cross-component
+//! communication" anti-pattern — while a genuinely captured enclosing-function
+//! local stays `hidden.mutation` (class 3). The distinction is syntactic/
+//! best-effort (the flat-scope approximation): a local/param that shadows a
+//! module binding still wins as local/param **when declared before the write**
+//! (the walker collects `locals` in traversal order — see the `locals` field
+//! doc), since those are checked first.
 //!
 //! Write sites we recognise: `=` and compound assignments (`AssignExpr`),
 //! `++`/`--` (`UpdateExpr`), the `delete` unary operator (`UnaryExpr`), and
@@ -60,8 +67,17 @@ pub fn detect(
     is_constructor: bool,
     lines: &SpanLines,
     imports: &ImportTable,
+    module_bindings: &HashSet<String>,
 ) -> Vec<(Effect, bool)> {
-    detect_with_refs(body, sig, is_constructor, lines, imports, &HashSet::new())
+    detect_with_refs(
+        body,
+        sig,
+        is_constructor,
+        lines,
+        imports,
+        module_bindings,
+        &HashSet::new(),
+    )
 }
 
 /// Like [`detect`], but pre-seeds the walker's `ref_bindings` with `extra_refs`.
@@ -77,9 +93,10 @@ pub fn detect_with_refs(
     is_constructor: bool,
     lines: &SpanLines,
     imports: &ImportTable,
+    module_bindings: &HashSet<String>,
     extra_refs: &HashSet<String>,
 ) -> Vec<(Effect, bool)> {
-    let mut walker = MutationWalker::seed(sig, is_constructor, lines, imports);
+    let mut walker = MutationWalker::seed(sig, is_constructor, lines, imports, module_bindings);
     walker.ref_bindings.extend(extra_refs.iter().cloned());
     body.walk_with(&mut walker);
     walker.effects
@@ -104,6 +121,10 @@ struct MutationWalker<'a> {
     is_constructor: bool,
     lines: &'a SpanLines,
     imports: &'a ImportTable,
+    /// Names introduced by the module's top-level declarations. A captured
+    /// write whose base is one of these is module-shared state, escalated to
+    /// `global.mutation` (class 6) rather than the `hidden.mutation` catch-all.
+    module_bindings: &'a HashSet<String>,
     effects: Vec<(Effect, bool)>,
 }
 
@@ -113,6 +134,7 @@ impl<'a> MutationWalker<'a> {
         is_constructor: bool,
         lines: &'a SpanLines,
         imports: &'a ImportTable,
+        module_bindings: &'a HashSet<String>,
     ) -> Self {
         let mut params = HashSet::new();
         for pat in &sig.params {
@@ -125,6 +147,7 @@ impl<'a> MutationWalker<'a> {
             is_constructor,
             lines,
             imports,
+            module_bindings,
             effects: Vec::new(),
         }
     }
@@ -218,10 +241,20 @@ impl<'a> MutationWalker<'a> {
             Classification::new(LocalMutation, 1, true, false, Tier::Exact, "local")
         } else if self.params.contains(base) {
             Classification::new(ParamMutation, 3, false, false, Tier::Heuristic, "param")
-        } else if base == "globalThis" || base == "window" || self.imports.resolve(base).is_some() {
+        } else if base == "globalThis"
+            || base == "window"
+            || self.imports.resolve(base).is_some()
+            || self.module_bindings.contains(base)
+        {
+            // A host global (`globalThis`/`window`), an imported binding, or a
+            // write to a MODULE top-level binding — module-shared state used for
+            // cross-component communication (issue #29). Checked AFTER
+            // locals/params, so a function-scoped binding that shadows a module
+            // name still wins (the flat-scope syntactic approximation).
             Classification::new(GlobalMutation, 6, false, false, Tier::Heuristic, "global")
         } else {
-            // Captured outer/module binding — hidden from the signature.
+            // Captured enclosing-function local — hidden from the signature, but
+            // NOT module-shared (not in `module_bindings`), so it stays class 3.
             Classification::new(HiddenMutation, 3, false, true, Tier::Heuristic, "captured")
                 .with_subreason("captured-binding")
         }
@@ -521,12 +554,20 @@ mod tests {
         let (module, cm) = functions::parse_module(src, "t.ts", Lang::Ts).expect("parse");
         let lines = SpanLines::new(cm);
         let imports = ImportTable::from_module(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
         let units = functions::collect(&module, "t.ts", &lines);
         let unit = units
             .iter()
             .find(|u| u.symbol == fn_name)
             .expect("unit not found");
-        detect(&unit.body, &unit.sig, unit.is_constructor, &lines, &imports)
+        detect(
+            &unit.body,
+            &unit.sig,
+            unit.is_constructor,
+            &lines,
+            &imports,
+            &module_bindings,
+        )
     }
 
     /// Shorthand: parse `src`, find the first function named `C`, run detection.
@@ -624,6 +665,7 @@ mod tests {
         let (module, cm) = functions::parse_module(src, "t.ts", Lang::Ts).expect("parse");
         let lines = SpanLines::new(cm);
         let imports = ImportTable::from_module(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
         let units = functions::collect(&module, "t.ts", &lines);
         let unit = units
             .iter()
@@ -635,6 +677,7 @@ mod tests {
             unit.is_constructor,
             &lines,
             &imports,
+            &module_bindings,
             &extra_refs,
         )
     }
@@ -816,10 +859,14 @@ mod tests {
 
     #[test]
     fn captured_binding_write_has_captured_subreason() {
-        // F3: a captured outer-binding write (module-level `counter`, not local/param)
-        // is hidden.mutation/3 — and now carries subreason "captured-binding"
-        // (reporting only; class/kind unchanged).
-        let effects = detect_in("let counter = 0; function C(){ counter += 1; }");
+        // F3: a captured ENCLOSING-FUNCTION local (`counter`, declared in `outer`,
+        // mutated in nested `C`) is hidden.mutation/3 with subreason
+        // "captured-binding". (Pre-#29 this used a module-level `counter`; that now
+        // escalates to global.mutation, so the fixture nests the binding.)
+        let effects = detect_in_fn(
+            "function outer(){ let counter = 0; function C(){ counter += 1; } return C; }",
+            "C",
+        );
         let e = effects
             .iter()
             .find(|(e, _)| e.kind == EffectKind::HiddenMutation)
@@ -829,5 +876,97 @@ mod tests {
         assert!(!e.1, "captured write stays contained == false");
         assert_eq!(e.0.subreason.as_deref(), Some("captured-binding"));
         assert_ne!(e.0.subreason.as_deref(), Some("ref-cell-write"));
+    }
+
+    // ── issue #29: module-level binding mutation escalates to global.mutation ──
+
+    #[test]
+    fn module_level_let_mutation_is_global() {
+        // A write to a module-level `let shared` from inside a function is a write
+        // to module-shared state — global.mutation (class 6), NOT hidden.mutation.
+        let effects = detect_in_fn("let shared = {}; function f(){ shared.x = 1; }", "f");
+        // Exactly one global.mutation, naming the var — guards against an accidental
+        // pass if some unrelated global write is ever introduced.
+        let globals: Vec<_> = effects
+            .iter()
+            .map(|(e, _)| e)
+            .filter(|e| e.kind == EffectKind::GlobalMutation && e.evidence.contains("shared"))
+            .collect();
+        assert_eq!(
+            globals.len(),
+            1,
+            "expected exactly one global.mutation naming `shared`"
+        );
+        assert_eq!(globals[0].effective_class(), 6);
+        assert!(
+            effects
+                .iter()
+                .all(|(e, _)| e.kind != EffectKind::HiddenMutation),
+            "module-level write wrongly classified as hidden.mutation"
+        );
+    }
+
+    #[test]
+    fn module_level_const_map_mutation_is_global() {
+        // Mutating a module `const`'s contents (`m.set(...)`) registers as a write
+        // on the base ident `m`, a module binding -> global.mutation.
+        let effects = detect_in_fn("const m = new Map(); function f(){ m.set('k', 1); }", "f");
+        let e = effects
+            .iter()
+            .map(|(e, _)| e)
+            .find(|e| e.kind == EffectKind::GlobalMutation)
+            .expect("expected a global.mutation for .set on module-level `m`");
+        assert_eq!(e.effective_class(), 6);
+    }
+
+    #[test]
+    fn captured_enclosing_local_stays_hidden() {
+        // A captured ENCLOSING-FUNCTION local (declared in an outer function,
+        // mutated in a nested function) is NOT module-level — it must stay
+        // hidden.mutation (class 3). Guards that we only escalated module bindings.
+        // From `inner`'s perspective `acc` is a captured outer binding (not its
+        // param/own-local, not a module binding).
+        let effects = detect_in_fn(
+            "function outer(){ let acc = {}; function inner(){ acc.x = 1; } return inner; }",
+            "inner",
+        );
+        let e = effects
+            .iter()
+            .map(|(e, _)| e)
+            .find(|e| e.kind == EffectKind::HiddenMutation)
+            .expect("expected hidden.mutation for captured enclosing-function local `acc`");
+        assert_eq!(e.effective_class(), 3);
+        assert_eq!(e.subreason.as_deref(), Some("captured-binding"));
+        assert!(
+            effects
+                .iter()
+                .all(|(e, _)| e.kind != EffectKind::GlobalMutation),
+            "captured enclosing-function local wrongly escalated to global.mutation"
+        );
+    }
+
+    #[test]
+    fn function_local_shadowing_module_binding_is_local() {
+        // A module `let shared` AND a function that declares its OWN `let shared`
+        // then writes it -> local.mutation (class 1). The shadow wins because
+        // locals are checked before the global arm (the flat-scope approximation).
+        let effects = detect_in_fn(
+            "let shared = {}; function f(){ let shared = {}; shared.x = 1; }",
+            "f",
+        );
+        let e = effects
+            .iter()
+            .map(|(e, _)| e)
+            .find(|e| e.kind == EffectKind::LocalMutation)
+            .expect(
+                "expected local.mutation — function-scoped `shared` shadows the module binding",
+            );
+        assert_eq!(e.effective_class(), 1);
+        assert!(
+            effects
+                .iter()
+                .all(|(e, _)| e.kind != EffectKind::GlobalMutation),
+            "shadowing local wrongly escalated to global.mutation"
+        );
     }
 }
