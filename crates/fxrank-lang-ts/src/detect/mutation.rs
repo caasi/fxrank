@@ -41,8 +41,8 @@ use fxrank_core::effect::{Effect, EffectKind, Tier};
 use fxrank_core::score::weight_for_class;
 use std::collections::HashSet;
 use swc_ecma_ast::{
-    AssignExpr, AssignTarget, BindingIdent, Callee, Expr, MemberExpr, MemberProp, ObjectPatProp,
-    Pat, SimpleAssignTarget, UnaryExpr, UnaryOp, UpdateExpr, VarDeclarator,
+    AssignExpr, AssignOp, AssignTarget, BindingIdent, Callee, Expr, MemberExpr, MemberProp,
+    ObjectPatProp, Pat, SimpleAssignTarget, UnaryExpr, UnaryOp, UpdateExpr, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -133,7 +133,13 @@ impl<'a> MutationWalker<'a> {
     ///
     /// `verb` describes the write for the evidence string (`"write to"` for an
     /// assignment, `".push on"` for a mutating-method call).
-    fn record_write(&mut self, place: &Expr, line: usize, verb: &str) {
+    ///
+    /// `is_direct_init` is `true` **only** for a plain `=` `AssignExpr`
+    /// (`AssignOp::Assign`). Compound assignments (`+=`, `-=`, …), update
+    /// expressions (`++`/`--`), `delete`, and mutating-method receivers all pass
+    /// `false`. This is the sole gate for the constructor field-init containment
+    /// discount — the verb string is NOT used for this decision.
+    fn record_write(&mut self, place: &Expr, line: usize, verb: &str, is_direct_init: bool) {
         let Some(base) = base_ident(place) else {
             return;
         };
@@ -164,12 +170,7 @@ impl<'a> MutationWalker<'a> {
             )
             .with_subreason("ref-cell-write")
         } else {
-            // A mutating-method receiver (verb begins with '.') is never a direct
-            // field-init even when its place is `this.<ident>` — pushing onto
-            // `this.items` mutates field contents, so it escapes. Only a true
-            // assignment target can be a contained ctor field-init.
-            let assign_like = !verb.starts_with('.');
-            self.classify(&base, place, assign_like)
+            self.classify(&base, place, is_direct_init)
         };
         let effect = Effect {
             kind: c.kind,
@@ -199,16 +200,18 @@ impl<'a> MutationWalker<'a> {
     /// bare reassignment of the binding itself (e.g. `r = makeRef()`) and should
     /// fall through to normal classification here — `r` is in `locals`, so it
     /// becomes `local.mutation` class 1.
-    fn classify(&self, base: &str, place: &Expr, assign_like: bool) -> Classification {
+    fn classify(&self, base: &str, place: &Expr, is_direct_init: bool) -> Classification {
         use EffectKind::*;
         if base == "this" {
-            if self.is_constructor && assign_like && direct_this_field(place) {
-                // A DIRECT field-init `this.<ident> = …` — honest, bounded local init.
+            if self.is_constructor && is_direct_init && direct_this_field(place) {
+                // A DIRECT plain-`=` field-init `this.<ident> = …` — honest, bounded
+                // local init. Compound assigns, updates, delete, and method receivers
+                // are NOT direct inits and escape to this.mutation.
                 Classification::new(LocalMutation, 1, true, false, Tier::Heuristic, "ctor this")
             } else {
                 // Normal method, OR a constructor write that is NOT a direct field-init
-                // (method receiver `this.xs.push`, subscript `this[i]`, deeper chain
-                // `this.a.b`) — escapes, not contained.
+                // (compound `+=`, update `++`, delete, method receiver `this.xs.push`,
+                // subscript `this[i]`, deeper chain `this.a.b`) — escapes, not contained.
                 Classification::new(ThisMutation, 3, false, false, Tier::Heuristic, "this field")
             }
         } else if self.locals.contains(base) {
@@ -280,38 +283,42 @@ impl Visit for MutationWalker<'_> {
 
     fn visit_assign_expr(&mut self, node: &AssignExpr) {
         // Both plain `=` and compound (`+=`, `-=`, …) ops are writes.
+        // Only plain `=` qualifies as a direct field-init for the ctor discount.
         let line = self.lines.line(node.span);
+        let is_direct_init = node.op == AssignOp::Assign;
         if let Some(base) = assign_target_base(&node.left) {
-            self.record_write(&base, line, "write to");
+            self.record_write(&base, line, "write to", is_direct_init);
         }
         node.visit_children_with(self);
     }
 
     fn visit_update_expr(&mut self, node: &UpdateExpr) {
-        // `x++` / `--y` write to `node.arg`.
+        // `x++` / `--y` write to `node.arg` — never a direct field-init.
         let line = self.lines.line(node.span);
-        self.record_write(&node.arg, line, "update");
+        self.record_write(&node.arg, line, "update", false);
         node.visit_children_with(self);
     }
 
     fn visit_unary_expr(&mut self, node: &UnaryExpr) {
-        // `delete obj.key` writes to (deletes a property of) the operand's base.
+        // `delete obj.key` writes to (deletes a property of) the operand's base
+        // — never a direct field-init.
         if node.op == UnaryOp::Delete {
             let line = self.lines.line(node.span);
-            self.record_write(&node.arg, line, "delete on");
+            self.record_write(&node.arg, line, "delete on", false);
         }
         node.visit_children_with(self);
     }
 
     fn visit_call_expr(&mut self, node: &swc_ecma_ast::CallExpr) {
-        // A mutating method call (`xs.push(…)`) writes to the receiver's base.
+        // A mutating method call (`xs.push(…)`) writes to the receiver's base
+        // — never a direct field-init.
         if let Callee::Expr(callee) = &node.callee
             && let Expr::Member(MemberExpr { obj, prop, .. }) = callee.as_ref()
             && let MemberProp::Ident(method) = prop
             && is_mutating_method(&method.sym)
         {
             let line = self.lines.line(node.span);
-            self.record_write(obj, line, &format!(".{} on", method.sym));
+            self.record_write(obj, line, &format!(".{} on", method.sym), false);
         }
         node.visit_children_with(self);
     }
@@ -761,6 +768,50 @@ mod tests {
             .expect("this[i] = 1 must escape to this.mutation");
         assert_eq!(e.0.effective_class(), 3);
         assert!(!e.1, "subscript write on this must be contained == false");
+    }
+
+    #[test]
+    fn ctor_compound_assign_on_this_escapes() {
+        // Copilot finding: `this.x += 1` in a constructor must escape to
+        // this.mutation/3/not-contained, not stay contained as local.mutation.
+        let effects = detect_in_fn(
+            "class C { x = 0; constructor(){ this.x += 1; } }",
+            "C.constructor",
+        );
+        let e = effects
+            .iter()
+            .find(|(e, _)| e.kind == EffectKind::ThisMutation)
+            .expect("this.x += 1 must escape to this.mutation/3");
+        assert_eq!(e.0.effective_class(), 3);
+        assert!(!e.1, "compound assign on this must be contained == false");
+        assert!(
+            !effects
+                .iter()
+                .any(|(e, c)| *c && e.kind == EffectKind::LocalMutation),
+            "compound assign on this must not stay as contained local.mutation"
+        );
+    }
+
+    #[test]
+    fn ctor_update_on_this_escapes() {
+        // Copilot finding: `this.x++` in a constructor must escape to
+        // this.mutation/3/not-contained, not stay contained as local.mutation.
+        let effects = detect_in_fn(
+            "class C { x = 0; constructor(){ this.x++; } }",
+            "C.constructor",
+        );
+        let e = effects
+            .iter()
+            .find(|(e, _)| e.kind == EffectKind::ThisMutation)
+            .expect("this.x++ must escape to this.mutation/3");
+        assert_eq!(e.0.effective_class(), 3);
+        assert!(!e.1, "update expr on this must be contained == false");
+        assert!(
+            !effects
+                .iter()
+                .any(|(e, c)| *c && e.kind == EffectKind::LocalMutation),
+            "update expr on this must not stay as contained local.mutation"
+        );
     }
 
     #[test]
