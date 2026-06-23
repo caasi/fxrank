@@ -385,6 +385,11 @@ fn self_interior_mutation_is_hidden_mutation_no_discount() {
     assert_eq!(e.discounted_to, None, "hidden mutation is never discounted");
     assert!(e.hidden, "interior mutation through &self is hidden");
     assert_eq!(e.tier, Tier::Heuristic);
+    assert_eq!(
+        e.subreason.as_deref(),
+        Some("interior-mut"),
+        "interior-mutability hidden write carries subreason interior-mut"
+    );
 }
 
 #[test]
@@ -1273,6 +1278,11 @@ fn unresolved_free_binding_write_is_hidden_mutation_class_3() {
     assert_eq!(e.discounted_to, None, "hidden mutation is never discounted");
     assert!(e.hidden, "an unresolved free-binding write is hidden");
     assert_eq!(e.tier, Tier::Heuristic);
+    assert_eq!(
+        e.subreason.as_deref(),
+        Some("captured-binding"),
+        "captured-binding hidden write carries subreason captured-binding"
+    );
 }
 
 // ── Spec 008 F5: import-resolved write base → global.mutation ────────────────

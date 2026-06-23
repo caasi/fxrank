@@ -155,6 +155,7 @@ impl<'a> MutationWalker<'a> {
         hidden: bool,
         line: usize,
         evidence: String,
+        subreason: Option<&str>,
     ) {
         let class = kind.base_class();
         self.effects.push(Effect {
@@ -167,7 +168,7 @@ impl<'a> MutationWalker<'a> {
             hidden,
             evidence,
             discount: None,
-            subreason: None,
+            subreason: subreason.map(str::to_string),
             confidence: detection_confidence(tier, false, false),
         });
     }
@@ -188,6 +189,7 @@ impl<'a> MutationWalker<'a> {
                 false,
                 line,
                 format!("write to local {base}"),
+                None,
             );
         } else if !self.locals.contains(&base) && self.statics.contains(&base) {
             // F2: base is bound in no local/param/let-mut set but IS a file-level
@@ -200,6 +202,7 @@ impl<'a> MutationWalker<'a> {
                 false,
                 line,
                 format!("write to global {base}"),
+                None,
             );
         } else if !self.locals.contains(&base) && self.imports.resolve(&base).is_some() {
             // 008-F5: the base resolves through the `use`-table — module-external
@@ -211,6 +214,7 @@ impl<'a> MutationWalker<'a> {
                 false,
                 line,
                 format!("write to imported {base}"),
+                None,
             );
         } else if !self.locals.contains(&base) {
             // 008-F1: the base resolves to no local/param/self/static binding —
@@ -222,6 +226,7 @@ impl<'a> MutationWalker<'a> {
                 true,
                 line,
                 format!("write to captured binding {base}"),
+                Some("captured-binding"),
             );
         }
     }
@@ -333,6 +338,7 @@ impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
                     true,
                     line,
                     format!(".{method} on shared &{base}"),
+                    Some("interior-mut"),
                 );
             } else if base.as_deref().is_some_and(|b| self.statics.contains(b)) {
                 // F2: the receiver base is a file-level static written via an
@@ -347,6 +353,7 @@ impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
                     false,
                     line,
                     format!("interior write to global {base} via .{method}"),
+                    None,
                 );
             }
         } else if is_mutating_method(&method) {
