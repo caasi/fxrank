@@ -44,6 +44,7 @@ use libcst_native::{
 use super::expr::render_expr;
 use super::{EffectSink, walk_own_body};
 use crate::functions::{FnBody, FnUnit};
+use crate::imports::Imports;
 use crate::source::{SpanIndex, anchor_of_subslice};
 
 /// Detect mutation effects in `unit`'s own body, with escape analysis.
@@ -53,7 +54,7 @@ use crate::source::{SpanIndex, anchor_of_subslice};
 /// constructor init); `false` means it escapes.
 ///
 /// Task 9 consumes the `contained` flags to apply boundary-containment discounts.
-pub fn detect(unit: &FnUnit, span: &SpanIndex) -> Vec<(Effect, bool)> {
+pub fn detect(unit: &FnUnit, imports: &Imports, span: &SpanIndex) -> Vec<(Effect, bool)> {
     // ── Step 1: collect param names from the unit's signature ────────────────
     let params = collect_param_names(unit.params);
 
@@ -70,6 +71,7 @@ pub fn detect(unit: &FnUnit, span: &SpanIndex) -> Vec<(Effect, bool)> {
         globals: &globals,
         nonlocals: &nonlocals,
         locals: &locals,
+        imports,
         is_init,
         span,
         effects: Vec::new(),
@@ -289,6 +291,10 @@ struct MutSink<'a> {
     /// Locally-assigned names (global/nonlocal names are removed from this set
     /// in the classification logic).
     locals: &'a HashSet<String>,
+    /// File-wide import table — lets the cascade resolve an import-rooted write (F5)
+    /// and distinguish a captured opaque binding (F1) from a known module.
+    #[allow(dead_code)]
+    imports: &'a Imports,
     /// True when analyzing `__init__` (so `self.attr = …` is local init).
     is_init: bool,
     span: &'a SpanIndex<'a>,
@@ -581,12 +587,13 @@ mod tests {
     fn mutation_effects(name: &str) -> HashMap<String, Vec<(EffectKind, bool)>> {
         let src = std::fs::read_to_string(format!("tests/fixtures/{name}.py")).unwrap();
         let module = libcst_native::parse_module(&src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let mut out: HashMap<String, Vec<(EffectKind, bool)>> = HashMap::new();
         for unit in &units {
-            let pairs = detect(unit, &span);
+            let pairs = detect(unit, &imports, &span);
             out.insert(
                 unit.symbol.clone(),
                 pairs.iter().map(|(e, c)| (e.kind, *c)).collect(),
@@ -599,12 +606,13 @@ mod tests {
     fn mutation_evidence(name: &str) -> HashMap<String, Vec<(EffectKind, bool, String)>> {
         let src = std::fs::read_to_string(format!("tests/fixtures/{name}.py")).unwrap();
         let module = libcst_native::parse_module(&src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let mut out: HashMap<String, Vec<(EffectKind, bool, String)>> = HashMap::new();
         for unit in &units {
-            let pairs = detect(unit, &span);
+            let pairs = detect(unit, &imports, &span);
             out.insert(
                 unit.symbol.clone(),
                 pairs
@@ -727,12 +735,15 @@ mod tests {
         let nonlocals = std::collections::HashSet::new();
         let locals = std::collections::HashSet::new();
         let src = "x\n";
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
         let span = crate::source::SpanIndex::new(src);
         let mut sink = MutSink {
             params: &params,
             globals: &globals,
             nonlocals: &nonlocals,
             locals: &locals,
+            imports: &imports,
             is_init: false,
             span: &span,
             effects: Vec::new(),
@@ -746,6 +757,24 @@ mod tests {
         assert!(effect.hidden, "push_hidden must set hidden:true");
         assert_eq!(effect.subreason.as_deref(), Some("captured-binding"));
         assert!(!contained, "hidden writes escape — contained=false");
+    }
+
+    /// PREREQ 2: mutation::detect accepts the ImportTable so F5 + F1 can resolve roots.
+    #[test]
+    fn detect_accepts_imports_param() {
+        let src = "def f(lst):\n    lst.append(1)\n";
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
+        let span = crate::source::SpanIndex::new(src);
+        let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
+        let (units, _) = functions::collect(&module, src, &span, &anchors);
+        let f = units.iter().find(|u| u.symbol == "f").unwrap();
+        let pairs = detect(f, &imports, &span);
+        assert!(
+            pairs.iter().any(|(e, _)| e.kind == ParamMutation),
+            "lst.append where lst is a param → ParamMutation, got: {:?}",
+            pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
     }
 
     /// FIX 2: mutating-method evidence renders the full receiver expression
