@@ -307,10 +307,13 @@ them. Concretely (the F1–F5 of spec 008):
   discount; Python `nonlocal`→`this.mutation`/Exact; plain rebind (Python no-emit vs TS/Rust
   `local.mutation`); per-language mutating-method allowlists.
 
-**Known remaining gap → issue #29:** a TS **module-top-level** binding that is *not* an import
-(a bare `const sharedMap`/`let shared`) written from a function still lands in the `hidden.mutation`
-catch-all rather than `global.mutation`/6. #29 is now a small, well-patterned task — the direct
-analog of F2 (thread a `module_bindings` set, add a `global` arm before the hidden tail).
+**Issue #29 resolved cross-language** (plan `docs/superpowers/plans/009-cross-language-module-binding-global.md`, extending spec 008's F2)**:** a module-top-level binding write now classifies
+as `global.mutation`/6 in all three frontends — Rust via the `static` set (F2, pre-existing), TS
+via the `module_bindings` set (#29), Python via the module-level-name set for the content-mutation
+case (the explicit-`global` rebind already escalated). **Residual heuristic limit:** a
+function-scoped binding shadowing a module-level name resolves to local — flat syntactic binding
+sets (TS traversal-order; Python whole-function local pre-scan) stop short of full lexical-scope
+modeling, so the shadow wins in both frontends.
 
 ## Design artifacts & workflow
 

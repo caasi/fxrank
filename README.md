@@ -29,8 +29,12 @@ function's signature is typed — an `any` at the boundary poisons it.
 
 All three frontends — Rust, TS/JS, and Python — classify mutation against **one canonical
 model**: the same effect kinds and classes, the same anti-Goodhart inversion, and a shared
-`hidden.mutation` subreason vocabulary, while keeping each language's honest differences. The
-shared model and those intentional differences are documented in
+`hidden.mutation` subreason vocabulary, while keeping each language's honest differences. One
+rule that holds across all three: a write to a **module top-level binding** (a Rust `static`, a
+TS module `const`/`let`/`var`/`fn`/`class`, a Python module-level name) is **`global.mutation`**
+(class 6, "wild global") — the "module var used for cross-component communication" anti-pattern —
+while a genuinely captured *enclosing-function* local stays `hidden.mutation`. The shared model
+and the intentional per-language differences are documented in
 [`docs/mutation-classification-guideline.md`](docs/mutation-classification-guideline.md).
 
 ## Install
@@ -198,9 +202,10 @@ The full spec lives in [`docs/superpowers/specs/001-fxrank-rust-effect-scanner.m
 discount, the hidden-mutation inversion, async/confidence metadata, diagnostics, and the
 `fxrank scan` CLI. Ships **three frontends**: Rust (`syn`), TypeScript/JavaScript (`swc`),
 and Python (`libcst`), each syntactic (no type-checker or borrow-checker). Mutation
-classification is **aligned across all three frontends** (spec 008): real `static`/import
-facts are threaded into detection, and captured/unresolved, global, and constructor-init
-writes are classified consistently — see the guideline above.
+classification is **aligned across all three frontends** (spec 008, extended by #29): real
+`static`/import facts are threaded into detection, and captured/unresolved, global,
+constructor-init, and **module top-level binding** writes are classified consistently
+(the last → `global.mutation`/6 in every frontend) — see the guideline above.
 
 Known limitations (accepted for Milestone A): own-score only (no call-graph propagation, so
 extract-method can launder a score); type-dependent signals are heuristic; macro-generated

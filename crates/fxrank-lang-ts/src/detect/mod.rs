@@ -32,8 +32,14 @@ use swc_ecma_visit::{Visit, VisitWith};
 /// and they are concatenated. `imports` and `lines` are threaded in from the
 /// calling `TsFrontend::analyze`, which keeps the `SourceMap` alive so spans
 /// can be resolved.
-pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, lines: &SpanLines) -> Hotspot {
-    let gathered: Vec<(Effect, bool)> = gather(unit, imports, lines, &HashSet::new());
+pub fn analyze_unit(
+    unit: &FnUnit,
+    imports: &ImportTable,
+    lines: &SpanLines,
+    module_bindings: &HashSet<String>,
+) -> Hotspot {
+    let gathered: Vec<(Effect, bool)> =
+        gather(unit, imports, lines, module_bindings, &HashSet::new());
 
     // The project thesis: types lower the score. Measure how typed the
     // signature is, then discount CONTAINED effects by the boundary tier — a
@@ -135,6 +141,7 @@ fn gather(
     unit: &FnUnit,
     imports: &ImportTable,
     lines: &SpanLines,
+    module_bindings: &HashSet<String>,
     extra_refs: &HashSet<String>,
 ) -> Vec<(Effect, bool)> {
     let mut effects: Vec<(Effect, bool)> = Vec::new();
@@ -150,6 +157,7 @@ fn gather(
         unit.is_constructor,
         lines,
         imports,
+        module_bindings,
         extra_refs,
     ));
     effects
@@ -217,11 +225,12 @@ pub fn raw_signals(
     unit: &FnUnit,
     imports: &ImportTable,
     lines: &SpanLines,
+    module_bindings: &HashSet<String>,
     ref_bindings: &HashSet<String>,
 ) -> RawSignals {
     // Pre-discount effects: drop the `contained` flag — the absorbing component
     // forces `contained = false` on every inherited effect anyway.
-    let effects: Vec<Effect> = gather(unit, imports, lines, ref_bindings)
+    let effects: Vec<Effect> = gather(unit, imports, lines, module_bindings, ref_bindings)
         .into_iter()
         .map(|(e, _contained)| e)
         .collect();

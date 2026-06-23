@@ -5,7 +5,7 @@ use fxrank_core::model::Hotspot;
 use fxrank_lang_ts::TsFrontend;
 use fxrank_lang_ts::detect::{self, calls, mutation, risk};
 use fxrank_lang_ts::functions;
-use fxrank_lang_ts::imports::ImportTable;
+use fxrank_lang_ts::imports::{self, ImportTable};
 use fxrank_lang_ts::source::{Lang, SpanLines};
 
 /// Read a fixture, parse it (keeping the `SourceMap`), build `SpanLines` +
@@ -17,12 +17,13 @@ fn analyze_fixture_unit(fixture: &str, fn_name: &str) -> Hotspot {
     let (module, cm) = functions::parse_module(&src, fixture, Lang::Ts).expect("parse fixture");
     let lines = SpanLines::new(cm);
     let imports = ImportTable::from_module(&module);
+    let module_bindings = imports::module_bindings(&module);
     let units = functions::collect(&module, fixture, &lines);
     let unit = units
         .iter()
         .find(|u| u.symbol == fn_name)
         .expect("function unit not found");
-    detect::analyze_unit(unit, &imports, &lines)
+    detect::analyze_unit(unit, &imports, &lines, &module_bindings)
 }
 
 /// Read a fixture from `tests/fixtures/<name>`, parse it as TypeScript, run
@@ -132,15 +133,23 @@ fn mutation_effects(fixture: &str, fn_name: &str) -> Vec<(String, bool)> {
     let (module, cm) = functions::parse_module(&src, fixture, Lang::Ts).expect("parse fixture");
     let lines = SpanLines::new(cm);
     let imports = ImportTable::from_module(&module);
+    let module_bindings = imports::module_bindings(&module);
     let units = functions::collect(&module, fixture, &lines);
     let unit = units
         .iter()
         .find(|u| u.symbol == fn_name)
         .expect("function unit not found");
-    mutation::detect(&unit.body, &unit.sig, unit.is_constructor, &lines, &imports)
-        .into_iter()
-        .map(|(e, contained)| (e.kind.wire().to_string(), contained))
-        .collect()
+    mutation::detect(
+        &unit.body,
+        &unit.sig,
+        unit.is_constructor,
+        &lines,
+        &imports,
+        &module_bindings,
+    )
+    .into_iter()
+    .map(|(e, contained)| (e.kind.wire().to_string(), contained))
+    .collect()
 }
 
 /// Just the wire kinds of a unit's mutation effects.
@@ -155,7 +164,11 @@ fn mutation_kinds(fixture: &str, fn_name: &str) -> Vec<String> {
 fn classifies_mutation_by_escape() {
     assert!(mutation_kinds("mutation.ts", "buildLocal").contains(&"local.mutation".into()));
     assert!(mutation_kinds("mutation.ts", "mutParam").contains(&"param.mutation".into()));
-    assert!(mutation_kinds("mutation.ts", "viaClosure").contains(&"hidden.mutation".into()));
+    // issue #29: a write to a MODULE-level binding (`counter`) escalates to
+    // global.mutation (class 6), not hidden.mutation.
+    assert!(mutation_kinds("mutation.ts", "viaModuleVar").contains(&"global.mutation".into()));
+    // A captured ENCLOSING-FUNCTION local stays hidden.mutation (class 3).
+    assert!(mutation_kinds("mutation.ts", "inner").contains(&"hidden.mutation".into()));
     assert!(mutation_kinds("mutation.ts", "Box.set").contains(&"this.mutation".into()));
     assert!(mutation_kinds("mutation.ts", "viaGlobal").contains(&"global.mutation".into()));
 }
@@ -299,9 +312,10 @@ fn analyze_unit_pure_fn_scores_zero() {
     let (module, cm) = functions::parse_module(src, "pure.ts", Lang::Ts).expect("parse");
     let lines = SpanLines::new(cm);
     let imports = ImportTable::from_module(&module);
+    let module_bindings = imports::module_bindings(&module);
     let units = functions::collect(&module, "pure.ts", &lines);
     let unit = units.iter().find(|u| u.symbol == "pure").expect("unit");
-    let h = detect::analyze_unit(unit, &imports, &lines);
+    let h = detect::analyze_unit(unit, &imports, &lines, &module_bindings);
     assert_eq!(h.max_class, 0);
     assert_eq!(h.own_score, 0.0);
     assert!(h.effects.is_empty());
@@ -402,10 +416,11 @@ fn analyze_inline_units(src: &str) -> Vec<Hotspot> {
     let (module, cm) = functions::parse_module(src, "inline.ts", Lang::Ts).expect("parse");
     let lines = SpanLines::new(cm);
     let imports = ImportTable::from_module(&module);
+    let module_bindings = imports::module_bindings(&module);
     let units = functions::collect(&module, "inline.ts", &lines);
     units
         .iter()
-        .map(|unit| detect::analyze_unit(unit, &imports, &lines))
+        .map(|unit| detect::analyze_unit(unit, &imports, &lines, &module_bindings))
         .collect()
 }
 

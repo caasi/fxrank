@@ -63,11 +63,18 @@ impl Frontend for TsFrontend {
                     // parsed the file to resolve them to line numbers.
                     let lines = SpanLines::new(cm);
                     let imports = ImportTable::from_module(&module);
+                    let module_bindings = imports::module_bindings(&module);
                     let units = functions::collect(&module, &source.path, &lines);
                     if !self.include_tests && is_test_file(&source.path) {
                         output.skipped_tests += units.len();
                     } else {
-                        analyze_units(&units, &imports, &lines, &mut output.functions);
+                        analyze_units(
+                            &units,
+                            &imports,
+                            &module_bindings,
+                            &lines,
+                            &mut output.functions,
+                        );
                     }
                 }
             }
@@ -93,6 +100,7 @@ impl Frontend for TsFrontend {
 fn analyze_units(
     units: &[FnUnit],
     imports: &ImportTable,
+    module_bindings: &HashSet<String>,
     lines: &SpanLines,
     out: &mut Vec<Hotspot>,
 ) {
@@ -129,11 +137,11 @@ fn analyze_units(
             // write inside this callback still classifies as ref-cell-write (the
             // arrow alone can't know `r` is a useRef binding from the component).
             let refs = comp_refs.get(comp_id.as_str()).unwrap_or(&empty_refs);
-            let raw = detect::raw_signals(unit, imports, lines, refs);
+            let raw = detect::raw_signals(unit, imports, lines, module_bindings, refs);
             pending.entry(comp_id).or_default().push((phase, raw));
             continue;
         }
-        let mut h = detect::analyze_unit(unit, imports, lines);
+        let mut h = detect::analyze_unit(unit, imports, lines, module_bindings);
         if react::returns_jsx(&unit.body) {
             detect::augment_component(&mut h, unit, lines);
         }

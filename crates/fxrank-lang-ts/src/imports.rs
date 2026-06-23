@@ -11,12 +11,86 @@
 //! glob imports (`has_glob`); this variant maps ES/CJS-imported names to
 //! module specifiers and flags dynamic imports (`has_dynamic`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use swc_ecma_ast::{
-    CallExpr, Callee, Decl, Expr, ExprStmt, Lit, Module, ModuleDecl, ModuleItem, Pat, Stmt, VarDecl,
+    CallExpr, Callee, Decl, DefaultDecl, Expr, ExprStmt, Lit, Module, ModuleDecl, ModuleItem, Pat,
+    Stmt, VarDecl,
 };
 use swc_ecma_visit::{Visit, VisitWith};
+
+use crate::detect::mutation::collect_pat_bindings;
+
+/// Collect the names introduced by **top-level** declarations of `module`.
+///
+/// These are the module's own shared bindings: top-level `const`/`let`/`var`
+/// declarators (including destructuring patterns), `function` declarations, and
+/// `class` declarations — bare, `export`ed (`export const`/`export function`/
+/// `export class`), or a **named** default (`export default function f(){}` /
+/// `export default class C{}`, which binds `f`/`C`). Only the module body is
+/// scanned; names introduced inside function bodies are NOT collected, so a
+/// write to one of these names from inside a function is a write to
+/// module-shared state (the "module var used for cross-component communication"
+/// anti-pattern), which the mutation walker escalates to `global.mutation`
+/// (issue #29).
+///
+/// **Not** collected: export specifiers / re-exports (`export { foo }`,
+/// `export { foo as bar }`, `export * from "x"`) introduce no local declaration;
+/// anonymous default exports have no name to bind; TS-only forms
+/// (`interface`/`type`) have no runtime binding. `enum`/`namespace` DO bind at
+/// runtime but mutating module-shared enum/namespace state is an accepted miss
+/// for this pass (revisit if dogfooding surfaces it). Likewise, only **direct**
+/// module-body declaration items are scanned: a `var` hoisted out of a top-level
+/// `if`/`for` block (`if (c) { var shared = 0; }`) is an accepted miss.
+///
+/// A mutated module `const`'s contents (`sharedMap.set(...)`, `arr.push(...)`)
+/// already registers as a write on the base ident, so collecting the `const`
+/// name is enough — no `const`-vs-`let` special-casing is needed.
+pub fn module_bindings(module: &Module) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for item in &module.body {
+        // Bare top-level declarations, `export`ed ones, and NAMED default
+        // exports contribute. Export specifiers / re-exports and anonymous
+        // defaults do not (see doc above).
+        let decl = match item {
+            ModuleItem::Stmt(Stmt::Decl(decl)) => decl,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => &export.decl,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => {
+                match &export.decl {
+                    DefaultDecl::Fn(f) => {
+                        if let Some(ident) = &f.ident {
+                            out.insert(ident.sym.to_string());
+                        }
+                    }
+                    DefaultDecl::Class(c) => {
+                        if let Some(ident) = &c.ident {
+                            out.insert(ident.sym.to_string());
+                        }
+                    }
+                    DefaultDecl::TsInterfaceDecl(_) => {}
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        match decl {
+            Decl::Var(var) => {
+                for d in &var.decls {
+                    collect_pat_bindings(&d.name, &mut out);
+                }
+            }
+            Decl::Fn(f) => {
+                out.insert(f.ident.sym.to_string());
+            }
+            Decl::Class(c) => {
+                out.insert(c.ident.sym.to_string());
+            }
+            // TS-only / enum / namespace forms: see doc above (accepted misses).
+            _ => {}
+        }
+    }
+    out
+}
 
 /// Mapping from local names to their module source strings, built from the
 /// `import` declarations and top-level `const x = require(...)` calls in a
@@ -308,6 +382,76 @@ mod tests {
         assert!(
             !t.has_dynamic(),
             "static import only should NOT set has_dynamic"
+        );
+    }
+
+    #[test]
+    fn module_bindings_collects_top_level_only() {
+        use crate::functions;
+        use crate::source::Lang;
+        let src = "\
+import x from 'm';\n\
+const sharedMap = new Map();\n\
+let counter = 0;\n\
+var legacy;\n\
+const { a, b } = obj;\n\
+function helper() {}\n\
+class Box {}\n\
+export const exported = 1;\n\
+export function exportedFn() {}\n\
+export class ExportedClass {}\n\
+export default function namedDefault() {}\n\
+function withLocals() { const innerLocal = 1; let p = 2; return innerLocal + p; }\n";
+        let (module, _cm) = functions::parse_module(src, "t.ts", Lang::Ts).expect("parse");
+        let mb = module_bindings(&module);
+        // Top-level declarations are collected — bare, exported, and named default.
+        // Note `withLocals` itself IS a top-level function, so its NAME is collected;
+        // only the bindings *inside* its body are not (asserted below).
+        for name in [
+            "sharedMap",
+            "counter",
+            "legacy",
+            "a",
+            "b",
+            "helper",
+            "Box",
+            "exported",
+            "exportedFn",
+            "ExportedClass",
+            "namedDefault",
+            "withLocals",
+        ] {
+            assert!(
+                mb.contains(name),
+                "expected module binding `{name}`, got {mb:?}"
+            );
+        }
+        // Function-body locals are NOT collected:
+        assert!(
+            !mb.contains("innerLocal"),
+            "function-body local leaked into module_bindings"
+        );
+        assert!(
+            !mb.contains("p"),
+            "function-body local leaked into module_bindings"
+        );
+        // Imported names are NOT module-owned declarations (they live in the ImportTable):
+        assert!(
+            !mb.contains("x"),
+            "imported name leaked into module_bindings"
+        );
+
+        // A module allows only one `export default`, so the named-default CLASS branch
+        // needs its own parse (the fixture above exercised the default FUNCTION branch):
+        let (m2, _cm2) = functions::parse_module(
+            "export default class NamedDefaultClass {}",
+            "t2.ts",
+            Lang::Ts,
+        )
+        .expect("parse");
+        assert!(
+            module_bindings(&m2).contains("NamedDefaultClass"),
+            "named `export default class` should be collected"
         );
     }
 }

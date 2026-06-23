@@ -23,6 +23,7 @@ functions; Rust's mutation walker descends into closures and block-local `fn` it
 | constructor *direct* field-init | local.mutation | 1 | yes | no | Heuristic |
 | explicit declared capture (`nonlocal`, Python) | this.mutation | 3 | no | no | Exact |
 | real global / static | global.mutation | 6 | no | no | Exact/Heuristic |
+| write to a module top-level binding | global.mutation | 6 | no | no | Heuristic |
 | write to imported binding | global.mutation | 6 | no | no | Heuristic |
 | interior-mutability / ref-cell write | hidden.mutation | 3 | no | yes | Heuristic |
 | captured-enclosing / unresolved base | hidden.mutation | 3 | no | yes | Heuristic |
@@ -41,6 +42,17 @@ functions; Rust's mutation walker descends into closures and block-local `fn` it
 - **Plain rebind `x = …`** — Python no-emits (name-rebinding ≠ mutation); TS/Rust emit
   local.mutation/1 (variable-slot reassignment).
 - **Per-language mutating-method allowlists** — language-appropriate vocabularies.
+- **Module-binding detection is per-frontend & syntactic** — each frontend collects its own
+  module top-level binding set (Rust: real `static` set; TS: `const`/`let`/`var`/`fn`/`class`,
+  incl. `export` + named default; Python: module-level assign targets + `def`/`class` names).
+  Locals/params win before module bindings (a function-scoped binding shadows a module name);
+  the local-set construction is frontend-specific (TS traversal-order; Python whole-function
+  pre-scan that recurses through tuple/list/starred destructuring and handles augmented-assign
+  targets). In
+  **Python**, a `global x` *rebind* already escalates via the explicit `global`-decl arm
+  (Exact); the module-binding set adds the **content-mutation without `global`** case
+  (`_cache["k"]=1`, `shared.append(1)` — Heuristic). TS has no such keyword, so all module
+  writes go through the set.
 - **Destructuring-target writes** — dropped in all three (accepted limitation).
 - **Constructor breadth** — only a *direct* `this.x=`/`self.attr=` field-init is contained-local;
   a method/subscript write on the receiver escapes (TS aligned to Python's rule).
@@ -57,6 +69,12 @@ discounted to 2). Hidden state scores above declared state.
   (no casing proxy); interior-mut on shared `&` receivers → hidden; closures share the parent
   unit's sets.
 - **TS** — `var` hoist vs `let`/`const` TDZ unmodeled; `useRef().current` → ref-cell hidden;
-  imports + `globalThis`/`window` → global.
-- **Python** — `global`/`nonlocal` pre-scanned; comprehension scopes unmodeled; captured/module
-  fallback → hidden.
+  imports + `globalThis`/`window` + **module top-level bindings** (`const`/`let`/`var`/`fn`/`class`,
+  incl. `export`/named-default) → global; captured enclosing-function local → hidden.
+- **Python** — `global`/`nonlocal` pre-scanned; prescan now also collects `for`/`async for`
+  loop targets, `with … as`/`async with … as` names, and `except … as`/`except* … as` names
+  as function-local bindings (shadowing same-named module-level names); **module top-level
+  bindings** (module-level assign targets + `def`/`class` names) whose contents are mutated
+  → global; a genuinely captured enclosing-function local → hidden.
+  **Residual accepted limits:** `match` pattern captures, comprehension-scope targets
+  (Python 3 gives them their own scope), and walrus (`:=`) operator targets.

@@ -15,6 +15,8 @@ pub mod expr;
 pub mod mutation;
 pub mod risk;
 
+use std::collections::HashSet;
+
 use crate::coverage;
 use crate::functions::{FnBody, FnUnit};
 use crate::imports::Imports;
@@ -902,7 +904,13 @@ fn count_awaits(unit: &FnUnit) -> usize {
 ///    are unresolved awaited calls), and `await_count` / `async_boundary`.
 ///
 /// Adding a detector is a one-line addition to the gather step.
-pub fn analyze_unit(unit: &FnUnit, path: &str, imports: &Imports, span: &SpanIndex) -> Hotspot {
+pub fn analyze_unit(
+    unit: &FnUnit,
+    path: &str,
+    imports: &Imports,
+    module_bindings: &HashSet<String>,
+    span: &SpanIndex,
+) -> Hotspot {
     // ── gather ───────────────────────────────────────────────────────────────
     let mut effects = calls::detect(unit, imports, span);
 
@@ -919,7 +927,7 @@ pub fn analyze_unit(unit: &FnUnit, path: &str, imports: &Imports, span: &SpanInd
     } else {
         cov.boundary
     };
-    let mut_pairs = mutation::detect(unit, imports, span);
+    let mut_pairs = mutation::detect(unit, imports, module_bindings, span);
     effects.extend(mut_pairs.into_iter().map(|(mut e, contained)| {
         // Only record a discount when the boundary actually shifts the class —
         // i.e. Partial/Full coverage. `None` (incl. a typed boundary voided by a
@@ -1020,12 +1028,21 @@ mod tests {
         let src = std::fs::read_to_string(format!("tests/fixtures/{name}.py")).unwrap();
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
         let span = SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = crate::functions::collect(&module, &src, &span, &anchors);
         units
             .iter()
-            .map(|unit| analyze_unit(unit, &format!("tests/fixtures/{name}.py"), &imports, &span))
+            .map(|unit| {
+                analyze_unit(
+                    unit,
+                    &format!("tests/fixtures/{name}.py"),
+                    &imports,
+                    &module_bindings,
+                    &span,
+                )
+            })
             .collect()
     }
 
@@ -1133,11 +1150,12 @@ mod tests {
         let src = "async def f(xs):\n    return xs[await key()]\n";
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).unwrap();
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
         let f = units.iter().find(|u| u.symbol == "f").unwrap();
-        let h = analyze_unit(f, "x.py", &imports, &span);
+        let h = analyze_unit(f, "x.py", &imports, &module_bindings, &span);
         assert!(
             h.await_count >= 1,
             "await in subscript index must count, got await_count={}",
@@ -1154,11 +1172,12 @@ mod tests {
         let src = "async def f(xs):\n    xs[await key()] = 1\n";
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).unwrap();
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
         let f = units.iter().find(|u| u.symbol == "f").unwrap();
-        let h = analyze_unit(f, "x.py", &imports, &span);
+        let h = analyze_unit(f, "x.py", &imports, &module_bindings, &span);
         assert!(
             h.await_count >= 1,
             "await in an assignment-target subscript index must count, got await_count={}",
@@ -1397,11 +1416,12 @@ mod tests {
         let src = "import requests\ndef f(x, u):\n    return f\"{x:{requests.get(u)}}\"\n";
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
         let unit = units.iter().find(|u| u.symbol == "f").unwrap();
-        let h = analyze_unit(unit, "x.py", &imports, &span);
+        let h = analyze_unit(unit, "x.py", &imports, &module_bindings, &span);
         assert!(
             h.effects.iter().any(|e| e.kind.wire() == "net.fs.db"),
             "requests.get(u) inside f-string format_spec must emit net.fs.db; got: {:?}",
@@ -1416,11 +1436,12 @@ mod tests {
         let src = "async def f(x):\n    async def w(): ...\n    return f\"{x:{await w()}}\"\n";
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
         let outer = units.iter().find(|u| u.symbol == "f").unwrap();
-        let h = analyze_unit(outer, "x.py", &imports, &span);
+        let h = analyze_unit(outer, "x.py", &imports, &module_bindings, &span);
         assert!(
             h.await_count >= 1,
             "await inside f-string format_spec must count; got await_count={}",
@@ -1439,11 +1460,12 @@ mod tests {
         let src = "from typing import Any, cast\ndef f(x: int, y: int) -> int:\n    acc: list[int] = []\n    _ = f\"{x:{cast(Any, y)}}\"\n    return x\n";
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
         let unit = units.iter().find(|u| u.symbol == "f").unwrap();
-        let h = analyze_unit(unit, "x.py", &imports, &span);
+        let h = analyze_unit(unit, "x.py", &imports, &module_bindings, &span);
         assert!(
             h.risk_features
                 .iter()
