@@ -459,6 +459,32 @@ impl MutSink<'_> {
         // but the Python spec does not yet require that tier.
     }
 
+    /// Push a `HiddenMutation` (`hidden:true` + a `subreason`), always escaping
+    /// (`contained:false`). Used for writes whose root is an opaque captured /
+    /// imported binding — the analog of the TS frontend's `captured` hidden case.
+    #[allow(dead_code)]
+    fn push_hidden(&mut self, line: usize, evidence: String, subreason: &str) {
+        let kind = EffectKind::HiddenMutation;
+        let tier = Tier::Heuristic;
+        let class = kind.base_class();
+        self.effects.push((
+            Effect {
+                kind,
+                class,
+                discounted_to: None,
+                weight: weight_for_class(class),
+                line,
+                tier,
+                hidden: true,
+                evidence,
+                discount: None,
+                subreason: Some(subreason.to_owned()),
+                confidence: detection_confidence(tier, false, false),
+            },
+            false,
+        ));
+    }
+
     fn push(
         &mut self,
         kind: EffectKind,
@@ -690,6 +716,36 @@ mod tests {
             "`self[i] = v` must be ThisMutation(false), got: {:?}",
             m["store"]
         );
+    }
+
+    /// PREREQ 1: MutSink can emit a HiddenMutation (hidden:true + subreason) —
+    /// the channel Python has never used. `push` stays the honest hidden:false path.
+    #[test]
+    fn push_hidden_emits_hidden_mutation_with_subreason() {
+        let params = std::collections::HashSet::new();
+        let globals = std::collections::HashSet::new();
+        let nonlocals = std::collections::HashSet::new();
+        let locals = std::collections::HashSet::new();
+        let src = "x\n";
+        let span = crate::source::SpanIndex::new(src);
+        let mut sink = MutSink {
+            params: &params,
+            globals: &globals,
+            nonlocals: &nonlocals,
+            locals: &locals,
+            is_init: false,
+            span: &span,
+            effects: Vec::new(),
+        };
+        sink.push_hidden(1, "outer_acc.append(…)".to_string(), "captured-binding");
+
+        assert_eq!(sink.effects.len(), 1);
+        let (effect, contained) = &sink.effects[0];
+        assert_eq!(effect.kind, EffectKind::HiddenMutation);
+        assert_eq!(effect.class, 3);
+        assert!(effect.hidden, "push_hidden must set hidden:true");
+        assert_eq!(effect.subreason.as_deref(), Some("captured-binding"));
+        assert!(!contained, "hidden writes escape — contained=false");
     }
 
     /// FIX 2: mutating-method evidence renders the full receiver expression
