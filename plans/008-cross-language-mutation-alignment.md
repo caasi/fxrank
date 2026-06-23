@@ -145,93 +145,193 @@ In `detect/mod.rs`, change `gather` line 93 from `effects.extend(mutation::detec
 
 ### Task R2: F2 — real-static write → `global.mutation`/6; retire `is_screaming_snake`
 
+> **Replaces** the existing test `screaming_snake_write_is_global_mutation_class_6` (in
+> `tests/rust_frontend.rs`), which asserted the casing proxy. **`collect_static_names` (lib.rs)
+> already collects ALL `static` items** — it matches `syn::Item::Static(_)` unconditionally, so
+> both `static mut X` and a plain `static X: AtomicU32` are in the set; no extension needed.
+> **F2 has two emission sites:** (1) `record_write`'s cascade for *assignment / mutating-method*
+> writes to a static, and (2) the **interior-mutator branch** of `visit_expr_method_call` for an
+> *interior-mutable* static (atomic / `Mutex`) written via `.store()`/`.lock()` — which never
+> reaches `record_write`. `shared_refs` is checked **before** `statics` so the anti-Goodhart
+> `&self` interior-mut case stays `hidden.mutation`. No committed `.snap` changes (snapshots
+> analyze only `worked_cases.rs`, which has no static writes).
+
 **Files:**
-- Modify: `crates/fxrank-lang-rust/src/detect/mutation.rs` (`record_write` lines 176–189; delete `is_screaming_snake` lines 236–243; module doc lines 19–22)
-- Modify: `crates/fxrank-lang-rust/tests/fixtures/mutation.rs` (append fixtures)
-- Modify: `crates/fxrank-lang-rust/tests/rust_frontend.rs` (replace `screaming_snake_write_is_global_mutation_class_6`, lines 440–452)
+- Modify: `crates/fxrank-lang-rust/src/detect/mutation.rs` (`record_write` static arm; the `is_interior_mutator` branch of `visit_expr_method_call`; delete `is_screaming_snake`; module doc)
+- Modify: `crates/fxrank-lang-rust/tests/fixtures/mutation.rs` (append three fixtures)
+- Modify: `crates/fxrank-lang-rust/tests/rust_frontend.rs` (delete `screaming_snake_write_is_global_mutation_class_6`; add four tests)
 
 **Interfaces:**
-- Consumes: `self.statics: &HashSet<String>` (from R1).
-- Produces: the global-mutation arm keys off the real static set instead of `is_screaming_snake`.
+- Consumes: `self.statics: &HashSet<String>` (from R1); `self.shared_refs`; `base_ident(&node.receiver)`.
+- Produces: `global.mutation`/6 from both the `record_write` cascade and the interior-mutator branch when the base is a real static.
 
-- [ ] **Step 1: Write the failing test** — the discriminating RED is a **lowercase** static (proves resolution moved off casing). Append to `tests/fixtures/mutation.rs`:
+- [ ] **Step 1: Write the failing fixtures** — append to `tests/fixtures/mutation.rs`:
 
 ```rust
-// 008-F2: a *lowercase* static — proves resolution is by the static set, not casing.
-static counter_cell: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-fn write_lowercase_static() {
-    counter_cell.store(1, std::sync::atomic::Ordering::SeqCst);
+// R2 (F2): a *lowercase* `static mut` written by direct assignment. Proves the
+// real-static detection is casing-INDEPENDENT (pre-fix `is_screaming_snake`
+// rejects the lowercase base → dropped → no global.mutation).
+static mut counter_cell: u32 = 0;
+fn write_lower_static_mut() {
+    unsafe {
+        counter_cell = 1;
+    }
 }
 
-// 008-F2: `SHADOW` is an UPPERCASE *local*, not a static. With the proxy retired,
-// its write is a plain local.mutation, never global.mutation.
-fn uppercase_local_not_global() {
-    let mut SHADOW = 0;
-    SHADOW = 1;
-    let _ = SHADOW;
+// R2 (F2): a plain `static` of interior-mutable type written via `.store()`. The
+// write routes through the interior-mutator branch of visit_expr_method_call, NOT
+// record_write. Pre-fix that branch only fires for `shared_refs` bases, so an
+// atomic static base is dropped → no global.mutation.
+use std::sync::atomic::{AtomicU32, Ordering};
+static HITS: AtomicU32 = AtomicU32::new(0);
+fn store_atomic_static() {
+    HITS.store(1, Ordering::Relaxed);
+}
+
+// R2 (F2): an UPPERCASE base bound NOWHERE and NOT a file-level static — the real
+// proxy-retirement discriminator. Pre-fix `is_screaming_snake("UNBOUND_THING")` is
+// true → wrongly emits global.mutation. Post-fix it is not in `statics` → dropped.
+fn write_unbound_upper() {
+    UNBOUND_THING.field = 1;
 }
 ```
 
-Replace the old test in `tests/rust_frontend.rs` (lines 440–452) with:
+Delete the `screaming_snake_write_is_global_mutation_class_6` test in `tests/rust_frontend.rs` and add:
 
 ```rust
-// ── Spec 008 F2: write to a real `static` → global.mutation class 6 ──────────
+// ── Task R2 (F2): real-static write → global.mutation (class 6) ───────────────
+/// A *lowercase* `static mut` written by direct assignment is global.mutation/6
+/// (casing-independent; the old proxy rejected the lowercase base).
 #[test]
-fn lowercase_static_store_is_global_mutation_class_6() {
+fn lowercase_static_mut_assign_is_global_mutation_class_6() {
     let out = analyze_fixture("mutation.rs");
-    let effects = effects_of(&out, "write_lowercase_static");
+    let effects = effects_of(&out, "write_lower_static_mut");
     let e = one_kind(&effects, "global.mutation");
     assert_eq!(e.class, 6, "global.mutation is class 6 (no class-4 downgrade)");
-    assert_eq!(e.tier, Tier::Heuristic, "static-set resolution is heuristic");
-    assert_eq!(e.discounted_to, None);
-    assert!(e.evidence.contains("counter_cell"), "evidence names the static, got: {}", e.evidence);
+    assert_eq!(e.tier, Tier::Heuristic, "static write-through is heuristic");
+    assert_eq!(e.discounted_to, None, "global.mutation is never discounted");
+    assert!(!e.hidden, "a global static write is not hidden");
 }
 
+/// An interior-mutable plain `static` written via `.store()` is global.mutation/6
+/// (the interior-mutator emission site: a static base, not a shared_refs member).
 #[test]
-fn uppercase_non_static_write_is_not_global_mutation() {
+fn atomic_static_store_is_global_mutation_class_6() {
     let out = analyze_fixture("mutation.rs");
-    let effects = effects_of(&out, "uppercase_local_not_global");
+    let effects = effects_of(&out, "store_atomic_static");
+    let e = one_kind(&effects, "global.mutation");
+    assert_eq!(e.class, 6);
+    assert_eq!(e.tier, Tier::Heuristic);
+    assert_eq!(e.discounted_to, None);
+    assert!(
+        effects.iter().all(|e| e.kind.wire() != "hidden.mutation"),
+        "atomic static .store() is global, not hidden"
+    );
+}
+
+/// An UPPERCASE ident bound nowhere and NOT a static must NOT be global.mutation
+/// (the proxy-retirement discriminator: the old casing heuristic flagged it).
+#[test]
+fn unbound_uppercase_non_static_is_not_global_mutation() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "write_unbound_upper");
     assert!(
         effects.iter().all(|e| e.kind.wire() != "global.mutation"),
-        "an UPPERCASE *local* must not be mis-scored as global.mutation, got: {:?}",
+        "an UPPERCASE non-static base must not be global.mutation, got: {:?}",
         effects.iter().map(|e| e.kind.wire()).collect::<Vec<_>>()
+    );
+}
+
+/// Regression (anti-Goodhart): a `&self` interior mutation stays hidden.mutation,
+/// NOT global.mutation, after the static rewiring (`self` is in shared_refs,
+/// checked first). Uses the existing interior-mut fixture/symbol.
+#[test]
+fn self_interior_mutation_stays_hidden_not_global() {
+    let out = analyze_fixture("mutation.rs");
+    let effects = effects_of(&out, "User::set");
+    assert!(
+        effects.iter().any(|e| e.kind.wire() == "hidden.mutation"),
+        "User::set must still emit hidden.mutation"
+    );
+    assert!(
+        effects.iter().all(|e| e.kind.wire() != "global.mutation"),
+        "User::set must NOT emit global.mutation (shared_refs checked before statics)"
     );
 }
 ```
 
-- [ ] **Step 2: Run test, verify it fails** — `cargo test -p fxrank-lang-rust lowercase_static_store_is_global_mutation_class_6`. Expected: **FAIL** — `expected exactly one global.mutation effect, got []` (old `is_screaming_snake("counter_cell")` is `false`, so the `.store` write on a non-`shared_refs` base is dropped).
+> Adjust `"User::set"` to whatever symbol the existing `&self` interior-mutability fixture uses
+> in `tests/fixtures/mutation.rs` (the one the canary `hidden_mutation_scores_higher_than_declared_mut_self` exercises).
 
-- [ ] **Step 3: Implement** — in `record_write` (lines 176–189), replace the `is_screaming_snake` arm:
+- [ ] **Step 2: Run, verify RED** — `cargo test -p fxrank-lang-rust lowercase_static_mut_assign_is_global_mutation_class_6 atomic_static_store_is_global_mutation_class_6 unbound_uppercase_non_static_is_not_global_mutation`. Expected: the two `*_is_global_mutation_class_6` tests fail with `expected exactly one global.mutation effect, got []` (lowercase rejected by the proxy; atomic base not in `shared_refs`); `unbound_uppercase_non_static…` fails because `is_screaming_snake("UNBOUND_THING")` is true → a spurious `global.mutation` IS present. (`self_interior_mutation_stays_hidden_not_global` passes already — canary baseline.)
+
+- [ ] **Step 3: Implement — site 1 (`record_write` cascade)** — replace the `is_screaming_snake` arm:
 
 ```rust
         } else if !self.locals.contains(&base) && self.statics.contains(&base) {
-            // 008-F2: a write whose base is a real file-level `static` (incl.
-            // `static mut`, atomics, `Mutex`, `OnceLock`, `RwLock`) is a true
-            // ambient-state write → global.mutation. Class-4 module-private
+            // F2: base is bound in no local/param/let-mut set but IS a file-level
+            // `static` — a real static write (direct/compound assignment, or a
+            // mutating method like `STATIC_VEC.push`). Class-4 module-private
             // downgrade DEFERRED per spec — always class 6.
             self.push_plain(
                 EffectKind::GlobalMutation,
                 Tier::Heuristic,
                 false,
                 line,
-                format!("write to static {base}"),
+                format!("write to global {base}"),
             );
         }
 ```
 
-Delete `is_screaming_snake` (lines 236–243) and update the module doc bullet (lines 19–22):
+- [ ] **Step 4: Implement — site 2 (interior-mutator branch)** — extend the `is_interior_mutator` branch of `visit_expr_method_call`. **`shared_refs` first** (preserves the anti-Goodhart `&self` → hidden case), **then `statics`**:
 
 ```rust
-//! - base is a real file-level `static` (in `statics`) → `global.mutation`
-//!   (class 6, heuristic — write-through to ambient state).
+        if is_interior_mutator(&method) {
+            let base = base_ident(&node.receiver);
+            if base.as_deref().is_some_and(|b| self.shared_refs.contains(b)) {
+                // Hidden mutation through a shared `&` base (`&T` param, or `self`
+                // when the receiver is `&self`). Checked FIRST so the anti-Goodhart
+                // `&self` interior-mut case stays `hidden`.
+                let base = base.expect("checked Some above");
+                self.push_plain(
+                    EffectKind::HiddenMutation,
+                    Tier::Heuristic,
+                    true,
+                    line,
+                    format!(".{method} on shared &{base}"),
+                );
+            } else if base.as_deref().is_some_and(|b| self.statics.contains(b)) {
+                // F2: the receiver base is a file-level interior-mutable `static`
+                // (atomic / `Mutex` / `OnceLock` / `RwLock`) written via `.store()` /
+                // `.lock()` / etc. → global.mutation, class 6.
+                let base = base.expect("checked Some above");
+                self.push_plain(
+                    EffectKind::GlobalMutation,
+                    Tier::Heuristic,
+                    false,
+                    line,
+                    format!("interior write to global {base} via .{method}"),
+                );
+            }
+        } else if is_mutating_method(&method) {
+            self.record_write(&node.receiver, line);
+        }
 ```
 
-(R3 replaces the fall-through; for now a non-local non-static base is still dropped.)
+- [ ] **Step 5: Implement — delete `is_screaming_snake` and fix the module doc.** Remove the whole `fn is_screaming_snake(...) -> bool { ... }`. Change the module-doc bullet:
 
-- [ ] **Step 4: Run test, verify pass** — `cargo test -p fxrank-lang-rust lowercase_static_store_is_global_mutation_class_6 uppercase_non_static_write_is_not_global_mutation`, then `cargo test -p fxrank-lang-rust`.
-- [ ] **Step 5: Snapshot review** — `cargo insta test -p fxrank-lang-rust --review`. Expected: **no pending**.
-- [ ] **Step 6: Clippy gate** — `cargo clippy -p fxrank-lang-rust --all-targets -- -D warnings` (confirms `is_screaming_snake` is fully removed, not orphaned).
-- [ ] **Step 7: Commit** — `git commit -m "feat(rust): F2 — score real-static writes as global.mutation, retire SCREAMING_SNAKE proxy"`
+```rust
+//! - base is a file-level `static` item (not a local/param) → `global.mutation`
+//!   (class 6, heuristic — written by assignment, a mutating method, or an
+//!   interior-mutability mutator like `.store()` on an atomic static).
+```
+
+(R3 replaces the cascade fall-through; for now a non-local non-static base is still dropped.)
+
+- [ ] **Step 6: Run, verify GREEN** — `cargo test -p fxrank-lang-rust lowercase_static_mut_assign_is_global_mutation_class_6 atomic_static_store_is_global_mutation_class_6 unbound_uppercase_non_static_is_not_global_mutation self_interior_mutation_stays_hidden_not_global` (all pass), then `cargo test -p fxrank-lang-rust` (full crate — esp. the canary `hidden_mutation_scores_higher_than_declared_mut_self`).
+- [ ] **Step 7: Snapshot review** — `cargo insta test -p fxrank-lang-rust --review`. Expected: **no pending** (snapshots use `worked_cases.rs`, untouched).
+- [ ] **Step 8: Clippy + fmt** — `cargo clippy -p fxrank-lang-rust --all-targets -- -D warnings && cargo fmt --check` (confirms `is_screaming_snake` is fully removed, not orphaned).
+- [ ] **Step 9: Commit** — `git commit -m "feat(rust): F2 — real-static (incl. atomic) writes → global.mutation/6, retire SCREAMING_SNAKE proxy"`
 
 ### Task R3: F1 — cascade-tail fallback → `hidden.mutation`/3/hidden
 
@@ -417,7 +517,7 @@ fn import_resolved_write_base_is_global_mutation_class_6() {
     }
 ```
 
-Update all `push_plain` call sites: `local.mutation` (record_write ~line 169) → trailing `None`; `global.mutation` F2 static arm → `None`; `global.mutation` F5 import arm → `None`; `hidden.mutation` F1 tail → `Some("captured-binding")`; `hidden.mutation` interior-mut (lines 301–307):
+Update **every** `push_plain` call site (the compiler will list them all once the signature changes): `local.mutation` (record_write) → trailing `None`; `global.mutation` F2 `record_write` static arm → `None`; **`global.mutation` F2 interior-mutator-static arm** (added in R2 site 2) → `None`; `global.mutation` F5 import arm → `None`; `hidden.mutation` F1 tail → `Some("captured-binding")`; `hidden.mutation` interior-mut shared-ref site:
 
 ```rust
                 self.push_plain(
@@ -744,7 +844,7 @@ Remove the `#[allow(dead_code)]` from `push_hidden` (P1).
 
 # TS frontend (Tasks T1–T2)
 
-**Intentional deltas:** TS is the *reference* for F1 (captured→hidden already correct) and F5 (imports→global already correct) — no change there. Only F4 (constructor breadth) and F3 (captured subreason) apply. The `worked.ts` snapshot has no constructor and the React fixtures have no constructor method/subscript-on-`this` write, so F4 produces **no snapshot churn**. F3 **will** add `subreason: "captured-binding"` to the plain captured-binding write in `uncontrolled_cell.tsx` — an intended snapshot delta to review/accept.
+**Intentional deltas:** TS is the *reference* for F1 (captured→hidden already correct) and F5 (imports→global already correct) — no change there. Only F4 (constructor breadth) and F3 (captured subreason) apply. **No committed TS snapshot changes:** `worked.ts` has no constructor; the React fixtures have no constructor method/subscript-on-`this` write (F4 no churn); and **no snapshotted fixture contains a captured-binding `hidden.mutation`** — the only `hidden.mutation` in any TS snapshot is the `uncontrolled_cell` *ref-cell* write (`inputRef.current = …`, already `subreason: "ref-cell-write"`), which T2 leaves untouched. So both F4 and F3 are proven by **direct-assertion unit tests**, not snapshots.
 
 ### Task T1: F4 — constructor breadth parity (only a direct `this.<ident>` field-init stays contained)
 
@@ -846,15 +946,18 @@ Change `classify` (lines 198–206):
 Add the helpers near `base_ident` (~line 357):
 
 ```rust
-/// `true` iff `place` is a DIRECT `this.<ident>` field place — a single
-/// non-computed member off a bare `this` receiver. The only constructor write
-/// shape that stays a contained `local.mutation` (F4). A method-call receiver
-/// (`this.xs.push`), a subscript (`this[i]`), or a deeper chain (`this.a.b`)
-/// all return `false` and escape to `this.mutation`.
+/// `true` iff `place` is a DIRECT named-field place off bare `this` — `this.x`
+/// or `this.#x` (a private field init is still a direct field init). The only
+/// constructor write shape that stays a contained `local.mutation` (F4). A
+/// computed `this[i]`, a method-call receiver (`this.xs.push`), or a deeper
+/// chain (`this.a.b`) all return `false` and escape to `this.mutation`.
 fn direct_this_field(place: &Expr) -> bool {
     match place {
         Expr::Member(m) => {
-            if matches!(m.prop, MemberProp::Computed(_)) {
+            // A *named* field place — `this.x` (Ident) or `this.#x` (PrivateName) —
+            // is a direct field-init. A computed `this[i]` (Computed) is a member-chain
+            // write, not a field-init, and escapes. (Match `&m.prop` by reference.)
+            if !matches!(&m.prop, MemberProp::Ident(_) | MemberProp::PrivateName(_)) {
                 return false;
             }
             matches!(strip_place_wrappers(&m.obj), Expr::This(_))
@@ -928,7 +1031,7 @@ fn strip_place_wrappers(expr: &Expr) -> &Expr {
 ```
 
 - [ ] **Step 4: Run test, verify pass** — `cargo test -p fxrank-lang-ts captured_binding_write_has_captured_subreason`. Regression-guard: `cargo test -p fxrank-lang-ts useref_current_write_is_hidden_mutation classifies_mutation_by_escape` (ref-cell subreason `"ref-cell-write"` and `viaClosure`→`hidden.mutation` still hold).
-- [ ] **Step 5: Snapshot review (intended delta)** — `cargo test -p fxrank-lang-ts --test react`. The plain captured-binding write in `uncontrolled_cell.tsx` (per CLAUDE.md, previously `hidden.mutation` with **no** subreason) will now gain `subreason: "captured-binding"`. **This is the intended F3 delta.** Run `cargo insta review`, confirm the diff shows **only** the added `"subreason": "captured-binding"` (class/kind/hidden unchanged), then accept.
+- [ ] **Step 5: Snapshot guard (no churn expected)** — `cargo test -p fxrank-lang-ts --test snapshots --test react`. Expected: **clean, no pending `.snap.new`** — no snapshotted TS fixture contains a captured-binding `hidden.mutation` (the only snapshotted `hidden.mutation` is the `uncontrolled_cell` ref-cell write, which T2 does not touch). The behavior is proven by the Step-1 unit test. If insta reports a pending diff, **stop and investigate** — it means a fixture unexpectedly exercises the captured fallback.
 - [ ] **Step 6: Commit** — `git commit -m "feat(ts): captured-binding mutation gains \"captured-binding\" subreason (F3)"`
 
 ---
@@ -946,11 +1049,17 @@ fn strip_place_wrappers(expr: &Expr) -> &Expr {
   - F2 real-static→`global.mutation`/6 + UPPERCASE-local NOT global: Rust `lowercase_static_store_is_global_mutation_class_6`, `uppercase_non_static_write_is_not_global_mutation`.
   - F4 ctor direct vs method/subscript: TS `ctor_direct_field_init_stays_local_mutation`, `ctor_method_call_on_this_escapes_to_this_mutation`, `ctor_subscript_write_on_this_escapes_to_this_mutation` (Python reference: `self_method_and_subscript_mutations_escape_even_in_init`).
   - F5 import→`global.mutation`/6: Rust `import_resolved_write_base_is_global_mutation_class_6`, Python `import_rooted_write_is_global_mutation`.
-  - Run: `cargo test --workspace mutation:: captured import ctor static hidden` (smoke over the parity tests) — Expected: all pass.
+  - Run them per package (cargo accepts only **one** filter substring per invocation):
+    ```bash
+    cargo test -p fxrank-lang-rust   # all rust-frontend tests incl. the new F1/F2/F5/F3
+    cargo test -p fxrank-lang-python # incl. captured_binding / import_rooted
+    cargo test -p fxrank-lang-ts     # incl. ctor_* / captured_binding_write_has_captured_subreason
+    ```
+    Expected: all pass.
 
 - [ ] **Step 2: Re-assert the anti-Goodhart canary across the suite.** Run: `cargo test --workspace hidden_mutation_scores_higher_than_declared_mut_self snapshot_inversion_pair`. Expected: pass (the alignment must not have perturbed the inversion).
 
-- [ ] **Step 3: Confirm React internals un-regressed.** Run: `cargo test -p fxrank-lang-ts --test react`. Expected: pass; the only accepted snapshot delta is the `uncontrolled_cell` `captured-binding` subreason addition (T2). No score-inheritance / `EffectInRender` / ref-cell-inheritance change.
+- [ ] **Step 3: Confirm React internals un-regressed.** Run: `cargo test -p fxrank-lang-ts --test react`. Expected: pass with **no** snapshot churn — score-inheritance, `EffectInRender`, and ref-cell-inheritance are all unchanged (the alignment touches none of them).
 
 - [ ] **Step 4: Full CI gates.** Run, in order:
   ```bash
@@ -980,7 +1089,7 @@ fn strip_place_wrappers(expr: &Expr) -> &Expr {
   cargo run -p fxrank -- scan crates/ | jq '.hotspots[] | {id, own_score}' > /tmp/008-rust-after.json
   diff <(jq -S . /tmp/008-rust-before.json) <(jq -S . /tmp/008-rust-after.json) || true
   ```
-  Expected: the only deltas are the intended ones — Python functions gaining `hidden`/`global` effects (were pure), Rust UPPERCASE-non-static moving `global`→`hidden` and real statics now caught, TS constructor method/subscript writes moving `local`→`this.mutation`. **No unexplained movement.**
+  Expected: the only deltas are the intended ones — Python functions gaining `hidden`/`global` effects (were pure); Rust **unresolved UPPERCASE non-static bases** moving `global`→`hidden` (uppercase *locals* stay `local.mutation`) and real statics (incl. atomic/`Mutex`) now caught as `global`; TS constructor method/subscript writes moving `local`→`this.mutation`. **No unexplained movement.**
 
 - [ ] **Step 3: Write `docs/008-dogfood-deltas.md`** — a short bullet list: for each frontend, the functions whose ranking moved and which F-number caused it. If any movement is unexplained, **stop** — it is a bug, not a delta; fix the responsible task before proceeding.
 
