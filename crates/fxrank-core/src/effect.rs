@@ -28,6 +28,7 @@ pub enum EffectKind {
     UnknownMacro,
     ThisMutation,
     StateTransition,
+    ExternalUnresolved,
 }
 impl EffectKind {
     pub fn wire(self) -> &'static str {
@@ -50,6 +51,7 @@ impl EffectKind {
             UnknownMacro => "unknown.macro",
             ThisMutation => "this.mutation",
             StateTransition => "state.transition",
+            ExternalUnresolved => "external.unresolved",
         }
     }
     pub fn base_class(self) -> u8 {
@@ -61,7 +63,7 @@ impl EffectKind {
             EnvRead | Logging | Panic => 4,
             GlobalMutation => 6,
             HiddenMutation | ParamMutation => 3,
-            AmbientRead | UnknownMacro => 2,
+            AmbientRead | UnknownMacro | ExternalUnresolved => 2,
             LocalMutation | StateTransition => 1,
             ThisMutation => 3,
         }
@@ -130,6 +132,16 @@ impl RiskKind {
             ImplDrop | ExternBlock => 2,
         }
     }
+
+    /// Whether this risk propagates to a caller (capability) or is encapsulated by
+    /// the callee. Spec 025 sec 7 / sec 15.7 — a judgment table, change here if dogfooding shifts it.
+    pub fn escapes(self) -> bool {
+        use RiskKind::*;
+        matches!(
+            self,
+            DynamicCode | FfiCall | HtmlInjection | ProtoPollution | EffectInRender
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -141,9 +153,12 @@ pub struct Effect {
     pub discounted_to: Option<u8>,
     pub weight: u32,
     pub line: usize,
+    pub col: usize,
     pub tier: Tier,
     #[serde(skip_serializing_if = "is_false")]
     pub hidden: bool,
+    #[serde(skip)]
+    pub contained: bool,
     pub evidence: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discount: Option<String>,
@@ -159,6 +174,12 @@ impl Effect {
     pub fn sync_weight(&mut self) {
         self.weight = weight_for_class(self.effective_class());
     }
+    /// Returns `true` if this effect propagates to the caller.
+    /// `ExternalUnresolved` always escapes (it represents an unresolved call boundary).
+    /// All other effects escape when not marked as contained.
+    pub fn escapes(&self) -> bool {
+        matches!(self.kind, EffectKind::ExternalUnresolved) || !self.contained
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,6 +190,7 @@ pub struct RiskFeature {
     pub weight: u32,
     pub path: String,
     pub line: usize,
+    pub col: usize,
     pub evidence: String,
     pub tier: Tier,
 }
@@ -219,6 +241,75 @@ mod tests {
     }
 
     #[test]
+    fn effect_and_risk_carry_col() {
+        let e = Effect {
+            kind: EffectKind::NetFsDb,
+            class: 7,
+            discounted_to: None,
+            weight: 21,
+            line: 4,
+            col: 9,
+            tier: Tier::Path,
+            hidden: false,
+            contained: false,
+            evidence: "fetch(x)".into(),
+            discount: None,
+            subreason: None,
+            confidence: 1.0,
+        };
+        assert_eq!(e.col, 9);
+        let j = serde_json::to_string(&e).unwrap();
+        assert!(j.contains("\"line\":4,\"col\":9"));
+    }
+
+    #[test]
+    fn external_unresolved_is_class_2() {
+        assert_eq!(EffectKind::ExternalUnresolved.wire(), "external.unresolved");
+        assert_eq!(EffectKind::ExternalUnresolved.base_class(), 2);
+    }
+
+    #[test]
+    fn risk_escaping_predicate() {
+        // capability risks the caller transitively triggers -> escape
+        assert!(RiskKind::DynamicCode.escapes());
+        assert!(RiskKind::FfiCall.escapes());
+        assert!(RiskKind::HtmlInjection.escapes());
+        assert!(RiskKind::ProtoPollution.escapes());
+        assert!(RiskKind::EffectInRender.escapes());
+        // encapsulated risks the callee owns -> do not escape
+        assert!(!RiskKind::UnsafeBlock.escapes());
+        assert!(!RiskKind::Transmute.escapes());
+        assert!(!RiskKind::RawPtrDeref.escapes());
+        assert!(!RiskKind::MemForget.escapes());
+        assert!(!RiskKind::ImplDrop.escapes());
+    }
+
+    #[test]
+    fn effect_escapes_unless_contained() {
+        let mut e = Effect {
+            kind: EffectKind::LocalMutation,
+            class: 1,
+            discounted_to: None,
+            weight: 1,
+            line: 1,
+            col: 1,
+            tier: Tier::Exact,
+            hidden: false,
+            contained: true,
+            evidence: "s = 1".into(),
+            discount: None,
+            subreason: None,
+            confidence: 1.0,
+        };
+        assert!(!e.escapes()); // contained local mutation stays put
+        e.contained = false;
+        assert!(e.escapes()); // escaping mutation propagates
+        e.kind = EffectKind::ExternalUnresolved;
+        e.contained = true;
+        assert!(e.escapes()); // external.unresolved always escapes
+    }
+
+    #[test]
     fn subreason_serializes_only_when_present() {
         let mut e = Effect {
             kind: EffectKind::HiddenMutation,
@@ -226,8 +317,10 @@ mod tests {
             discounted_to: None,
             weight: 3,
             line: 1,
+            col: 1,
             tier: Tier::Heuristic,
             hidden: true,
+            contained: false,
             evidence: "x".into(),
             discount: None,
             subreason: Some("ref-cell-write".into()),

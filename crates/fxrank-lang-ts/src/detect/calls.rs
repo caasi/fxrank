@@ -57,8 +57,8 @@ impl Visit for CallWalker<'_> {
             && let Some(rendered) = render_expr(callee)
             && let Some((kind, tier)) = self.classify_call(&rendered)
         {
-            let line = self.lines.line(node.span);
-            self.push(kind, tier, line, format!("{rendered}(…)"));
+            let (line, col) = self.lines.line_col(node.span);
+            self.push(kind, tier, line, col, format!("{rendered}(…)"));
         }
         node.visit_children_with(self);
     }
@@ -74,15 +74,21 @@ impl Visit for CallWalker<'_> {
             && !rest.is_empty()
             && !rest.contains('.')
         {
-            let line = self.lines.line(node.span);
-            self.push(EffectKind::EnvRead, Tier::Heuristic, line, rendered);
+            let (line, col) = self.lines.line_col(node.span);
+            self.push(EffectKind::EnvRead, Tier::Heuristic, line, col, rendered);
         }
         node.visit_children_with(self);
     }
 
     fn visit_throw_stmt(&mut self, node: &ThrowStmt) {
-        let line = self.lines.line(node.span);
-        self.push(EffectKind::Panic, Tier::Exact, line, "throw".to_string());
+        let (line, col) = self.lines.line_col(node.span);
+        self.push(
+            EffectKind::Panic,
+            Tier::Exact,
+            line,
+            col,
+            "throw".to_string(),
+        );
         node.visit_children_with(self);
     }
 
@@ -90,8 +96,8 @@ impl Visit for CallWalker<'_> {
         if let Some(name) = render_expr(&node.callee) {
             let no_args = node.args.as_ref().is_none_or(|a| a.is_empty());
             if let Some((kind, tier)) = classify_new_expr(&name, no_args) {
-                let line = self.lines.line(node.span);
-                self.push(kind, tier, line, format!("new {name}(…)"));
+                let (line, col) = self.lines.line_col(node.span);
+                self.push(kind, tier, line, col, format!("new {name}(…)"));
             }
         }
         node.visit_children_with(self);
@@ -103,7 +109,7 @@ impl Visit for CallWalker<'_> {
 }
 
 impl CallWalker<'_> {
-    fn push(&mut self, kind: EffectKind, tier: Tier, line: usize, evidence: String) {
+    fn push(&mut self, kind: EffectKind, tier: Tier, line: usize, col: usize, evidence: String) {
         let class = kind.base_class();
         // Path tier carries a shadow penalty when the file has a dynamic import,
         // because a bare name could resolve to a module we never see (the
@@ -116,8 +122,10 @@ impl CallWalker<'_> {
             discounted_to: None,
             weight: weight_for_class(class),
             line,
+            col,
             tier,
             hidden: false,
+            contained: false,
             evidence,
             discount: None,
             subreason: None,
@@ -292,5 +300,33 @@ mod tests {
         let src = "import { readFile } from 'node:fs';\nfunction f() { readFile('p'); }";
         let k = kinds(src, "f");
         assert!(k.contains(&"net.fs.db".to_string()));
+    }
+
+    /// Two same-kind effects on the same line at different columns must have
+    /// distinct `col` values — verifying the col fix resolves the SiteKey
+    /// collapse bug (both col=0 → deduped to one site).
+    #[test]
+    fn two_same_kind_effects_same_line_have_distinct_col() {
+        // Both `fetch` calls are on the same line (line 1), at different columns.
+        let src = "function f() { fetch('a'); fetch('b'); }";
+        let (module, cm) = functions::parse_module(src, "t.ts", Lang::Ts).expect("parse");
+        let lines = SpanLines::new(cm);
+        let imports = ImportTable::from_module(&module);
+        let units = functions::collect(&module, "t.ts", &lines);
+        let unit = units.iter().find(|u| u.symbol == "f").expect("unit");
+        let effects = detect(&unit.body, &imports, &lines);
+        // Must have exactly two net.fs.db effects.
+        let net: Vec<_> = effects
+            .iter()
+            .filter(|e| e.kind.wire() == "net.fs.db")
+            .collect();
+        assert_eq!(net.len(), 2, "expected two net.fs.db effects; got {net:?}");
+        // Both on the same line, but at different columns.
+        assert_eq!(net[0].line, net[1].line, "both fetches must be on line 1");
+        assert_ne!(
+            net[0].col, net[1].col,
+            "two fetches on the same line must have distinct cols, got col={} and col={}",
+            net[0].col, net[1].col
+        );
     }
 }

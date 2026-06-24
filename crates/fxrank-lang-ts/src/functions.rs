@@ -26,10 +26,12 @@
 //! (inline callbacks such as `[1].map(x => x)`). Anonymous function expressions
 //! use `<fn@L{line}C{col}>` as their positional fallback.
 
+use swc_common::{DUMMY_SP, SyntaxContext};
 use swc_ecma_ast::{
-    ArrowExpr, BlockStmtOrExpr, Class, ClassMethod, Constructor, Decl, Expr, FnDecl, FnExpr,
-    Function, GetterProp, MethodKind, MethodProp, ParamOrTsParamProp, Pat, PrivateMethod, PropName,
-    SetterProp, Stmt, TsTypeAnn, VarDeclarator,
+    ArrowExpr, BlockStmtOrExpr, Class, ClassDecl, ClassMethod, Constructor, Decl, DefaultDecl,
+    Expr, ExprStmt, FnDecl, FnExpr, Function, GetterProp, Ident, MethodKind, MethodProp, Module,
+    ModuleDecl, ModuleItem, ParamOrTsParamProp, Pat, PrivateMethod, PropName, SetterProp, Stmt,
+    TsTypeAnn, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -172,6 +174,139 @@ pub fn collect(module: &swc_ecma_ast::Module, path: &str, lines: &SpanLines) -> 
     };
     module.visit_with(&mut collector);
     collector.units
+}
+
+/// Build a synthetic `FnUnit` representing the module's top-level initialisation
+/// code — the "import-time" effects that run when the file is first loaded.
+///
+/// Collects all top-level executable statements:
+/// - `ModuleItem::Stmt(stmt)` — bare statements (`fetch(...)`, `let x = ...`,
+///   expression statements, etc.).
+/// - `ModuleItem::ModuleDecl(ExportDecl(Decl::Var(...)))` — `export const/let`
+///   declarations whose initialisers may be effectful calls (e.g.
+///   `export const client = createClient()`). The entire `var` declaration is
+///   turned into a `Stmt::Decl(Decl::Var(...))` so that call-detectors walking
+///   the body see the initialiser expression.
+///
+/// Import declarations (`import x from '...'`) are `ModuleDecl` items that carry
+/// no runtime execution effect on their own and are deliberately excluded.
+///
+/// The body is `FnBodyOwned::Block(<collected stmts>)`. Because the TS detectors
+/// have own-body semantics (they do NOT recurse into nested `function`/arrow
+/// bodies), scoring this unit captures exactly the import-time effects — nested
+/// function definitions inside the module are their own units and are not
+/// double-counted.
+///
+/// Returns `None` when the module has no top-level executable statements (e.g. a
+/// module that consists solely of imports and function/class declarations) — the
+/// caller uses this to avoid allocating an empty unit.
+pub fn module_init_unit(module: &Module, path: &str) -> Option<FnUnit> {
+    let mut stmts: Vec<Stmt> = Vec::new();
+
+    for item in &module.body {
+        match item {
+            // Bare executable statement at module level (expression statements,
+            // variable declarations, etc.).
+            //
+            // Function DECLARATIONS are defined at module load but their bodies
+            // do NOT execute at import time:
+            //   `function f() { fetch("x"); }` — body runs only when called.
+            // Skipping them avoids a false `<module>` when the only top-level
+            // item is a function whose body has effects.  The ≥1-effect guard
+            // downstream catches the case anyway, but an accurate early-None is
+            // cheaper and self-documenting.
+            //
+            // Class DECLARATIONS are intentionally NOT skipped here: a bare
+            // `class C { static x = fetch() }` runs its static field initialisers
+            // at import time and IS executable.  The class-walker stops at method
+            // bodies, so only static-init effects are attributed to `<module>`.
+            // A class with no static effectful inits produces an empty `stmts`
+            // body and is dropped by the ≥1-effect guard.
+            //
+            // `export class C { static x = fetch() }` comes through the
+            // `ExportDecl(Decl::Class)` arm below (already handled correctly).
+            ModuleItem::Stmt(Stmt::Decl(Decl::Fn(_))) => {
+                // Function declaration: body does not run at import time — skip.
+            }
+            ModuleItem::Stmt(stmt) => {
+                stmts.push(stmt.clone());
+            }
+            // `export const/let/var x = expr` — the initialiser can have effects.
+            // Re-wrap as a `Stmt::Decl(Decl::Var(...))` so the call-walker sees
+            // the initialiser expressions when it walks the synthetic body.
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
+                match &export.decl {
+                    Decl::Var(v) => {
+                        stmts.push(Stmt::Decl(Decl::Var(Box::new((**v).clone()))));
+                    }
+                    // `export class Foo { static x = expr; static { ... } }` —
+                    // static field initialisers and static blocks run at import
+                    // time and must be captured. Re-wrap as a `Stmt::Decl` so the
+                    // call-walker (which stops at `visit_function` / `visit_arrow_expr`
+                    // / `visit_constructor`) visits the static-init expressions and
+                    // static-block bodies without descending into method bodies.
+                    Decl::Class(c) => {
+                        stmts.push(Stmt::Decl(Decl::Class(c.clone())));
+                    }
+                    _ => {}
+                }
+            }
+            // `export default class Foo { static x = expr }` — same reasoning.
+            // `ClassExpr` may or may not have an ident; synthesise a dummy ident
+            // (`<default>` at DUMMY_SP) for anonymous classes so that `ClassDecl`
+            // (which requires an `Ident`) can be constructed.
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => {
+                if let DefaultDecl::Class(c_expr) = &export.decl {
+                    let ident = c_expr.ident.clone().unwrap_or_else(|| {
+                        Ident::new("<default>".into(), DUMMY_SP, SyntaxContext::empty())
+                    });
+                    let class_decl = ClassDecl {
+                        ident,
+                        declare: false,
+                        class: c_expr.class.clone(),
+                    };
+                    stmts.push(Stmt::Decl(Decl::Class(class_decl)));
+                }
+            }
+            // `export default <expr>` — the expression is evaluated at import
+            // time and may have effects (e.g. `export default fetch("x")`,
+            // `export default createClient()`). Wrap it as a bare expression
+            // statement so the call-walker sees it. The downstream ≥1-effect
+            // guard drops pure cases (e.g. `export default 42`).
+            // Note: `export default function` / `export default class` are
+            // handled as `ExportDefaultDecl` above, not here.
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) => {
+                stmts.push(Stmt::Expr(ExprStmt {
+                    span: DUMMY_SP,
+                    expr: export.expr.clone(),
+                }));
+            }
+            // All other module declarations (import, export *, re-exports,
+            // type/interface aliases, etc.) carry no own-body runtime effect.
+            _ => {}
+        }
+    }
+
+    if stmts.is_empty() {
+        return None;
+    }
+
+    let symbol = "<module>".to_string();
+    let id = format!("{path}:1:1:<module>");
+    Some(FnUnit {
+        symbol,
+        id,
+        path: path.to_string(),
+        line: 1,
+        col: 1,
+        is_async: false,
+        is_constructor: false,
+        sig: FnSig {
+            params: Vec::new(),
+            return_type: None,
+        },
+        body: FnBodyOwned::Block(stmts),
+    })
 }
 
 struct Collector<'a> {

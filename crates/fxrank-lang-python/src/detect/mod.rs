@@ -13,6 +13,7 @@
 pub mod calls;
 pub mod expr;
 pub mod mutation;
+pub mod refs;
 pub mod risk;
 
 use std::collections::HashSet;
@@ -79,6 +80,39 @@ pub fn walk_own_body<'a>(unit: &FnUnit<'a>, sink: &mut dyn EffectSink) {
     match &unit.body {
         FnBody::Suite(suite) => walk_suite(suite, sink),
         FnBody::Expr(expr) => walk_expr(expr, sink),
+        // The synthetic `<module>` unit: walk each top-level statement.
+        // Special handling for top-level `ClassDef`: Python class bodies run at
+        // class-definition / import time, so class-level statements ARE import-time
+        // effects of `<module>`.  Walk the class body suite directly so that
+        // `class C: DATA = open("y")` charges `open("y")` to `<module>`.
+        // Nested `def` / method bodies inside the class are still their own units;
+        // `walk_suite` → `walk_compound` → `FunctionDef` → `walk_nested_def_header`
+        // already handles that (decorators + defaults only, NOT the method body).
+        // For all other statements (including top-level `FunctionDef`), the existing
+        // `walk_statement` → `walk_compound` boundary is correct:
+        //   top-level FunctionDef → `walk_nested_def_header` (decorators + defaults, NOT body)
+        //   everything else       → descend normally
+        FnBody::Module(stmts) => {
+            for stmt in *stmts {
+                match stmt {
+                    Statement::Compound(CompoundStatement::ClassDef(class_def)) => {
+                        // Walk the class body to capture class-level import-time effects.
+                        // `walk_suite` already makes nested `def` (methods) charge only
+                        // their header (decorators/defaults), never their bodies.
+                        walk_suite(&class_def.body, sink);
+                        // Also walk the class HEADER expressions, which run at
+                        // class-definition / import time (per guideline):
+                        //   @register(handler)          — decorator expression
+                        //   class C(make_base(), metaclass=M())  — base/keyword args
+                        // These are import-time effects charged to `<module>`, mirroring
+                        // how `walk_nested_def_header` handles a function's decorators and
+                        // parameter defaults (run in the enclosing scope, not inside).
+                        walk_class_header(class_def, sink);
+                    }
+                    other => walk_statement(other, sink),
+                }
+            }
+        }
     }
 }
 
@@ -91,6 +125,24 @@ fn walk_nested_def_header(def: &libcst_native::FunctionDef, sink: &mut dyn Effec
         walk_decorator(dec, sink);
     }
     walk_param_defaults(&def.params, sink);
+}
+
+/// Walk a top-level `ClassDef`'s **header expressions** — decorators and
+/// base-class / keyword-argument expressions — which run at class-definition /
+/// import time and are therefore import-time effects of `<module>`.
+///
+/// Mirrors `walk_nested_def_header` (function decorators + param defaults).
+/// Does NOT descend into the class body (handled separately by the caller).
+fn walk_class_header(class_def: &libcst_native::ClassDef, sink: &mut dyn EffectSink) {
+    for dec in &class_def.decorators {
+        walk_decorator(dec, sink);
+    }
+    // `bases` covers positional base-class args: `class C(Base(), ...)`.
+    // `keywords` covers keyword args: `class C(metaclass=M())`.
+    // Both are `Vec<Arg>` with a `value: Expression` field.
+    for arg in class_def.bases.iter().chain(class_def.keywords.iter()) {
+        walk_expr(&arg.value, sink);
+    }
 }
 
 fn walk_decorator(dec: &Decorator, sink: &mut dyn EffectSink) {
@@ -551,6 +603,32 @@ fn count_awaits(unit: &FnUnit) -> usize {
         match body {
             FnBody::Suite(suite) => count_in_suite(suite),
             FnBody::Expr(expr) => count_in_expr(expr),
+            // The `<module>` unit's body is a flat list of top-level statements.
+            // Top-level ClassDef: count awaits in both the class body (same as
+            // walk_own_body) and the class header expressions (decorators + base/
+            // keyword args, which run at import time — mirrors walk_class_header).
+            FnBody::Module(stmts) => stmts
+                .iter()
+                .map(|stmt| {
+                    if let libcst_native::Statement::Compound(
+                        libcst_native::CompoundStatement::ClassDef(c),
+                    ) = stmt
+                    {
+                        count_in_stmt(stmt)
+                            + c.decorators
+                                .iter()
+                                .map(|dec| count_in_expr(&dec.decorator))
+                                .sum::<usize>()
+                            + c.bases
+                                .iter()
+                                .chain(c.keywords.iter())
+                                .map(|arg| count_in_expr(&arg.value))
+                                .sum::<usize>()
+                    } else {
+                        count_in_stmt(stmt)
+                    }
+                })
+                .sum(),
         }
     }
 
@@ -895,29 +973,37 @@ fn count_awaits(unit: &FnUnit) -> usize {
 
 // ─── unit assembly ────────────────────────────────────────────────────────────
 
-/// Analyze one function-unit into an owned [`Hotspot`].
+/// Run every detector over `unit`'s own body and return the gathered
+/// `(effects, risks, await_count, async_boundary)` tuple.
 ///
-/// # Gather → Fold
-/// 1. **gather**: drive each detector over the own body to collect `Vec<Effect>`.
-/// 2. **fold**: compute `own_score`, `max_class`, function-level `confidence`
-///    (weakest-link min over per-effect confidences, plus 0.8 synthetic when there
-///    are unresolved awaited calls), and `await_count` / `async_boundary`.
+/// Both [`analyze_unit`] and [`build_record`] call this helper so the two
+/// callers can never silently diverge — any future detector addition touches
+/// one place. Mirrors the private `gather` in `fxrank-lang-rust/src/detect/mod.rs`.
+/// Return type of [`gather`]: `(effects, risks, await_count, async_boundary, unknown_decorator)`.
 ///
-/// Adding a detector is a one-line addition to the gather step.
-pub fn analyze_unit(
+/// `unknown_decorator` is forwarded to `analyze_unit` only — it lowers confidence
+/// without touching coverage.  `build_record` discards it (records carry no
+/// confidence field).
+type GatherOutput = (
+    Vec<fxrank_core::effect::Effect>,
+    Vec<RiskFeature>,
+    usize,
+    bool,
+    bool,
+);
+
+fn gather(
     unit: &FnUnit,
     path: &str,
     imports: &Imports,
     module_bindings: &HashSet<String>,
     span: &SpanIndex,
-) -> Hotspot {
-    // ── gather ───────────────────────────────────────────────────────────────
+) -> GatherOutput {
     let mut effects = calls::detect(unit, imports, span);
 
-    // Signature annotation coverage + `Any`/decorator signals (Task 9).
+    // Signature annotation coverage + `Any`/decorator signals.
     let cov = coverage::of(unit, imports);
 
-    // Task 8: mutation::detect — escape analysis + contained flag.
     // Apply the boundary-containment discount per the `contained` flag: a contained
     // (local-state) effect under an honest, typed boundary shifts down. Body `Any`
     // re-opens the boundary, so it voids the discount (coverage forced to `None`).
@@ -929,6 +1015,9 @@ pub fn analyze_unit(
     };
     let mut_pairs = mutation::detect(unit, imports, module_bindings, span);
     effects.extend(mut_pairs.into_iter().map(|(mut e, contained)| {
+        // Wire the tuple's containment bool onto the Effect so propagation logic
+        // (`Effect::escapes()`) sees the real value (not the default `false` stub).
+        e.contained = contained;
         // Only record a discount when the boundary actually shifts the class —
         // i.e. Partial/Full coverage. `None` (incl. a typed boundary voided by a
         // body `Any`) produces no shift, so we leave `discounted_to`/`discount`
@@ -947,14 +1036,11 @@ pub fn analyze_unit(
         }
         e
     }));
-    // ── risks ────────────────────────────────────────────────────────────────
+
     // The coverage gate owns the `Any`-family `type.escape` risk (class 3, exact):
     // an explicit `Any` in the signature or body is the `any ≈ unsafe` escape hatch.
-    // Task 10 adds dynamic.code etc. through this same Vec → fold.
-    let mut risks: Vec<RiskFeature> = Vec::new();
-
-    // Task 10: risk::detect — eval/exec/pickle/yaml/importlib/setattr/shell=True.
-    risks.extend(risk::detect(unit, imports, span, path));
+    // risk::detect adds eval/exec/pickle/yaml/importlib/setattr/shell=True.
+    let mut risks: Vec<RiskFeature> = risk::detect(unit, imports, span, path);
     if cov.any_in_signature || cov.any_in_body {
         let class = RiskKind::TypeEscape.class();
         risks.push(RiskFeature {
@@ -963,6 +1049,7 @@ pub fn analyze_unit(
             weight: weight_for_class(class),
             path: path.into(),
             line: unit.line,
+            col: unit.col,
             evidence: "explicit Any (signature or body) — type-escape hatch".into(),
             tier: Tier::Exact,
         });
@@ -970,6 +1057,35 @@ pub fn analyze_unit(
 
     let await_count = count_awaits(unit);
     let async_boundary = unit.is_async || await_count > 0;
+
+    (
+        effects,
+        risks,
+        await_count,
+        async_boundary,
+        cov.unknown_decorator,
+    )
+}
+
+/// Analyze one function-unit into an owned [`Hotspot`].
+///
+/// # Gather → Fold
+/// 1. **gather**: drive each detector over the own body to collect `Vec<Effect>`.
+/// 2. **fold**: compute `own_score`, `max_class`, function-level `confidence`
+///    (weakest-link min over per-effect confidences, plus 0.8 synthetic when there
+///    are unresolved awaited calls), and `await_count` / `async_boundary`.
+///
+/// Adding a detector is a one-line addition to the gather step (in [`gather`]).
+pub fn analyze_unit(
+    unit: &FnUnit,
+    path: &str,
+    imports: &Imports,
+    module_bindings: &HashSet<String>,
+    span: &SpanIndex,
+) -> Hotspot {
+    // ── gather ───────────────────────────────────────────────────────────────
+    let (effects, risks, await_count, async_boundary, unknown_decorator) =
+        gather(unit, path, imports, module_bindings, span);
 
     // ── fold ─────────────────────────────────────────────────────────────────
     let weights: Vec<u32> = effects.iter().map(|e| e.weight).collect();
@@ -986,7 +1102,7 @@ pub fn analyze_unit(
     if await_count > 0 {
         confidences.push(0.8);
     }
-    if cov.unknown_decorator {
+    if unknown_decorator {
         confidences.push(0.8);
     }
 
@@ -999,19 +1115,68 @@ pub fn analyze_unit(
         weight_for_class(risk_class)
     };
 
+    let mc = max_class(&classes, risk_class);
+    let os = own_score(&weights);
     Hotspot {
         id: format!("{}:{}:{}:{}", path, unit.line, unit.col, unit.symbol),
         symbol: unit.symbol.clone(),
         path: path.into(),
         line: unit.line,
-        max_class: max_class(&classes, risk_class),
-        own_score: own_score(&weights),
         risk_weight,
         confidence: function_confidence(&confidences),
         async_boundary,
         await_count,
         effects,
         risk_features: risks,
+        // Propagated fields default to own (cross-file folding overwrites them).
+        ..Hotspot::own_seed(os, mc)
+    }
+}
+
+// ─── build_record ─────────────────────────────────────────────────────────────
+
+/// Build a language-neutral [`fxrank_core::record::UnitRecord`] for `unit`.
+///
+/// Calls the shared [`gather`] helper (same as [`analyze_unit`]) so the record's
+/// `effects`/`risks`/`async_boundary`/`await_count` are byte-identical to the
+/// Hotspot. Also extracts outgoing call references via [`refs::extract`] for the
+/// cross-file resolver.
+///
+/// INVARIANT: this recomputes own-body via the same `gather` as `analyze_unit`.
+/// This stays correct only while `analyze_unit` does NO post-`gather` mutation of
+/// effects/risks (unlike TS, which absorbs React signals and so must copy from the
+/// final Hotspot). If you add a post-gather step here, switch to copying from the
+/// Hotspot or the record's own-body will drift from it.
+pub fn build_record(
+    unit: &FnUnit,
+    path: &str,
+    imports: &Imports,
+    module_bindings: &HashSet<String>,
+    span: &SpanIndex,
+) -> fxrank_core::record::UnitRecord {
+    // ── gather ─────────────────────────────────────────────────────────────
+    // `unknown_decorator` is a confidence-only signal; records carry no
+    // confidence field, so we discard it here.
+    let (effects, risks, await_count, async_boundary, _unknown_decorator) =
+        gather(unit, path, imports, module_bindings, span);
+
+    // ── refs ───────────────────────────────────────────────────────────────
+    let call_refs = refs::extract(unit, imports, span);
+
+    fxrank_core::record::UnitRecord {
+        unit_id: format!("{}:{}:{}:{}", path, unit.line, unit.col, unit.symbol),
+        path: path.into(),
+        line: unit.line,
+        col: unit.col,
+        symbol: unit.symbol.clone(),
+        is_root: false,
+        export: None,
+        effects,
+        risks,
+        refs: call_refs,
+        async_boundary,
+        await_count,
+        language: fxrank_core::frontend::Language::Python,
     }
 }
 
@@ -1475,6 +1640,309 @@ mod tests {
                 .iter()
                 .map(|r| r.kind.wire())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// Task 2 (Phase-3a): the mutation tuple's `contained` bool must flow through
+    /// to `Effect.contained` after `gather` assembles the effects list.
+    ///
+    /// - A body-local mutation (`acc.append(1)` where `acc` is a local) is
+    ///   `LocalMutation, contained=true` from the detector; `Effect.contained`
+    ///   must be `true` and `escapes()` must be `false`.
+    /// - An escaping mutation (`global g; g = 1` → `GlobalMutation`) is
+    ///   `contained=false`; `Effect.contained` must be `false` and `escapes()` must
+    ///   be `true`.
+    #[test]
+    fn gather_sets_effect_contained_from_mutation_tuple() {
+        // --- contained: body-local list build → LocalMutation, contained=true ---
+        let contained_src =
+            "def builds_local():\n    acc = []\n    acc.append(1)\n    return acc\n";
+        let module = libcst_native::parse_module(contained_src, None).unwrap();
+        let imports = Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
+        let span = SpanIndex::new(contained_src);
+        let anchors = crate::source::lambda_anchors(contained_src).expect("tokenize");
+        let (units, _) = crate::functions::collect(&module, contained_src, &span, &anchors);
+        let unit = units
+            .iter()
+            .find(|u| u.symbol == "builds_local")
+            .expect("builds_local not found");
+        let h = analyze_unit(unit, "test.py", &imports, &module_bindings, &span);
+        let local_mut = h
+            .effects
+            .iter()
+            .find(|e| e.kind.wire() == "local.mutation")
+            .expect("expected a local.mutation effect");
+        assert!(
+            local_mut.contained,
+            "local.mutation from a body-local build must have contained=true, got: {:?}",
+            local_mut
+        );
+        assert!(
+            !local_mut.escapes(),
+            "a contained local.mutation must not escape, got: {:?}",
+            local_mut
+        );
+
+        // --- escaping: global mutation → GlobalMutation, contained=false ---
+        let escaping_src = "_g = 0\ndef uses_global():\n    global _g\n    _g += 1\n";
+        let module2 = libcst_native::parse_module(escaping_src, None).unwrap();
+        let imports2 = Imports::build(&module2);
+        let module_bindings2 = crate::imports::module_bindings(&module2);
+        let span2 = SpanIndex::new(escaping_src);
+        let anchors2 = crate::source::lambda_anchors(escaping_src).expect("tokenize");
+        let (units2, _) = crate::functions::collect(&module2, escaping_src, &span2, &anchors2);
+        let unit2 = units2
+            .iter()
+            .find(|u| u.symbol == "uses_global")
+            .expect("uses_global not found");
+        let h2 = analyze_unit(unit2, "test.py", &imports2, &module_bindings2, &span2);
+        let global_mut = h2
+            .effects
+            .iter()
+            .find(|e| e.kind.wire() == "global.mutation")
+            .expect("expected a global.mutation effect");
+        assert!(
+            !global_mut.contained,
+            "global.mutation must have contained=false, got: {:?}",
+            global_mut
+        );
+        assert!(
+            global_mut.escapes(),
+            "a non-contained global.mutation must escape, got: {:?}",
+            global_mut
+        );
+    }
+
+    /// Task 4: `build_record` emits a `UnitRecord` 1:1 with the Hotspot.
+    /// Parse `import os\ndef writer():\n    os.getcwd()`; build the record;
+    /// assert: symbol "writer", a ref `base "os.getcwd"` with `qualified true`,
+    /// `unit_id` ends `:writer`, `language == Python`.
+    /// The frontend always emits `is_root: false`; the CLI sets the real value.
+    #[test]
+    fn build_record_emits_record_for_python_unit() {
+        let src = "import os\ndef writer():\n    os.getcwd()\n";
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let imports = Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
+        let span = SpanIndex::new(src);
+        let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
+        let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
+        let unit = units
+            .iter()
+            .find(|u| u.symbol == "writer")
+            .expect("writer unit not found");
+        let rec = build_record(unit, "test.py", &imports, &module_bindings, &span);
+
+        assert_eq!(rec.symbol, "writer");
+        assert!(
+            rec.unit_id.ends_with(":writer"),
+            "unit_id must end with ':writer', got: {}",
+            rec.unit_id
+        );
+        assert_eq!(
+            rec.language,
+            fxrank_core::frontend::Language::Python,
+            "language must be Python"
+        );
+        // Frontend always emits is_root: false; CLI sets the real value.
+        assert!(
+            !rec.is_root,
+            "frontend build_record must emit is_root=false (CLI sets the real value)"
+        );
+        let os_ref = rec
+            .refs
+            .iter()
+            .find(|r| r.base == "os.getcwd")
+            .expect("expected a ref with base 'os.getcwd'");
+        assert!(
+            os_ref.qualified,
+            "os.getcwd ref must have qualified=true (os is imported)"
+        );
+    }
+
+    // ── Task 2 (Phase-3d): module-init unit ───────────────────────────────────
+
+    /// Helper: parse an inline Python `src`, build a synthetic `<module>` unit
+    /// (if any), run `analyze_unit` on it, and return the `Hotspot`.
+    fn module_init_hotspot(src: &str) -> Option<Hotspot> {
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let imports = Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
+        let span = SpanIndex::new(src);
+        let unit = crate::functions::module_init_unit(&module)?;
+        Some(analyze_unit(
+            &unit,
+            "test.py",
+            &imports,
+            &module_bindings,
+            &span,
+        ))
+    }
+
+    /// A module with import-time effects MUST emit a `<module>` hotspot whose
+    /// own-body effects capture only the TOP-LEVEL statements — NOT effects from
+    /// inside nested `def` bodies (own-body isolation assertion).
+    ///
+    /// Source:
+    /// ```python
+    /// import os
+    /// CONFIG = os.environ["X"]   # ← top-level subscript read of os.environ
+    /// print("loading")           # ← top-level call (logging effect)
+    /// def impure():
+    ///     open("f")              # ← inside def body — must NOT appear on <module>
+    /// def pure():
+    ///     return 1
+    /// ```
+    #[test]
+    fn module_init_captures_top_level_effects_not_nested_def_body() {
+        let src = concat!(
+            "import os\n",
+            "CONFIG = os.environ[\"X\"]\n",
+            "print(\"loading\")\n",
+            "def impure():\n",
+            "    open(\"f\")\n",
+            "def pure():\n",
+            "    return 1\n",
+        );
+        let h = module_init_hotspot(src).expect("<module> hotspot must exist for impure module");
+
+        // The `<module>` symbol is correct.
+        assert_eq!(
+            h.symbol, "<module>",
+            "synthetic unit must have symbol '<module>'"
+        );
+
+        // The `<module>` hotspot must have at least one effect (the top-level call
+        // to `print` or the `os.environ` subscript read).
+        assert!(
+            !h.effects.is_empty(),
+            "<module> must have ≥1 effect from top-level statements; got: {:?}",
+            h.effects.iter().map(|e| e.kind.wire()).collect::<Vec<_>>()
+        );
+
+        // ISOLATION ASSERTION (the load-bearing correctness check):
+        // `impure`'s `open("f")` is inside a `def` body — it MUST NOT appear on
+        // the `<module>` unit's effects (own-body semantics: nested def bodies are
+        // separate units, never charged to the enclosing module scope).
+        let module_effect_kinds: Vec<&str> = h.effects.iter().map(|e| e.kind.wire()).collect();
+        assert!(
+            !module_effect_kinds.contains(&"net.fs.db"),
+            "impure()'s open('f') is inside a def body and must NOT surface on <module>; \
+             got module effects: {:?}",
+            module_effect_kinds
+        );
+
+        // `impure` and `pure` are their own separate units (scored via scan_fixture).
+        // Verify they can be found by the regular collect path.
+        let module2 = libcst_native::parse_module(src, None).unwrap();
+        let span = SpanIndex::new(src);
+        let anchors = crate::source::lambda_anchors(src).expect("tokenize");
+        let imports = Imports::build(&module2);
+        let module_bindings = crate::imports::module_bindings(&module2);
+        let (units, _) = crate::functions::collect(&module2, src, &span, &anchors);
+        let impure_h = analyze_unit(
+            units
+                .iter()
+                .find(|u| u.symbol == "impure")
+                .expect("impure unit"),
+            "test.py",
+            &imports,
+            &module_bindings,
+            &span,
+        );
+        assert!(
+            impure_h
+                .effects
+                .iter()
+                .any(|e| e.kind.wire() == "net.fs.db"),
+            "impure must have its own net.fs.db from open('f'); got: {:?}",
+            impure_h
+                .effects
+                .iter()
+                .map(|e| e.kind.wire())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A pure module (only `import` declarations and `def`/`class` definitions
+    /// with no executable top-level statements) must produce NO `<module>` hotspot.
+    #[test]
+    fn pure_module_emits_no_module_init_hotspot() {
+        let src = "import os\ndef f():\n    return 1\n";
+        assert!(
+            module_init_hotspot(src).is_none(),
+            "a pure module (import + def, no top-level effects) must not emit a <module> hotspot"
+        );
+    }
+
+    // ── Feature 025: module-init captures class decorators + base-class exprs ──
+
+    /// A top-level class decorator that is an effectful call must be captured on
+    /// `<module>`. `@open("y")` on a top-level class runs at import time.
+    ///
+    /// Uses `open(...)` which resolves to `net.fs.db` (class 7) — a concrete scored
+    /// effect rather than an unscored call reference.
+    #[test]
+    fn module_init_captures_class_decorator_effect() {
+        let src = concat!("@open(\"y\")\n", "class C:\n", "    pass\n",);
+        let h = module_init_hotspot(src)
+            .expect("<module> hotspot must exist when a class has an effectful decorator");
+        assert!(
+            h.effects.iter().any(|e| e.kind.wire() == "net.fs.db"),
+            "class decorator open(\"y\") must charge net.fs.db to <module>; got: {:?}",
+            h.effects.iter().map(|e| e.kind.wire()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A top-level class base-class expression that is an effectful call must be
+    /// captured on `<module>`. `class C(open("y")):` runs `open("y")` at import time.
+    #[test]
+    fn module_init_captures_class_base_expr_effect() {
+        let src = concat!("class C(open(\"y\")):\n", "    pass\n",);
+        let h = module_init_hotspot(src)
+            .expect("<module> hotspot must exist when a class has an effectful base expression");
+        assert!(
+            h.effects.iter().any(|e| e.kind.wire() == "net.fs.db"),
+            "class base open(\"y\") must charge net.fs.db to <module>; got: {:?}",
+            h.effects.iter().map(|e| e.kind.wire()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A method body's call MUST NOT appear on `<module>` — isolation is preserved
+    /// even when the class has an effectful base expression that IS captured.
+    ///
+    /// `class C(open("y")): def m(self): open("z")`
+    ///   → `open("y")` (base)  → captured on `<module>` (net.fs.db, exactly 1)
+    ///   → `open("z")` (method body) → NOT on `<module>` (remains on `m`)
+    #[test]
+    fn module_init_class_header_captured_method_body_not() {
+        let src = concat!(
+            "class C(open(\"y\")):\n",
+            "    def m(self):\n",
+            "        open(\"z\")\n",
+        );
+        let h = module_init_hotspot(src)
+            .expect("<module> hotspot must exist when a class has an effectful base expression");
+
+        // The base-class `open("y")` must appear on `<module>`.
+        assert!(
+            h.effects.iter().any(|e| e.kind.wire() == "net.fs.db"),
+            "class base open(\"y\") must charge net.fs.db to <module>; got: {:?}",
+            h.effects.iter().map(|e| e.kind.wire()).collect::<Vec<_>>()
+        );
+
+        // ISOLATION GUARD: the method body contributes a SECOND `open` call which
+        // must NOT appear on `<module>`. The count must be exactly 1 (only the base).
+        let net_count = h
+            .effects
+            .iter()
+            .filter(|e| e.kind.wire() == "net.fs.db")
+            .count();
+        assert_eq!(
+            net_count, 1,
+            "method body open(\"z\") must NOT be double-counted on <module>; \
+             expected exactly 1 net.fs.db effect, got {net_count}"
         );
     }
 }

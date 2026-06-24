@@ -547,6 +547,15 @@ fn nested_any_in_inner_fn_not_attributed_to_outer() {
     );
 }
 
+// ── Phase-3b Task 2: is_root (frontend-level; CLI sets the real value) ──────────
+
+/// Build a `SourceFile`, run `TsFrontend::analyze`, return `(hotspots, records)`.
+fn analyze_source(path: &str, text: &str) -> (Vec<Hotspot>, Vec<fxrank_core::record::UnitRecord>) {
+    let frontend = TsFrontend::default();
+    let out = frontend.analyze(&[make_source(path, text)]);
+    (out.functions, out.records)
+}
+
 // ── P2: test-file skipping by path ───────────────────────────────────────────
 
 /// Build a `SourceFile` with a synthetic path and text (no disk I/O).
@@ -686,4 +695,365 @@ fn anonymous_fns_on_same_line_get_distinct_ids() {
             a.symbol
         );
     }
+}
+
+// ── Phase-3d Task 1: module-init unit ────────────────────────────────────────
+
+/// Run `analyze_units` (the full two-pass) on inline TS src via `TsFrontend::analyze`.
+fn analyze_module_src(src: &str) -> Vec<Hotspot> {
+    let frontend = TsFrontend {
+        lang: Lang::Ts,
+        include_tests: false,
+    };
+    let out = frontend.analyze(&[make_source("module_init.ts", src)]);
+    out.functions
+}
+
+/// A module with top-level effectful statements must produce a `<module>` hotspot
+/// with effects. Pure functions inside are their own separate units.
+#[test]
+fn module_init_unit_emitted_for_effectful_module() {
+    let src = "import { createClient } from './db';\n\
+               export const client = createClient();\n\
+               fetch('https://x');\n\
+               function pure() { return 1; }\n";
+    let hotspots = analyze_module_src(src);
+
+    // <module> hotspot must exist.
+    let module_hs = hotspots
+        .iter()
+        .find(|h| h.symbol == "<module>")
+        .expect("<module> hotspot must be emitted for effectful top-level statements");
+
+    // Must have at least one effect (the top-level fetch → net.fs.db).
+    assert!(
+        !module_hs.effects.is_empty(),
+        "<module> must have effects; got empty effects"
+    );
+    assert!(
+        module_hs
+            .effects
+            .iter()
+            .any(|e| e.kind.wire() == "net.fs.db"),
+        "<module> must carry a net.fs.db effect from top-level fetch; effects: {:?}",
+        module_hs
+            .effects
+            .iter()
+            .map(|e| e.kind.wire())
+            .collect::<Vec<_>>()
+    );
+
+    // <module> id must be "module_init.ts:1:1:<module>".
+    assert_eq!(
+        module_hs.id, "module_init.ts:1:1:<module>",
+        "<module> id must be path:1:1:<module>"
+    );
+
+    // pure() must be a separate unit with NO effects (own-body = top-level only).
+    let pure_hs = hotspots
+        .iter()
+        .find(|h| h.symbol == "pure")
+        .expect("pure() unit must still be emitted");
+    assert!(
+        pure_hs.effects.is_empty(),
+        "pure() must have no effects (own-body isolation); got: {:?}",
+        pure_hs
+            .effects
+            .iter()
+            .map(|e| e.kind.wire())
+            .collect::<Vec<_>>()
+    );
+
+    // <module> effects must NOT include anything from inside pure().
+    // (The fetch is at module scope; pure() has `return 1` which is not effectful.)
+    // This is inherently satisfied by the own-body semantics, but verify explicitly:
+    // the <module> effects count must equal the number of top-level call effects
+    // (no double-counting from pure's body).
+    // We only assert the pure() function's effects are not attributed to <module>,
+    // which the above pure_hs.effects.is_empty() already covers.
+}
+
+/// A pure module (only imports + a named function) must produce NO `<module>` hotspot.
+#[test]
+fn module_init_unit_absent_for_pure_module() {
+    let src = "import x from './y';\n\
+               function f() { return 1; }\n";
+    let hotspots = analyze_module_src(src);
+
+    assert!(
+        !hotspots.iter().any(|h| h.symbol == "<module>"),
+        "pure module must NOT produce a <module> hotspot; got: {:?}",
+        hotspots.iter().map(|h| &h.symbol).collect::<Vec<_>>()
+    );
+}
+
+/// The TS `<module>` unit's frontend record must have `is_root == false`.
+/// The frontend is root-agnostic; the CLI sets the real value for explicit-file
+/// entries (cross-file guideline §"Module-init units").
+#[test]
+fn module_init_record_is_root_false_at_frontend() {
+    // An effectful top-level call produces a <module> hotspot + record.
+    let src = "fetch('https://api.example.com/data');\n";
+    let (_, records) = analyze_source("module_init.ts", src);
+
+    let module_rec = records
+        .iter()
+        .find(|r| r.symbol == "<module>")
+        .expect("<module> record must be emitted");
+    assert!(
+        !module_rec.is_root,
+        "<module> frontend record.is_root must be false (CLI sets the real value)"
+    );
+}
+
+// ── Finding 3 (Copilot C5): pure fn/class decls not treated as executable ────
+
+/// A module with only an import and a named function (whose body has a `fetch`)
+/// must NOT produce a `<module>` hotspot.  The function body is NOT executed at
+/// import time — effects belong to `f`, not to the module-init.
+#[test]
+fn module_init_absent_when_only_fn_decl_has_effects() {
+    let src = "import x from './y';\nfunction f() { fetch('z'); }\n";
+    let hotspots = analyze_module_src(src);
+
+    assert!(
+        !hotspots.iter().any(|h| h.symbol == "<module>"),
+        "module with only fn decl must NOT produce a <module> hotspot; got: {:?}",
+        hotspots.iter().map(|h| &h.symbol).collect::<Vec<_>>()
+    );
+}
+
+// ── I1 fix: bare (non-exported) class decls with static inits ────────────────
+
+/// `class C { static x = fetch("y"); m() { fetch("z"); } }` — a bare (non-exported)
+/// class at module level.  Its static field initialiser runs at import time, so a
+/// `<module>` hotspot must be emitted carrying exactly that `fetch` (class 7).
+/// The method body `m()` must NOT be attributed to `<module>` (own-body isolation).
+/// A bare `function f(){}` with an effectful body must NOT produce a `<module>`.
+/// A bare `class Empty {}` with no static effects must NOT produce a `<module>`.
+#[test]
+fn module_init_bare_class_static_init_contributes_to_module() {
+    // Bare (non-exported) class with a static field init and an instance method.
+    let src = "class C { static x = fetch('y'); m() { fetch('z'); } }\n";
+    let hotspots = analyze_module_src(src);
+
+    let module_hs = hotspots
+        .iter()
+        .find(|h| h.symbol == "<module>")
+        .expect("<module> must be emitted for bare class with static fetch");
+
+    // Must carry a net.fs.db effect from the static-field fetch.
+    assert!(
+        module_hs
+            .effects
+            .iter()
+            .any(|e| e.kind.wire() == "net.fs.db"),
+        "<module> must carry net.fs.db from bare-class static-init fetch; effects: {:?}",
+        module_hs
+            .effects
+            .iter()
+            .map(|e| e.kind.wire())
+            .collect::<Vec<_>>()
+    );
+
+    // Exactly 1 net.fs.db effect — the method fetch must NOT be attributed.
+    let net_count = module_hs
+        .effects
+        .iter()
+        .filter(|e| e.kind.wire() == "net.fs.db")
+        .count();
+    assert_eq!(
+        net_count,
+        1,
+        "<module> must have exactly 1 net.fs.db (static-init only, not method body); \
+         effects: {:?}",
+        module_hs
+            .effects
+            .iter()
+            .map(|e| e.kind.wire())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A bare `function f() { fetch("z"); }` — function body does NOT execute at
+/// import time — must NOT produce a `<module>` hotspot.
+#[test]
+fn module_init_absent_for_bare_fn_decl_with_body_effects() {
+    let src = "function f() { fetch('z'); }\n";
+    let hotspots = analyze_module_src(src);
+
+    assert!(
+        !hotspots.iter().any(|h| h.symbol == "<module>"),
+        "bare fn decl must NOT produce a <module> hotspot; got: {:?}",
+        hotspots.iter().map(|h| &h.symbol).collect::<Vec<_>>()
+    );
+}
+
+/// A bare `class Empty {}` with no static effectful init must NOT produce a
+/// `<module>` hotspot (the ≥1-effect guard correctly drops it).
+#[test]
+fn module_init_absent_for_bare_class_without_static_effects() {
+    let src = "class Empty {}\n";
+    let hotspots = analyze_module_src(src);
+
+    assert!(
+        !hotspots.iter().any(|h| h.symbol == "<module>"),
+        "bare class with no static effects must NOT produce a <module> hotspot; got: {:?}",
+        hotspots.iter().map(|h| &h.symbol).collect::<Vec<_>>()
+    );
+}
+
+// ── Finding 5: exported/default class declarations with static inits ─────────
+
+/// `export class Foo { static client = fetch("y"); method() { fetch("z"); } }`
+/// The `<module>` hotspot must capture the `fetch` in the static initialiser but
+/// NOT the `fetch` inside `method()` (own-body isolation).
+#[test]
+fn module_init_includes_exported_class_static_init() {
+    let src = "export class Foo {\n\
+                 static client = fetch('y');\n\
+                 method() { fetch('z'); }\n\
+               }\n";
+    let hotspots = analyze_module_src(src);
+
+    // A <module> hotspot must be emitted (the static initialiser has a fetch).
+    let module_hs = hotspots
+        .iter()
+        .find(|h| h.symbol == "<module>")
+        .expect("<module> hotspot must be emitted for exported class with static fetch");
+
+    // Must carry a net.fs.db effect from the static-field fetch.
+    assert!(
+        module_hs
+            .effects
+            .iter()
+            .any(|e| e.kind.wire() == "net.fs.db"),
+        "<module> must carry a net.fs.db effect from static-field fetch; effects: {:?}",
+        module_hs
+            .effects
+            .iter()
+            .map(|e| e.kind.wire())
+            .collect::<Vec<_>>()
+    );
+
+    // The effect count must equal 1 (only the static-field fetch).
+    // method()'s fetch must NOT be attributed to <module> (own-body isolation).
+    let net_fs_db_count = module_hs
+        .effects
+        .iter()
+        .filter(|e| e.kind.wire() == "net.fs.db")
+        .count();
+    assert_eq!(
+        net_fs_db_count,
+        1,
+        "<module> must have exactly 1 net.fs.db effect (static-init only, not method body); \
+         effects: {:?}",
+        module_hs
+            .effects
+            .iter()
+            .map(|e| e.kind.wire())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `export class Foo { method() {} }` — no static effectful init → NO `<module>`.
+#[test]
+fn module_init_absent_for_exported_class_without_static_effects() {
+    let src = "export class Foo { method() { fetch('y'); } }\n";
+    let hotspots = analyze_module_src(src);
+
+    assert!(
+        !hotspots.iter().any(|h| h.symbol == "<module>"),
+        "exported class with NO static effects must NOT produce a <module> hotspot; got: {:?}",
+        hotspots.iter().map(|h| &h.symbol).collect::<Vec<_>>()
+    );
+}
+
+/// `export default class Bar { static x = fetch("y"); method() { fetch("z"); } }`
+/// Same isolation guarantee for the default-exported form.
+#[test]
+fn module_init_includes_export_default_class_static_init() {
+    let src = "export default class Bar {\n\
+                 static x = fetch('y');\n\
+                 method() { fetch('z'); }\n\
+               }\n";
+    let hotspots = analyze_module_src(src);
+
+    let module_hs = hotspots
+        .iter()
+        .find(|h| h.symbol == "<module>")
+        .expect("<module> must be emitted for export default class with static fetch");
+
+    assert!(
+        module_hs
+            .effects
+            .iter()
+            .any(|e| e.kind.wire() == "net.fs.db"),
+        "<module> must carry net.fs.db from static-field fetch; effects: {:?}",
+        module_hs
+            .effects
+            .iter()
+            .map(|e| e.kind.wire())
+            .collect::<Vec<_>>()
+    );
+
+    let net_fs_db_count = module_hs
+        .effects
+        .iter()
+        .filter(|e| e.kind.wire() == "net.fs.db")
+        .count();
+    assert_eq!(
+        net_fs_db_count,
+        1,
+        "<module> must have exactly 1 net.fs.db effect (static-init only, not method body); \
+         effects: {:?}",
+        module_hs
+            .effects
+            .iter()
+            .map(|e| e.kind.wire())
+            .collect::<Vec<_>>()
+    );
+}
+
+// ── Finding 2 (Codex-A): module-init captures export default <expr> effects ──
+
+/// `export default fetch("y")` — a call expression evaluated at import time —
+/// must produce a `<module>` hotspot with a `net.fs.db` effect.
+#[test]
+fn module_init_captures_export_default_effectful_expr() {
+    let src = "export default fetch('https://api.example.com/data');\n";
+    let hotspots = analyze_module_src(src);
+
+    let module_hs = hotspots
+        .iter()
+        .find(|h| h.symbol == "<module>")
+        .expect("<module> must be emitted for export default <call expr>");
+
+    assert!(
+        module_hs
+            .effects
+            .iter()
+            .any(|e| e.kind.wire() == "net.fs.db"),
+        "<module> must carry a net.fs.db effect from `export default fetch(...)`; \
+         effects: {:?}",
+        module_hs
+            .effects
+            .iter()
+            .map(|e| e.kind.wire())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `export default 42` — a pure literal expression — must NOT produce a
+/// `<module>` hotspot (the ≥1-effect guard drops it).
+#[test]
+fn module_init_absent_for_export_default_pure_literal() {
+    let src = "export default 42;\n";
+    let hotspots = analyze_module_src(src);
+
+    assert!(
+        !hotspots.iter().any(|h| h.symbol == "<module>"),
+        "pure `export default 42` must NOT produce a <module> hotspot; got: {:?}",
+        hotspots.iter().map(|h| &h.symbol).collect::<Vec<_>>()
+    );
 }

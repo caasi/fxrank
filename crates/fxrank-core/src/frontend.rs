@@ -1,7 +1,7 @@
 use crate::effect::RiskFeature;
 use crate::model::{Diagnostic, Hotspot};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
     Ts,
@@ -19,6 +19,7 @@ pub struct FrontendOutput {
     pub module_risks: Vec<RiskFeature>, // module-level (impl Drop, extern)
     pub diagnostics: Vec<Diagnostic>,
     pub skipped_tests: usize,
+    pub records: Vec<crate::record::UnitRecord>, // cross-file fold input (populated by frontends in Task 3+)
 }
 
 pub trait Frontend {
@@ -36,6 +37,12 @@ pub trait Frontend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontend_output_carries_records() {
+        let o = FrontendOutput::default();
+        assert!(o.records.is_empty());
+    }
 
     #[test]
     fn frontend_trait_object_safe() {

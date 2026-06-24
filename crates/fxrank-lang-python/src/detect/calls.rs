@@ -53,7 +53,7 @@ impl EffectSink for CallSink<'_> {
         let Some(anchor) = leftmost_name(&call.func) else {
             return;
         };
-        let line = name_line(anchor, self.span);
+        let (line, col) = name_line_col(anchor, self.span);
         let Some(rendered) = render_expr(&call.func) else {
             return;
         };
@@ -61,31 +61,38 @@ impl EffectSink for CallSink<'_> {
         // `subprocess(..., shell=True)` emits its process.control effect here; the
         // dynamic.code risk it ALSO emits is Task 10's job.
         if let Some((kind, tier, evidence)) = self.classify_call(&rendered) {
-            self.push(kind, tier, line, evidence);
+            self.push(kind, tier, line, col, evidence);
         }
     }
 
     fn on_assert(&mut self, assert: &Assert) {
-        let line = match leftmost_name(&assert.test) {
-            Some(n) => name_line(n, self.span),
-            None => 0,
+        let (line, col) = match leftmost_name(&assert.test) {
+            Some(n) => name_line_col(n, self.span),
+            None => (0, 0),
         };
         self.push(
             EffectKind::Panic,
             Tier::Exact,
             line,
+            col,
             "assert — stripped under -O".to_string(),
         );
     }
 
     fn on_raise(&mut self, raise: &Raise) {
-        let line = raise
+        let (line, col) = raise
             .exc
             .as_ref()
             .and_then(leftmost_name)
-            .map(|n| name_line(n, self.span))
-            .unwrap_or(0);
-        self.push(EffectKind::Panic, Tier::Exact, line, "raise".to_string());
+            .map(|n| name_line_col(n, self.span))
+            .unwrap_or((0, 0));
+        self.push(
+            EffectKind::Panic,
+            Tier::Exact,
+            line,
+            col,
+            "raise".to_string(),
+        );
     }
 
     fn on_assign_target(&mut self, target: &AssignTargetExpression, _is_aug: bool) {
@@ -95,13 +102,14 @@ impl EffectSink for CallSink<'_> {
             && let Some(rendered) = render_subscript_base(sub)
             && self.resolve_dotted(&rendered).as_deref() == Some("os.environ")
         {
-            let line = leftmost_subscript_name(sub)
-                .map(|n| name_line(n, self.span))
-                .unwrap_or(0);
+            let (line, col) = leftmost_subscript_name(sub)
+                .map(|n| name_line_col(n, self.span))
+                .unwrap_or((0, 0));
             self.push(
                 EffectKind::EnvWrite,
                 Tier::Heuristic,
                 line,
+                col,
                 "os.environ[...] = … — environment write".to_string(),
             );
         }
@@ -123,20 +131,21 @@ impl EffectSink for CallSink<'_> {
         if self.resolve_dotted(&rendered_base).as_deref() != Some("sys") {
             return;
         }
-        let line = leftmost_name(attr)
-            .map(|n| name_line(n, self.span))
-            .unwrap_or(0);
+        let (line, col) = leftmost_name(attr)
+            .map(|n| name_line_col(n, self.span))
+            .unwrap_or((0, 0));
         self.push(
             EffectKind::AmbientRead,
             Tier::Path,
             line,
+            col,
             "sys.argv".to_string(),
         );
     }
 }
 
 impl CallSink<'_> {
-    fn push(&mut self, kind: EffectKind, tier: Tier, line: usize, evidence: String) {
+    fn push(&mut self, kind: EffectKind, tier: Tier, line: usize, col: usize, evidence: String) {
         let class = kind.base_class();
         // Path-tier effects carry a shadow penalty when the file imports dynamic-import
         // infrastructure (importlib/__import__), because a bare name might resolve to
@@ -149,8 +158,10 @@ impl CallSink<'_> {
             discounted_to: None,
             weight: weight_for_class(class),
             line,
+            col,
             tier,
             hidden: false,
+            contained: false,
             evidence,
             discount: None,
             subreason: None,
@@ -342,9 +353,9 @@ fn leftmost_subscript_name<'a>(sub: &'a Subscript<'a>) -> Option<&'a Name<'a>> {
     leftmost_name(&sub.value)
 }
 
-/// 1-based line of a `Name`'s anchor (its `value` &str borrows the source buffer).
-fn name_line(name: &Name, span: &SpanIndex) -> usize {
-    span.line_col(anchor_of_subslice(span.src(), name.value)).0
+/// 1-based `(line, col)` of a `Name`'s anchor (its `value` &str borrows the source buffer).
+fn name_line_col(name: &Name, span: &SpanIndex) -> (usize, usize) {
+    span.line_col(anchor_of_subslice(span.src(), name.value))
 }
 
 #[cfg(test)]
@@ -504,6 +515,27 @@ mod tests {
             Tier::Path,
             "dotenv.load_dotenv is import-resolved; must be Tier::Path, got {:?}",
             e2.tier
+        );
+    }
+
+    /// Two same-kind effects on the **same line** at different columns must
+    /// produce distinct `col` values, not both zero. Verifies the col fix
+    /// prevents SiteKey collapse in the cross-file fold.
+    #[test]
+    fn two_same_kind_effects_same_line_have_distinct_col() {
+        // Both `open` calls are on line 2, separated by a semicolon (whitespace apart).
+        let src = "def f():\n    open('a'); open('b')\n";
+        let effects = effects_for_src(src);
+        let net: Vec<_> = effects.iter().filter(|e| e.kind == NetFsDb).collect();
+        assert_eq!(net.len(), 2, "expected two net.fs.db effects; got {net:?}");
+        assert_eq!(
+            net[0].line, net[1].line,
+            "both open() calls must be on line 2"
+        );
+        assert_ne!(
+            net[0].col, net[1].col,
+            "two open() calls on the same line must have distinct cols, got col={} and col={}",
+            net[0].col, net[1].col
         );
     }
 }

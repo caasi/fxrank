@@ -23,6 +23,7 @@ fn analyze_worked() -> Report {
         skipped_tests: output.skipped_tests,
         skipped_excluded: 0,
         risk_features: output.module_risks,
+        external_reaches: vec![],
     };
     Report::build(scope, output.functions, output.diagnostics, None)
 }

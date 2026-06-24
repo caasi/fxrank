@@ -66,7 +66,7 @@ struct RiskWalker<'a> {
 }
 
 impl RiskWalker<'_> {
-    fn push(&mut self, kind: RiskKind, tier: Tier, line: usize, evidence: String) {
+    fn push(&mut self, kind: RiskKind, tier: Tier, line: usize, col: usize, evidence: String) {
         let class = kind.class();
         self.features.push(RiskFeature {
             kind,
@@ -74,6 +74,7 @@ impl RiskWalker<'_> {
             weight: weight_for_class(class),
             path: self.path.clone(),
             line,
+            col,
             evidence,
             tier,
         });
@@ -88,11 +89,17 @@ impl Visit for RiskWalker<'_> {
         if let Callee::Expr(callee) = &node.callee
             && let Some(rendered) = render_expr(callee)
         {
-            let line = self.lines.line(node.span);
+            let (line, col) = self.lines.line_col(node.span);
             match rendered.as_str() {
                 // eval(...) — dynamic code execution, exact.
                 "eval" => {
-                    self.push(RiskKind::DynamicCode, Tier::Exact, line, "eval(…)".into());
+                    self.push(
+                        RiskKind::DynamicCode,
+                        Tier::Exact,
+                        line,
+                        col,
+                        "eval(…)".into(),
+                    );
                 }
                 // Object.setPrototypeOf(...) — prototype pollution, path tier.
                 "Object.setPrototypeOf" => {
@@ -100,6 +107,7 @@ impl Visit for RiskWalker<'_> {
                         RiskKind::ProtoPollution,
                         Tier::Path,
                         line,
+                        col,
                         "Object.setPrototypeOf(…)".into(),
                     );
                 }
@@ -109,6 +117,7 @@ impl Visit for RiskWalker<'_> {
                         RiskKind::HtmlInjection,
                         Tier::Path,
                         line,
+                        col,
                         "document.write(…)".into(),
                     );
                 }
@@ -121,6 +130,7 @@ impl Visit for RiskWalker<'_> {
                             RiskKind::HtmlInjection,
                             Tier::Heuristic,
                             line,
+                            col,
                             format!("{other}(…)"),
                         );
                     }
@@ -136,11 +146,12 @@ impl Visit for RiskWalker<'_> {
         if let Some(name) = render_expr(&node.callee)
             && name == "Function"
         {
-            let line = self.lines.line(node.span);
+            let (line, col) = self.lines.line_col(node.span);
             self.push(
                 RiskKind::DynamicCode,
                 Tier::Exact,
                 line,
+                col,
                 "new Function(…)".into(),
             );
         }
@@ -150,11 +161,12 @@ impl Visit for RiskWalker<'_> {
     // ── with (...) {} — dynamic code execution ────────────────────────────────
 
     fn visit_with_stmt(&mut self, node: &WithStmt) {
-        let line = self.lines.line(node.span);
+        let (line, col) = self.lines.line_col(node.span);
         self.push(
             RiskKind::DynamicCode,
             Tier::Exact,
             line,
+            col,
             "with (…) {}".into(),
         );
         node.visit_children_with(self);
@@ -165,13 +177,14 @@ impl Visit for RiskWalker<'_> {
 
     fn visit_assign_expr(&mut self, node: &AssignExpr) {
         if let Some(prop_name) = assign_target_prop_name(&node.left) {
-            let line = self.lines.line(node.span);
+            let (line, col) = self.lines.line_col(node.span);
             match prop_name.as_str() {
                 "__proto__" => {
                     self.push(
                         RiskKind::ProtoPollution,
                         Tier::Heuristic,
                         line,
+                        col,
                         ".__proto__ =".into(),
                     );
                 }
@@ -180,6 +193,7 @@ impl Visit for RiskWalker<'_> {
                         RiskKind::HtmlInjection,
                         Tier::Heuristic,
                         line,
+                        col,
                         format!(".{prop_name} ="),
                     );
                 }
@@ -195,11 +209,12 @@ impl Visit for RiskWalker<'_> {
     // is owned by the coverage gate and must NOT be re-detected here.
 
     fn visit_ts_non_null_expr(&mut self, node: &TsNonNullExpr) {
-        let line = self.lines.line(node.span);
+        let (line, col) = self.lines.line_col(node.span);
         self.push(
             RiskKind::TypeEscape,
             Tier::Exact,
             line,
+            col,
             "x! (non-null assertion)".into(),
         );
         node.visit_children_with(self);

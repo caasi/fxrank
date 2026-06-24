@@ -52,11 +52,13 @@ impl<'ast> Visit<'ast> for MacroWalker {
             None => return,
         };
         let first = segments[0].as_str();
-        let line = mac.span().start().line;
+        let loc = mac.span().start();
+        let line = loc.line;
+        let col = loc.column + 1;
 
         // Classify by matching the path.
         if let Some((kind, tier)) = classify_macro(first, last, segments.len()) {
-            self.push(kind, tier, line, format_evidence(&segments));
+            self.push(kind, tier, line, col, format_evidence(&segments));
         }
         // Note: visit_macro does NOT recurse into the macro token stream because
         // syn sees the invocation unexpanded. No further descent needed here.
@@ -64,7 +66,7 @@ impl<'ast> Visit<'ast> for MacroWalker {
 }
 
 impl MacroWalker {
-    fn push(&mut self, kind: EffectKind, tier: Tier, line: usize, evidence: String) {
+    fn push(&mut self, kind: EffectKind, tier: Tier, line: usize, col: usize, evidence: String) {
         let class = kind.base_class();
         // unknown.macro uses a fixed 0.4 confidence (lower than heuristic 0.6)
         // to flag it as low-trust. All other macros use detection_confidence.
@@ -79,8 +81,10 @@ impl MacroWalker {
             discounted_to: None,
             weight: weight_for_class(class),
             line,
+            col,
             tier,
             hidden: false,
+            contained: false,
             evidence,
             discount: None,
             subreason: None,

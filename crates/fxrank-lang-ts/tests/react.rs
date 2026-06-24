@@ -233,6 +233,40 @@ fn usememo_fetch_still_effect_in_render() {
     );
 }
 
+/// Two render-phase world effects in a `useMemo` callback on the same line must
+/// produce `EffectInRender` risks with DISTINCT `col` values — not both `0`.
+/// This guards against same-line collapse when risks are keyed by `(unit, line, col, kind)`.
+#[test]
+fn two_render_phase_effects_same_line_have_distinct_cols() {
+    // Both fetch calls are on one source line inside useMemo → two world effects,
+    // each carrying their own column → two EffectInRender risks with distinct cols.
+    let src =
+        "function C(){ const x = useMemo(() => { fetch('a'); fetch('b'); }, []); return <div/>; }";
+    let hs = util::analyze_tsx(src);
+    let c = hs.iter().find(|h| h.symbol == "C").expect("component C");
+    let render_risks: Vec<_> = c
+        .risk_features
+        .iter()
+        .filter(|r| r.kind == fxrank_core::effect::RiskKind::EffectInRender)
+        .collect();
+    assert!(
+        render_risks.len() >= 2,
+        "expected at least 2 EffectInRender risks, got {}",
+        render_risks.len()
+    );
+    // All cols must be non-zero (no hardcoded col:0 placeholder).
+    for r in &render_risks {
+        assert_ne!(r.col, 0, "EffectInRender risk must carry real col, not 0");
+    }
+    // The two risks must have distinct cols (same-line, different positions).
+    let cols: Vec<usize> = render_risks.iter().map(|r| r.col).collect();
+    assert_ne!(
+        cols[0], cols[1],
+        "two same-line render-phase effects must produce distinct col values, got both {}",
+        cols[0]
+    );
+}
+
 /// Snapshot the full hotspot list for the three React fixture files.
 ///
 /// Dynamic snapshot suffix (the `with_settings!` form) is used because the

@@ -223,6 +223,10 @@ fn body_has_any(body: &FnBody, imports: &Imports) -> bool {
         FnBody::Suite(suite) => suite_has_any(suite, imports),
         // A lambda body is a single expression; only a `cast(Any, …)` could appear.
         FnBody::Expr(e) => expr_has_any(e, imports),
+        // The synthetic `<module>` unit has no signature, so coverage/Any
+        // are not meaningful. Return false (no type-escape risk from module-level
+        // Any; the `<module>` unit has no parameters to annotate with Any).
+        FnBody::Module(_) => false,
     }
 }
 

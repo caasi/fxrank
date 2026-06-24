@@ -207,10 +207,23 @@ classification is **aligned across all three frontends** (spec 008, extended by 
 constructor-init, and **module top-level binding** writes are classified consistently
 (the last → `global.mutation`/6 in every frontend) — see the guideline above.
 
-Known limitations (accepted for Milestone A): own-score only (no call-graph propagation, so
-extract-method can launder a score); type-dependent signals are heuristic; macro-generated
-effects are invisible to `syn`. Test code is skipped by default, but a bare top-level
-`#[cfg(test)] fn` (a helper outside a `#[cfg(test)] mod`) is not yet detected as test.
+**Milestone B — cross-file propagation (spec 025, all three frontends):** a scan now resolves
+calls across the scanned files and folds **escaping** effects along the call graph, so each
+function gets a `propagated_score` (its effect blast-radius) alongside `own_score` — closing the
+extract-method laundering hole. Output also gains `root` (the files you named explicitly on the
+CLI — your observation focus; directory-walked files are context, not roots), `inherited[]`
+provenance, and `scope.external_reaches[]` (the app's outward dependency surface, split
+`FirstPartyOutOfScope` vs `ThirdParty`); import-time top-level code is scored as a `<module>` unit.
+Third-party boundaries stay opaque (class-2 `external.unresolved`), not followed. `--no-resolve`
+turns the pass off (own scores only). Own-body **scores** are unchanged; the wire format gains the
+propagation fields above, plus a `col` on each `effect`/`risk` (effect-location precision) — so a
+cross-version JSON diff will show those additions.
 
-**Next:** call-graph propagation (`inherited_score`) and a `lower-effect-score` agent skill
-(the "lab protocol" for using FxRank safely).
+Known limitations (accepted): the cross-file resolver is **name-based** — a qualified call can
+false-resolve to a lone same-named local (precise module-tree resolution deferred → #36);
+type-dependent signals are heuristic; macro-generated effects are invisible to `syn`. Test code is
+skipped by default, but a bare top-level `#[cfg(test)] fn` is not yet detected as test.
+
+**Next:** module-tree precise resolution (#36, also unlocks Rust public-API roots), the React
+fold retrofit (#37), and a `lower-effect-score` agent skill (the "lab protocol" for using FxRank
+safely). Research directions in #4 (protocol axis, evidence-mass confidence, boundary-slice delta).

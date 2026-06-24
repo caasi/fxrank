@@ -162,7 +162,14 @@ impl<'a> MutationWalker<'a> {
     /// expressions (`++`/`--`), `delete`, and mutating-method receivers all pass
     /// `false`. This is the sole gate for the constructor field-init containment
     /// discount — the verb string is NOT used for this decision.
-    fn record_write(&mut self, place: &Expr, line: usize, verb: &str, is_direct_init: bool) {
+    fn record_write(
+        &mut self,
+        place: &Expr,
+        line: usize,
+        col: usize,
+        verb: &str,
+        is_direct_init: bool,
+    ) {
         let Some(base) = base_ident(place) else {
             return;
         };
@@ -201,8 +208,10 @@ impl<'a> MutationWalker<'a> {
             discounted_to: None,
             weight: weight_for_class(c.class),
             line,
+            col,
             tier: c.tier,
             hidden: c.hidden,
+            contained: false,
             evidence: format!("{verb} {} {base}", c.role),
             discount: None,
             subreason: c.subreason.map(String::from),
@@ -317,18 +326,18 @@ impl Visit for MutationWalker<'_> {
     fn visit_assign_expr(&mut self, node: &AssignExpr) {
         // Both plain `=` and compound (`+=`, `-=`, …) ops are writes.
         // Only plain `=` qualifies as a direct field-init for the ctor discount.
-        let line = self.lines.line(node.span);
+        let (line, col) = self.lines.line_col(node.span);
         let is_direct_init = node.op == AssignOp::Assign;
         if let Some(base) = assign_target_base(&node.left) {
-            self.record_write(&base, line, "write to", is_direct_init);
+            self.record_write(&base, line, col, "write to", is_direct_init);
         }
         node.visit_children_with(self);
     }
 
     fn visit_update_expr(&mut self, node: &UpdateExpr) {
         // `x++` / `--y` write to `node.arg` — never a direct field-init.
-        let line = self.lines.line(node.span);
-        self.record_write(&node.arg, line, "update", false);
+        let (line, col) = self.lines.line_col(node.span);
+        self.record_write(&node.arg, line, col, "update", false);
         node.visit_children_with(self);
     }
 
@@ -336,8 +345,8 @@ impl Visit for MutationWalker<'_> {
         // `delete obj.key` writes to (deletes a property of) the operand's base
         // — never a direct field-init.
         if node.op == UnaryOp::Delete {
-            let line = self.lines.line(node.span);
-            self.record_write(&node.arg, line, "delete on", false);
+            let (line, col) = self.lines.line_col(node.span);
+            self.record_write(&node.arg, line, col, "delete on", false);
         }
         node.visit_children_with(self);
     }
@@ -350,8 +359,8 @@ impl Visit for MutationWalker<'_> {
             && let MemberProp::Ident(method) = prop
             && is_mutating_method(&method.sym)
         {
-            let line = self.lines.line(node.span);
-            self.record_write(obj, line, &format!(".{} on", method.sym), false);
+            let (line, col) = self.lines.line_col(node.span);
+            self.record_write(obj, line, col, &format!(".{} on", method.sym), false);
         }
         node.visit_children_with(self);
     }

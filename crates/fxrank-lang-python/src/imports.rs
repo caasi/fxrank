@@ -40,6 +40,10 @@ use libcst_native::{
 pub struct Imports {
     /// local name → fully-qualified path string.
     table: HashMap<String, String>,
+    /// Local names that came from a **relative** (leading-dot) `from`-import.
+    /// e.g. `from . import sibling` and `from .utils import helper` both add to
+    /// this set.  Plain `import` and absolute `from m import n` do not.
+    relative_locals: HashSet<String>,
     /// `true` when `importlib` or `__import__` appears as an imported name.
     dynamic: bool,
 }
@@ -55,11 +59,16 @@ impl Imports {
     /// for a syntactic heuristic (see spec *Deferred / Future work*).
     pub fn build(module: &Module) -> Self {
         let mut table: HashMap<String, String> = HashMap::new();
+        let mut relative_locals: HashSet<String> = HashSet::new();
         let mut dynamic = false;
         for stmt in &module.body {
-            collect_stmt(stmt, &mut table, &mut dynamic);
+            collect_stmt(stmt, &mut table, &mut relative_locals, &mut dynamic);
         }
-        Self { table, dynamic }
+        Self {
+            table,
+            relative_locals,
+            dynamic,
+        }
     }
 
     /// Resolve a local name to its fully-qualified module path.
@@ -67,6 +76,13 @@ impl Imports {
     /// Returns `None` when the name was not introduced by any import statement.
     pub fn resolve(&self, local: &str) -> Option<&str> {
         self.table.get(local).map(|s| s.as_str())
+    }
+
+    /// `true` when `local` was introduced by a **relative** (leading-dot)
+    /// `from`-import (`from . import x`, `from .mod import y`, etc.).
+    /// Returns `false` for absolute imports and unknown names.
+    pub fn is_relative(&self, local: &str) -> bool {
+        self.relative_locals.contains(local)
     }
 
     /// `true` when `importlib` or `__import__` appears as an imported name,
@@ -81,27 +97,37 @@ impl Imports {
 
 /// Collect imports from a statement, recursing into compound-statement bodies
 /// (functions, classes, branches, loops) so function-local imports are captured.
-fn collect_stmt(stmt: &Statement, table: &mut HashMap<String, String>, dynamic: &mut bool) {
+fn collect_stmt(
+    stmt: &Statement,
+    table: &mut HashMap<String, String>,
+    relative_locals: &mut HashSet<String>,
+    dynamic: &mut bool,
+) {
     match stmt {
         Statement::Simple(line) => {
             for small in &line.body {
-                collect_small(small, table, dynamic);
+                collect_small(small, table, relative_locals, dynamic);
             }
         }
-        Statement::Compound(c) => collect_compound(c, table, dynamic),
+        Statement::Compound(c) => collect_compound(c, table, relative_locals, dynamic),
     }
 }
 
-fn collect_suite(suite: &Suite, table: &mut HashMap<String, String>, dynamic: &mut bool) {
+fn collect_suite(
+    suite: &Suite,
+    table: &mut HashMap<String, String>,
+    relative_locals: &mut HashSet<String>,
+    dynamic: &mut bool,
+) {
     match suite {
         Suite::IndentedBlock(b) => {
             for stmt in &b.body {
-                collect_stmt(stmt, table, dynamic);
+                collect_stmt(stmt, table, relative_locals, dynamic);
             }
         }
         Suite::SimpleStatementSuite(s) => {
             for small in &s.body {
-                collect_small(small, table, dynamic);
+                collect_small(small, table, relative_locals, dynamic);
             }
         }
     }
@@ -110,76 +136,89 @@ fn collect_suite(suite: &Suite, table: &mut HashMap<String, String>, dynamic: &m
 fn collect_compound(
     c: &CompoundStatement,
     table: &mut HashMap<String, String>,
+    relative_locals: &mut HashSet<String>,
     dynamic: &mut bool,
 ) {
     match c {
-        CompoundStatement::FunctionDef(d) => collect_suite(&d.body, table, dynamic),
-        CompoundStatement::ClassDef(d) => collect_suite(&d.body, table, dynamic),
+        CompoundStatement::FunctionDef(d) => {
+            collect_suite(&d.body, table, relative_locals, dynamic)
+        }
+        CompoundStatement::ClassDef(d) => collect_suite(&d.body, table, relative_locals, dynamic),
         CompoundStatement::If(i) => {
-            collect_suite(&i.body, table, dynamic);
+            collect_suite(&i.body, table, relative_locals, dynamic);
             if let Some(orelse) = &i.orelse {
-                collect_orelse(orelse, table, dynamic);
+                collect_orelse(orelse, table, relative_locals, dynamic);
             }
         }
         CompoundStatement::For(f) => {
-            collect_suite(&f.body, table, dynamic);
+            collect_suite(&f.body, table, relative_locals, dynamic);
             if let Some(e) = &f.orelse {
-                collect_suite(&e.body, table, dynamic);
+                collect_suite(&e.body, table, relative_locals, dynamic);
             }
         }
         CompoundStatement::While(w) => {
-            collect_suite(&w.body, table, dynamic);
+            collect_suite(&w.body, table, relative_locals, dynamic);
             if let Some(e) = &w.orelse {
-                collect_suite(&e.body, table, dynamic);
+                collect_suite(&e.body, table, relative_locals, dynamic);
             }
         }
         CompoundStatement::Try(t) => {
-            collect_suite(&t.body, table, dynamic);
+            collect_suite(&t.body, table, relative_locals, dynamic);
             for h in &t.handlers {
-                collect_suite(&h.body, table, dynamic);
+                collect_suite(&h.body, table, relative_locals, dynamic);
             }
             if let Some(e) = &t.orelse {
-                collect_suite(&e.body, table, dynamic);
+                collect_suite(&e.body, table, relative_locals, dynamic);
             }
             if let Some(e) = &t.finalbody {
-                collect_suite(&e.body, table, dynamic);
+                collect_suite(&e.body, table, relative_locals, dynamic);
             }
         }
         CompoundStatement::TryStar(t) => {
-            collect_suite(&t.body, table, dynamic);
+            collect_suite(&t.body, table, relative_locals, dynamic);
             for h in &t.handlers {
-                collect_suite(&h.body, table, dynamic);
+                collect_suite(&h.body, table, relative_locals, dynamic);
             }
             if let Some(e) = &t.orelse {
-                collect_suite(&e.body, table, dynamic);
+                collect_suite(&e.body, table, relative_locals, dynamic);
             }
             if let Some(e) = &t.finalbody {
-                collect_suite(&e.body, table, dynamic);
+                collect_suite(&e.body, table, relative_locals, dynamic);
             }
         }
-        CompoundStatement::With(w) => collect_suite(&w.body, table, dynamic),
+        CompoundStatement::With(w) => collect_suite(&w.body, table, relative_locals, dynamic),
         CompoundStatement::Match(m) => {
             for case in &m.cases {
-                collect_suite(&case.body, table, dynamic);
+                collect_suite(&case.body, table, relative_locals, dynamic);
             }
         }
     }
 }
 
-fn collect_orelse(orelse: &OrElse, table: &mut HashMap<String, String>, dynamic: &mut bool) {
+fn collect_orelse(
+    orelse: &OrElse,
+    table: &mut HashMap<String, String>,
+    relative_locals: &mut HashSet<String>,
+    dynamic: &mut bool,
+) {
     match orelse {
         OrElse::Elif(elif) => {
-            collect_suite(&elif.body, table, dynamic);
+            collect_suite(&elif.body, table, relative_locals, dynamic);
             if let Some(inner) = &elif.orelse {
-                collect_orelse(inner, table, dynamic);
+                collect_orelse(inner, table, relative_locals, dynamic);
             }
         }
-        OrElse::Else(e) => collect_suite(&e.body, table, dynamic),
+        OrElse::Else(e) => collect_suite(&e.body, table, relative_locals, dynamic),
     }
 }
 
-/// Record imports from a single small statement into `table` / `dynamic`.
-fn collect_small(small: &SmallStatement, table: &mut HashMap<String, String>, dynamic: &mut bool) {
+/// Record imports from a single small statement into `table` / `relative_locals` / `dynamic`.
+fn collect_small(
+    small: &SmallStatement,
+    table: &mut HashMap<String, String>,
+    relative_locals: &mut HashSet<String>,
+    dynamic: &mut bool,
+) {
     match small {
         // `import a`, `import a.b.c`, `import a.b as x`
         SmallStatement::Import(imp) => {
@@ -197,10 +236,13 @@ fn collect_small(small: &SmallStatement, table: &mut HashMap<String, String>, dy
                     root_component(&path)
                 };
                 table.insert(local, path);
+                // Plain `import` is never relative — no dots needed here.
             }
         }
-        // `from m import n`, `from m import n as p`
+        // `from m import n`, `from m import n as p`,
+        // `from . import x`, `from .mod import y` (leading dots = relative)
         SmallStatement::ImportFrom(from) => {
+            let is_relative = !from.relative.is_empty();
             let module_path = from
                 .module
                 .as_ref()
@@ -228,6 +270,9 @@ fn collect_small(small: &SmallStatement, table: &mut HashMap<String, String>, dy
                 } else {
                     name
                 };
+                if is_relative {
+                    relative_locals.insert(local.clone());
+                }
                 table.insert(local, full);
             }
         }
@@ -478,6 +523,16 @@ mod tests {
         );
         assert_eq!(i.resolve("run"), Some("subprocess.run"));
         assert!(i.has_dynamic());
+    }
+
+    #[test]
+    fn is_relative_detects_leading_dot_imports() {
+        // `from .utils import helper` and `from . import sibling` are relative
+        let i = build_str("from .utils import helper\nfrom . import sibling\nimport os\n");
+        assert!(i.is_relative("helper"), "helper must be relative");
+        assert!(i.is_relative("sibling"), "sibling must be relative");
+        assert!(!i.is_relative("os"), "os must not be relative");
+        assert!(!i.is_relative("unknown"), "unknown must not be relative");
     }
 
     #[test]

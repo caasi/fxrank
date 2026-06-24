@@ -128,7 +128,13 @@ impl<'a> MutationWalker<'a> {
     }
 
     /// Emit a `param.mutation` for a write whose base is a `&mut` channel.
-    fn push_param_mutation(&mut self, discount: Discount, line: usize, evidence: String) {
+    fn push_param_mutation(
+        &mut self,
+        discount: Discount,
+        line: usize,
+        col: usize,
+        evidence: String,
+    ) {
         let unsafe_enclosed = self.unsafe_enclosed();
         let discounted = apply_discount(3, discount, unsafe_enclosed);
         let reason = match discount {
@@ -141,9 +147,11 @@ impl<'a> MutationWalker<'a> {
             discounted_to: Some(discounted),
             weight: weight_for_class(discounted),
             line,
+            col,
             // The binding is exact, but the write-through is a heuristic.
             tier: Tier::Heuristic,
             hidden: false,
+            contained: false,
             evidence,
             discount: Some(reason.to_string()),
             subreason: None,
@@ -152,24 +160,31 @@ impl<'a> MutationWalker<'a> {
     }
 
     /// Emit a plain class-N mutation effect (hidden/local/global): no discount.
+    #[allow(clippy::too_many_arguments)]
     fn push_plain(
         &mut self,
         kind: EffectKind,
         tier: Tier,
         hidden: bool,
         line: usize,
+        col: usize,
         evidence: String,
         subreason: Option<&str>,
     ) {
         let class = kind.base_class();
+        // A body-local write is bounded by the function; all other effects
+        // (param/global/hidden mutation, IO, etc.) escape to the caller.
+        let contained = matches!(kind, EffectKind::LocalMutation);
         self.effects.push(Effect {
             kind,
             class,
             discounted_to: None,
             weight: weight_for_class(class),
             line,
+            col,
             tier,
             hidden,
+            contained,
             evidence,
             discount: None,
             subreason: subreason.map(str::to_string),
@@ -178,20 +193,31 @@ impl<'a> MutationWalker<'a> {
     }
 
     /// Classify a write to a place expression by its base ident.
-    fn record_write(&mut self, place: &syn::Expr, line: usize) {
+    fn record_write(&mut self, place: &syn::Expr, line: usize, col: usize) {
         let Some(base) = base_ident(place) else {
             return;
         };
         if self.mut_params.contains(&base) {
-            self.push_param_mutation(Discount::MutParam, line, format!("write to &mut {base}"));
+            self.push_param_mutation(
+                Discount::MutParam,
+                line,
+                col,
+                format!("write to &mut {base}"),
+            );
         } else if base == "self" && self.mut_self {
-            self.push_param_mutation(Discount::MutSelf, line, "write to &mut self".to_string());
+            self.push_param_mutation(
+                Discount::MutSelf,
+                line,
+                col,
+                "write to &mut self".to_string(),
+            );
         } else if self.let_mut.contains(&base) {
             self.push_plain(
                 EffectKind::LocalMutation,
                 Tier::Exact,
                 false,
                 line,
+                col,
                 format!("write to local {base}"),
                 None,
             );
@@ -205,6 +231,7 @@ impl<'a> MutationWalker<'a> {
                 Tier::Heuristic,
                 false,
                 line,
+                col,
                 format!("write to global {base}"),
                 None,
             );
@@ -225,6 +252,7 @@ impl<'a> MutationWalker<'a> {
                 Tier::Heuristic,
                 false,
                 line,
+                col,
                 format!("write to imported {base}"),
                 None,
             );
@@ -240,6 +268,7 @@ impl<'a> MutationWalker<'a> {
                 Tier::Heuristic,
                 true,
                 line,
+                col,
                 format!("write to captured binding {base}"),
                 Some("captured-binding"),
             );
@@ -320,23 +349,29 @@ impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
     }
 
     fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
-        let line = node.span().start().line;
-        self.record_write(&node.left, line);
+        let loc = node.span().start();
+        let line = loc.line;
+        let col = loc.column + 1;
+        self.record_write(&node.left, line, col);
         syn::visit::visit_expr_assign(self, node);
     }
 
     fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
         // Compound assignment (`+=`, `-=`, …) is a Binary node, not Assign.
         if is_assign_op(&node.op) {
-            let line = node.span().start().line;
-            self.record_write(&node.left, line);
+            let loc = node.span().start();
+            let line = loc.line;
+            let col = loc.column + 1;
+            self.record_write(&node.left, line, col);
         }
         syn::visit::visit_expr_binary(self, node);
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         let method = node.method.to_string();
-        let line = node.span().start().line;
+        let loc = node.span().start();
+        let line = loc.line;
+        let col = loc.column + 1;
         if is_interior_mutator(&method) {
             let base = base_ident(&node.receiver);
             if base
@@ -352,6 +387,7 @@ impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
                     Tier::Heuristic,
                     true,
                     line,
+                    col,
                     format!(".{method} on shared &{base}"),
                     Some("interior-mut"),
                 );
@@ -367,12 +403,13 @@ impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
                     Tier::Heuristic,
                     false,
                     line,
+                    col,
                     format!("interior write to global {base} via .{method}"),
                     None,
                 );
             }
         } else if is_mutating_method(&method) {
-            self.record_write(&node.receiver, line);
+            self.record_write(&node.receiver, line, col);
         }
         syn::visit::visit_expr_method_call(self, node);
     }
