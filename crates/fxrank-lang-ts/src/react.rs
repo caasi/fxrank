@@ -60,7 +60,7 @@ impl Visit for ContextReadWalker<'_> {
             _ => None,
         };
         if callee_name == Some("useContext") {
-            let line = self.lines.line(node.span);
+            let (line, col) = self.lines.line_col(node.span);
             let class: u8 = 2;
             let confidence = detection_confidence(Tier::Heuristic, false, false);
             self.effects.push(Effect {
@@ -69,8 +69,10 @@ impl Visit for ContextReadWalker<'_> {
                 discounted_to: None,
                 weight: weight_for_class(class),
                 line,
+                col,
                 tier: Tier::Heuristic,
                 hidden: false,
+                contained: false,
                 evidence: "useContext(…)".to_string(),
                 discount: None,
                 subreason: Some("useContext-read".to_string()),
@@ -139,7 +141,7 @@ impl Visit for StateTransitionWalker<'_> {
         if !matches!(&node.name, Pat::Array(_)) {
             return;
         }
-        let line = self.lines.line(node.span);
+        let (line, col) = self.lines.line_col(node.span);
         let class: u8 = 1;
         let confidence = detection_confidence(Tier::Heuristic, false, false);
         self.effects.push(Effect {
@@ -148,8 +150,10 @@ impl Visit for StateTransitionWalker<'_> {
             discounted_to: None,
             weight: weight_for_class(class),
             line,
+            col,
             tier: Tier::Heuristic,
             hidden: false,
+            contained: false,
             evidence: format!("{subreason}(…)"),
             discount: None,
             subreason: Some(subreason.to_string()),

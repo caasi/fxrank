@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use fxrank_core::CorpusProfile;
 use fxrank_core::frontend::{Frontend, FrontendOutput, Language, SourceFile};
 use fxrank_core::model::{Diagnostic, Hotspot};
+use fxrank_core::record::CallSiteRef;
 
 /// TypeScript/JavaScript corpus hygiene.
 ///
@@ -99,7 +100,39 @@ impl Frontend for TsFrontend {
                             &module_bindings,
                             &lines,
                             &mut output.functions,
+                            &mut output.records,
                         );
+
+                        // Module-init unit: score the top-level executable
+                        // statements as a synthetic `<module>` unit. Emitted
+                        // only when the module has ≥1 effect (import-time IO,
+                        // effectful top-level call, etc.). A pure module
+                        // (imports + function declarations only) produces no
+                        // `<module>` entry. This runs AFTER analyze_units so
+                        // it does not interfere with the React two-pass.
+                        //
+                        // `is_root` is set by the CLI for explicit-file entries;
+                        // the frontend always emits `false`.
+                        if let Some(init_unit) = functions::module_init_unit(&module, &source.path)
+                        {
+                            let h = detect::analyze_unit(
+                                &init_unit,
+                                &imports,
+                                &lines,
+                                &module_bindings,
+                            );
+                            if !h.effects.is_empty() {
+                                let rec = detect::record_from_hotspot(
+                                    &init_unit,
+                                    &h,
+                                    &imports,
+                                    &lines,
+                                    &[],
+                                );
+                                output.records.push(rec);
+                                output.functions.push(h);
+                            }
+                        }
                     }
                 }
             }
@@ -128,6 +161,7 @@ fn analyze_units(
     module_bindings: &HashSet<String>,
     lines: &SpanLines,
     out: &mut Vec<Hotspot>,
+    records: &mut Vec<fxrank_core::record::UnitRecord>,
 ) {
     // Pass 1: components, their ref-binding sets, and the inherited arrows.
     let components: Vec<&FnUnit> = units
@@ -148,8 +182,18 @@ fn analyze_units(
 
     // Pass 2: score each unit, routing inherited arrows into their component.
     let mut by_id: HashMap<String, Hotspot> = HashMap::new();
+    // id -> &FnUnit for every emitted (non-suppressed) unit, so the final loop
+    // can recover the unit to build its record (path/col + own-body refs).
+    // Suppressed arrows are never inserted here (they `continue` below), so a
+    // record is built iff a Hotspot is pushed → 1:1.
+    let mut unit_by_id: HashMap<&str, &FnUnit> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut pending: HashMap<String, Vec<(react::HookPhase, detect::RawSignals)>> = HashMap::new();
+    // Outgoing call refs absorbed from suppressed hook-callback arrows, keyed by
+    // the owning component id. These are merged into the component's record refs
+    // so that cross-file propagation can follow calls made inside hook callbacks
+    // (e.g. `useEffect(() => helper())` gives the component an edge to `helper`).
+    let mut pending_refs: HashMap<String, Vec<CallSiteRef>> = HashMap::new();
     // Shared empty set used as a borrow fallback when a component has no ref bindings.
     // Avoids cloning the per-component HashSet<String> for every suppressed callback.
     let empty_refs: HashSet<String> = HashSet::new();
@@ -163,7 +207,18 @@ fn analyze_units(
             // arrow alone can't know `r` is a useRef binding from the component).
             let refs = comp_refs.get(comp_id.as_str()).unwrap_or(&empty_refs);
             let raw = detect::raw_signals(unit, imports, lines, module_bindings, refs);
-            pending.entry(comp_id).or_default().push((phase, raw));
+            pending
+                .entry(comp_id.clone())
+                .or_default()
+                .push((phase, raw));
+            // Also collect this arrow's outgoing call refs so the component's
+            // record carries edges to functions called inside hook callbacks.
+            // `refs::extract` uses own-body semantics (stops at nested arrows/fns),
+            // which is correct here — the callback IS the body we want.
+            let arrow_refs = detect::refs::extract(&unit.body, imports, lines);
+            if !arrow_refs.is_empty() {
+                pending_refs.entry(comp_id).or_default().extend(arrow_refs);
+            }
             continue;
         }
         let mut h = detect::analyze_unit(unit, imports, lines, module_bindings);
@@ -171,6 +226,7 @@ fn analyze_units(
             detect::augment_component(&mut h, unit, lines);
         }
         by_id.insert(unit.id.clone(), h);
+        unit_by_id.insert(unit.id.as_str(), unit);
         order.push(unit.id.clone());
     }
 
@@ -182,7 +238,23 @@ fn analyze_units(
     }
 
     for id in order {
-        out.push(by_id.remove(&id).expect("hotspot present for ordered id"));
+        let h = by_id.remove(&id).expect("hotspot present for ordered id");
+        // Build the record FROM the final Hotspot (own-data copied, incl. a
+        // component's absorbed inherited signals), then push both 1:1.
+        // Pass the absorbed arrow refs so cross-file propagation can follow
+        // calls made inside hook callbacks (transitive propagation through hooks).
+        let unit = unit_by_id
+            .get(id.as_str())
+            .expect("unit present for ordered id");
+        let absorbed_refs = pending_refs.remove(id.as_str()).unwrap_or_default();
+        records.push(detect::record_from_hotspot(
+            unit,
+            &h,
+            imports,
+            lines,
+            &absorbed_refs,
+        ));
+        out.push(h);
     }
 }
 
@@ -211,6 +283,162 @@ mod tests {
         let p = TsFrontend::default().corpus_profile();
         assert_eq!(p.prune_dirs, CORPUS_PROFILE.prune_dirs);
         assert_eq!(p.test_file_globs, CORPUS_PROFILE.test_file_globs);
+    }
+
+    /// Parse `src` as TSX, run the full `analyze_units` two-pass, and return
+    /// `(hotspots, records)`.
+    fn analyze_src(src: &str) -> (Vec<Hotspot>, Vec<fxrank_core::record::UnitRecord>) {
+        let (module, cm) = functions::parse_module(src, "t.tsx", Lang::Tsx).expect("parse");
+        let lines = SpanLines::new(cm);
+        let imports = ImportTable::from_module(&module);
+        let module_bindings = imports::module_bindings(&module);
+        let units = functions::collect(&module, "t.tsx", &lines);
+        let mut out = Vec::new();
+        let mut records = Vec::new();
+        analyze_units(
+            &units,
+            &imports,
+            &module_bindings,
+            &lines,
+            &mut out,
+            &mut records,
+        );
+        (out, records)
+    }
+
+    #[test]
+    fn records_emitted_one_to_one_with_hotspots_and_suppressed_arrow_has_none() {
+        // A component passing `() => fetch(...)` to useEffect: the arrow is an
+        // inherited hook callback → SUPPRESSED as a standalone hotspot, its fetch
+        // effect absorbed into the component. The component is emitted; the arrow
+        // is not.
+        let src = "import React, { useEffect } from 'react';\n\
+                   function FetchData() {\n\
+                     useEffect(() => { fetch('/api/data'); }, []);\n\
+                     return <div/>;\n\
+                   }\n";
+        let (out, records) = analyze_src(src);
+
+        // 1:1 — exactly one record per emitted hotspot.
+        assert_eq!(
+            records.len(),
+            out.len(),
+            "records must be 1:1 with hotspots; hotspots={:?} records={:?}",
+            out.iter().map(|h| &h.id).collect::<Vec<_>>(),
+            records.iter().map(|r| &r.unit_id).collect::<Vec<_>>(),
+        );
+
+        // The component hotspot exists; the suppressed arrow does NOT.
+        let comp = out
+            .iter()
+            .find(|h| h.symbol == "FetchData")
+            .expect("FetchData component hotspot present");
+        assert!(
+            !out.iter().any(|h| h.id.contains("<arrow@")),
+            "suppressed arrow must NOT appear as a hotspot; out={:?}",
+            out.iter().map(|h| &h.id).collect::<Vec<_>>(),
+        );
+
+        // Records contain the component id but NOT the arrow id.
+        assert!(
+            records.iter().any(|r| r.unit_id == comp.id),
+            "component id must have a record"
+        );
+        assert!(
+            !records.iter().any(|r| r.unit_id.contains("<arrow@")),
+            "suppressed arrow must NOT have a record; records={:?}",
+            records.iter().map(|r| &r.unit_id).collect::<Vec<_>>(),
+        );
+
+        // The component's record carries the absorbed fetch effect (its own-data
+        // == the final component Hotspot's).
+        let comp_rec = records
+            .iter()
+            .find(|r| r.unit_id == comp.id)
+            .expect("component record present");
+        assert_eq!(
+            comp_rec.effects.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            comp.effects.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            "component record effects must equal the final component Hotspot's (absorbed signals included)"
+        );
+        assert!(
+            comp_rec
+                .effects
+                .iter()
+                .any(|e| e.kind == fxrank_core::effect::EffectKind::NetFsDb),
+            "component record must carry the absorbed fetch (net.fs.db) effect; effects={:?}",
+            comp_rec.effects.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Finding 2: a suppressed hook-callback arrow's outgoing refs must be merged
+    /// into the owning component's record so that cross-file propagation can follow
+    /// calls made inside hook callbacks.
+    ///
+    /// Scenario: `Comp` passes `() => { helper(); }` to `useEffect`. `helper` does
+    /// `fetch("x")`. The arrow is suppressed; its call to `helper` must appear in
+    /// `Comp`'s record `refs` — enabling the propagation fold to later push
+    /// `helper`'s class-7 IO up to `Comp`.
+    ///
+    /// This test is at the record level (below the cross-file fold). The propagation
+    /// fold lives in `fxrank-cli`; what we verify here is the pre-condition: the
+    /// record carries the `helper` ref.
+    #[test]
+    fn hook_callback_refs_routed_into_component_record() {
+        // A component with a useEffect callback that calls an in-scope `helper`.
+        let src = "import React, { useEffect } from 'react';\n\
+                   function Comp() {\n\
+                     useEffect(() => { helper(); }, []);\n\
+                     return <div/>;\n\
+                   }\n\
+                   function helper() { fetch('x'); }\n";
+        let (out, records) = analyze_src(src);
+
+        // The arrow must be suppressed — only Comp and helper appear as hotspots.
+        assert!(
+            !out.iter().any(|h| h.id.contains("<arrow@")),
+            "suppressed hook-callback arrow must not appear as a hotspot; out={:?}",
+            out.iter().map(|h| &h.id).collect::<Vec<_>>(),
+        );
+
+        let comp = out
+            .iter()
+            .find(|h| h.symbol == "Comp")
+            .expect("Comp hotspot present");
+
+        let comp_rec = records
+            .iter()
+            .find(|r| r.unit_id == comp.id)
+            .expect("Comp record present");
+
+        // The component's record must carry a ref to `helper` (from the absorbed
+        // hook callback) so that the propagation fold can follow the edge.
+        assert!(
+            comp_rec.refs.iter().any(|r| r.base == "helper"),
+            "Comp record must carry a ref to `helper` (absorbed from hook callback); refs={:?}",
+            comp_rec.refs.iter().map(|r| &r.base).collect::<Vec<_>>(),
+        );
+
+        // Sanity: helper itself is an emitted hotspot with its own fetch effect.
+        let helper = out
+            .iter()
+            .find(|h| h.symbol == "helper")
+            .expect("helper hotspot present");
+        assert!(
+            helper
+                .effects
+                .iter()
+                .any(|e| e.kind == fxrank_core::effect::EffectKind::NetFsDb),
+            "helper must have a net.fs.db effect from fetch; effects={:?}",
+            helper.effects.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        );
+
+        // Records 1:1 with hotspots.
+        assert_eq!(
+            records.len(),
+            out.len(),
+            "records must be 1:1 with hotspots"
+        );
     }
 
     #[test]
