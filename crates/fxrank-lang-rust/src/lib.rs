@@ -67,6 +67,9 @@ impl Frontend for RustFrontend {
                             output
                                 .functions
                                 .push(detect::analyze_unit(unit, &imports, &statics));
+                            output
+                                .records
+                                .push(detect::build_record(unit, &imports, &statics));
                         }
                     } else {
                         let mut skipped = 0usize;
@@ -77,6 +80,9 @@ impl Frontend for RustFrontend {
                                 output
                                     .functions
                                     .push(detect::analyze_unit(unit, &imports, &statics));
+                                output
+                                    .records
+                                    .push(detect::build_record(unit, &imports, &statics));
                             }
                         }
                         output.skipped_tests += skipped;

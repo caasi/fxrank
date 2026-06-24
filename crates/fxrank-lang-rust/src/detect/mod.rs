@@ -8,6 +8,7 @@
 pub mod calls;
 pub mod macros;
 pub mod mutation;
+pub mod refs;
 pub mod risk;
 
 use crate::functions::FnUnit;
@@ -55,19 +56,21 @@ pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, statics: &HashSet<Stri
         weight_for_class(risk_class)
     };
 
+    let mc = max_class(&classes, risk_class);
+    let os = own_score(&weights);
     Hotspot {
         id: unit.id.clone(),
         symbol: unit.symbol.clone(),
         path: unit.path.clone(),
         line: unit.line,
-        max_class: max_class(&classes, risk_class),
-        own_score: own_score(&weights),
         risk_weight,
         confidence: function_confidence(&confidences),
         async_boundary,
         await_count,
         effects,
         risk_features: risks,
+        // Propagated fields default to own (cross-file folding overwrites them).
+        ..Hotspot::own_seed(os, mc)
     }
 }
 
@@ -92,4 +95,71 @@ fn gather(unit: &FnUnit, imports: &ImportTable, statics: &HashSet<String>) -> Ve
     effects.extend(macros::detect(&unit.block));
     effects.extend(mutation::detect(&unit.block, &unit.sig, statics, imports));
     effects
+}
+
+/// Build a language-neutral [`fxrank_core::record::UnitRecord`] for `unit`.
+///
+/// The record carries the same own-body `effects` and `risks` as the
+/// [`analyze_unit`] Hotspot (same `gather` + `risk::detect_fn_risks` calls),
+/// plus outgoing call references from [`refs::extract`].  It is the phase-2
+/// pass-1 intermediate that the cross-file fold consumes.
+///
+/// INVARIANT: this recomputes own-body via the same `gather` as `analyze_unit`.
+/// This stays correct only while `analyze_unit` does NO post-`gather` mutation of
+/// effects/risks (unlike TS, which absorbs React signals and so must copy from the
+/// final Hotspot). If you add a post-gather step here, switch to copying from the
+/// Hotspot or the record's own-body will drift from it.
+pub fn build_record(
+    unit: &FnUnit,
+    imports: &ImportTable,
+    statics: &HashSet<String>,
+) -> fxrank_core::record::UnitRecord {
+    let effects = gather(unit, imports, statics);
+    let risks = risk::detect_fn_risks(&unit.block, &unit.sig, &unit.path);
+    let call_refs = refs::extract(&unit.block, imports);
+    let await_count = count_awaits(&unit.block);
+    let async_boundary = unit.sig.asyncness.is_some() || await_count > 0;
+
+    fxrank_core::record::UnitRecord {
+        unit_id: unit.id.clone(),
+        path: unit.path.clone(),
+        line: unit.line,
+        col: unit.col,
+        symbol: unit.symbol.clone(),
+        is_root: false,
+        export: None,
+        effects,
+        risks,
+        refs: call_refs,
+        async_boundary,
+        await_count,
+        language: fxrank_core::frontend::Language::Rust,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_record_captures_own_and_refs() {
+        let f =
+            syn::parse_file("use std::fs; fn writer(p: &str) { fs::write(p, b\"x\"); }").unwrap();
+        let imports = crate::imports::ImportTable::from_file(&f);
+        let statics = std::collections::HashSet::new();
+        let units = crate::functions::collect(&f, "a.rs");
+        let rec = build_record(&units[0], &imports, &statics);
+        assert_eq!(rec.symbol, "writer");
+        assert!(
+            rec.refs.iter().any(|r| r.base.contains("fs::write")),
+            "expected a ref with base containing 'fs::write', got: {:?}",
+            rec.refs
+        );
+        assert!(
+            !rec.effects.is_empty(),
+            "expected effects (fs::write → net.fs.db), got none"
+        );
+        assert_eq!(rec.unit_id, units[0].id);
+        assert!(!rec.is_root);
+    }
 }

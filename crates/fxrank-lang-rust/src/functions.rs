@@ -27,6 +27,8 @@ pub struct FnUnit {
     pub path: String,
     /// 1-based line number of the function's name (`sig.ident`).
     pub line: usize,
+    /// 1-based character column of the function's name (`sig.ident`).
+    pub col: usize,
     /// The full function signature (for detectors to inspect attributes, asyncness, etc.).
     pub sig: syn::Signature,
     /// The function body (for detectors to walk expressions in T11–T15).
@@ -83,6 +85,7 @@ fn collect_items(items: &[Item], path: &str, in_cfg_test: bool, out: &mut Vec<Fn
                     symbol,
                     path: path.to_string(),
                     line,
+                    col,
                     sig: f.sig.clone(),
                     block: *f.block.clone(),
                     is_test,
@@ -138,6 +141,7 @@ fn collect_from_impl(impl_block: &ItemImpl, path: &str, in_cfg_test: bool, out: 
                 symbol,
                 path: path.to_string(),
                 line,
+                col,
                 sig: method.sig.clone(),
                 block: method.block.clone(),
                 is_test,
@@ -170,6 +174,7 @@ fn collect_from_trait(
                     symbol,
                     path: path.to_string(),
                     line,
+                    col,
                     sig: method.sig.clone(),
                     block: block.clone(),
                     is_test,
@@ -198,4 +203,17 @@ fn last_segment_ident(path: &syn::Path) -> String {
         .last()
         .map(|seg| seg.ident.to_string())
         .unwrap_or_else(|| "_".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fnunit_exposes_col() {
+        let file = syn::parse_file("fn foo() {}").unwrap();
+        let units = collect(&file, "a.rs");
+        assert_eq!(units[0].col, 4); // 1-based column of `foo`
+        assert!(units[0].id.ends_with(":4:foo")); // col already in id
+    }
 }

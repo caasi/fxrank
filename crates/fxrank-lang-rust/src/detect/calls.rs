@@ -55,8 +55,10 @@ impl<'a, 'ast> Visit<'ast> for CallWalker<'a> {
             let rendered = render_path(&p.path);
             let resolved = self.resolve(&rendered);
             if let Some(kind) = classify_path_call(&resolved) {
-                let line = node.span().start().line;
-                self.push(kind, Tier::Path, line, rendered);
+                let loc = node.span().start();
+                let line = loc.line;
+                let col = loc.column + 1;
+                self.push(kind, Tier::Path, line, col, rendered);
             }
         }
         // Recurse manually so we can set `in_callee` for the callee sub-expression.
@@ -74,8 +76,10 @@ impl<'a, 'ast> Visit<'ast> for CallWalker<'a> {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         let method = node.method.to_string();
         if let Some(kind) = classify_method_call(&method) {
-            let line = node.span().start().line;
-            self.push(kind, Tier::Heuristic, line, format!(".{method}"));
+            let loc = node.span().start();
+            let line = loc.line;
+            let col = loc.column + 1;
+            self.push(kind, Tier::Heuristic, line, col, format!(".{method}"));
         }
         syn::visit::visit_expr_method_call(self, node);
     }
@@ -92,8 +96,10 @@ impl<'a, 'ast> Visit<'ast> for CallWalker<'a> {
         if !self.in_callee && node.path.segments.len() == 1 {
             let ident = node.path.segments[0].ident.to_string();
             if self.statics.contains(&ident) {
-                let line = node.span().start().line;
-                self.push(EffectKind::AmbientRead, Tier::Heuristic, line, ident);
+                let loc = node.span().start();
+                let line = loc.line;
+                let col = loc.column + 1;
+                self.push(EffectKind::AmbientRead, Tier::Heuristic, line, col, ident);
             }
         }
         syn::visit::visit_expr_path(self, node);
@@ -118,7 +124,7 @@ impl<'a> CallWalker<'a> {
         }
     }
 
-    fn push(&mut self, kind: EffectKind, tier: Tier, line: usize, evidence: String) {
+    fn push(&mut self, kind: EffectKind, tier: Tier, line: usize, col: usize, evidence: String) {
         let class = kind.base_class();
         // Path tier carries a shadow penalty when the file has a glob import,
         // because a bare name could resolve to something we never see.
@@ -130,8 +136,10 @@ impl<'a> CallWalker<'a> {
             discounted_to: None,
             weight: weight_for_class(class),
             line,
+            col,
             tier,
             hidden: false,
+            contained: false,
             evidence,
             discount: None,
             subreason: None,
@@ -239,5 +247,36 @@ fn classify_method_call(method: &str) -> Option<EffectKind> {
         // panic — Option/Result unwrapping.
         "unwrap" | "expect" => Some(Panic),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::imports::ImportTable;
+
+    /// Two `std::fs::write` calls on the **same line** must produce two effects
+    /// with different `col` values. This verifies that the real span is used
+    /// (not a hardcoded `col: 0`) so the fold-level `SiteKey` is unique per call.
+    #[test]
+    fn two_same_kind_effects_same_line_have_distinct_col() {
+        let src = "use std::fs;\nfn f() { std::fs::write(\"a\", b\"x\").ok(); std::fs::write(\"b\", b\"y\").ok(); }";
+        let file = syn::parse_file(src).unwrap();
+        let imports = ImportTable::from_file(&file);
+        let statics = std::collections::HashSet::new();
+        let units = crate::functions::collect(&file, "t.rs");
+        let unit = units.iter().find(|u| u.symbol == "f").expect("unit f");
+        let effects = detect(&unit.block, &imports, "t.rs", &statics);
+        let net: Vec<_> = effects
+            .iter()
+            .filter(|e| e.kind.wire() == "net.fs.db")
+            .collect();
+        assert_eq!(net.len(), 2, "expected two net.fs.db effects; got {net:?}");
+        assert_eq!(net[0].line, net[1].line, "both calls must be on line 2");
+        assert_ne!(
+            net[0].col, net[1].col,
+            "two writes on the same line must have distinct cols, got col={} and col={}",
+            net[0].col, net[1].col
+        );
     }
 }

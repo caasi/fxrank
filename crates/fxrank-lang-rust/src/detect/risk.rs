@@ -43,11 +43,14 @@ pub fn detect_fn_risks(block: &syn::Block, sig: &syn::Signature, path: &str) -> 
 
     // `unsafe fn` → UnsafeFn (class 5, Exact).
     if sig.unsafety.is_some() {
-        let line = sig.span().start().line;
+        let loc = sig.span().start();
+        let line = loc.line;
+        let col = loc.column + 1;
         walker.push(
             RiskKind::UnsafeFn,
             Tier::Exact,
             line,
+            col,
             "unsafe fn".to_string(),
         );
     }
@@ -68,7 +71,7 @@ struct RiskWalker {
 }
 
 impl RiskWalker {
-    fn push(&mut self, kind: RiskKind, tier: Tier, line: usize, evidence: String) {
+    fn push(&mut self, kind: RiskKind, tier: Tier, line: usize, col: usize, evidence: String) {
         let class = kind.class();
         self.features.push(RiskFeature {
             kind,
@@ -76,6 +79,7 @@ impl RiskWalker {
             weight: weight_for_class(class),
             path: self.path.clone(),
             line,
+            col,
             evidence,
             tier,
         });
@@ -90,11 +94,14 @@ impl<'ast> Visit<'ast> for RiskWalker {
     // ── unsafe { } blocks ────────────────────────────────────────────────────
 
     fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
-        let line = node.span().start().line;
+        let loc = node.span().start();
+        let line = loc.line;
+        let col = loc.column + 1;
         self.push(
             RiskKind::UnsafeBlock,
             Tier::Exact,
             line,
+            col,
             "unsafe { }".to_string(),
         );
         self.unsafe_depth += 1;
@@ -108,10 +115,12 @@ impl<'ast> Visit<'ast> for RiskWalker {
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*node.func {
             let rendered = render_path(&p.path);
-            let line = node.span().start().line;
+            let loc = node.span().start();
+            let line = loc.line;
+            let col = loc.column + 1;
 
             if let Some((kind, tier, evidence)) = classify_path_call(&rendered) {
-                self.push(kind, tier, line, evidence);
+                self.push(kind, tier, line, col, evidence);
             }
         }
         syn::visit::visit_expr_call(self, node);
@@ -121,7 +130,9 @@ impl<'ast> Visit<'ast> for RiskWalker {
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         let method = node.method.to_string();
-        let line = node.span().start().line;
+        let loc = node.span().start();
+        let line = loc.line;
+        let col = loc.column + 1;
 
         match method.as_str() {
             "get_unchecked" | "get_unchecked_mut" => {
@@ -129,6 +140,7 @@ impl<'ast> Visit<'ast> for RiskWalker {
                     RiskKind::GetUnchecked,
                     Tier::Heuristic,
                     line,
+                    col,
                     format!(".{method}"),
                 );
             }
@@ -137,6 +149,7 @@ impl<'ast> Visit<'ast> for RiskWalker {
                     RiskKind::FromRaw,
                     Tier::Heuristic,
                     line,
+                    col,
                     ".from_raw".to_string(),
                 );
             }
@@ -153,8 +166,16 @@ impl<'ast> Visit<'ast> for RiskWalker {
             rendered.as_str(),
             "asm" | "core::arch::asm" | "std::arch::asm"
         ) {
-            let line = node.span().start().line;
-            self.push(RiskKind::Asm, Tier::Exact, line, format!("{rendered}!"));
+            let loc = node.span().start();
+            let line = loc.line;
+            let col = loc.column + 1;
+            self.push(
+                RiskKind::Asm,
+                Tier::Exact,
+                line,
+                col,
+                format!("{rendered}!"),
+            );
         }
         syn::visit::visit_macro(self, node);
     }
@@ -169,11 +190,14 @@ impl<'ast> Visit<'ast> for RiskWalker {
 
     fn visit_expr_unary(&mut self, node: &'ast syn::ExprUnary) {
         if matches!(node.op, syn::UnOp::Deref(_)) && self.inside_unsafe() {
-            let line = node.span().start().line;
+            let loc = node.span().start();
+            let line = loc.line;
+            let col = loc.column + 1;
             self.push(
                 RiskKind::RawPtrDeref,
                 Tier::Heuristic,
                 line,
+                col,
                 "*<expr> inside unsafe".to_string(),
             );
         }
@@ -201,7 +225,9 @@ pub fn detect_module_risks(file: &syn::File, path: &str, include_tests: bool) ->
                 if !include_tests && is_cfg_test(&fm.attrs) {
                     continue;
                 }
-                let line = fm.span().start().line;
+                let loc = fm.span().start();
+                let line = loc.line;
+                let col = loc.column + 1;
                 let abi = fm
                     .abi
                     .name
@@ -214,6 +240,7 @@ pub fn detect_module_risks(file: &syn::File, path: &str, include_tests: bool) ->
                     weight: weight_for_class(RiskKind::ExternBlock.class()),
                     path: path.to_string(),
                     line,
+                    col,
                     evidence: format!("extern \"{abi}\" {{ }}"),
                     tier: Tier::Exact,
                 });
@@ -228,13 +255,16 @@ pub fn detect_module_risks(file: &syn::File, path: &str, include_tests: bool) ->
                 if !include_tests && is_cfg_test(&impl_block.attrs) {
                     continue;
                 }
-                let line = impl_block.span().start().line;
+                let loc = impl_block.span().start();
+                let line = loc.line;
+                let col = loc.column + 1;
                 features.push(RiskFeature {
                     kind: RiskKind::ImplDrop,
                     class: RiskKind::ImplDrop.class(),
                     weight: weight_for_class(RiskKind::ImplDrop.class()),
                     path: path.to_string(),
                     line,
+                    col,
                     evidence: "impl Drop".to_string(),
                     tier: Tier::Exact,
                 });
@@ -247,6 +277,7 @@ pub fn detect_module_risks(file: &syn::File, path: &str, include_tests: bool) ->
                         weight: weight_for_class(RiskKind::UnsafeImpl.class()),
                         path: path.to_string(),
                         line,
+                        col,
                         evidence: "unsafe impl".to_string(),
                         tier: Tier::Exact,
                     });
@@ -258,13 +289,16 @@ pub fn detect_module_risks(file: &syn::File, path: &str, include_tests: bool) ->
                 if !include_tests && is_cfg_test(&impl_block.attrs) {
                     continue;
                 }
-                let line = impl_block.span().start().line;
+                let loc = impl_block.span().start();
+                let line = loc.line;
+                let col = loc.column + 1;
                 features.push(RiskFeature {
                     kind: RiskKind::UnsafeImpl,
                     class: RiskKind::UnsafeImpl.class(),
                     weight: weight_for_class(RiskKind::UnsafeImpl.class()),
                     path: path.to_string(),
                     line,
+                    col,
                     evidence: "unsafe impl".to_string(),
                     tier: Tier::Exact,
                 });

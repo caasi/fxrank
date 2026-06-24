@@ -1328,3 +1328,62 @@ fn nested_impl_self_write_not_attributed_to_free_fn() {
             .collect::<Vec<_>>()
     );
 }
+
+// ── Phase-3a Task 1: Effect.contained correctness ──────────────────────────
+
+/// `local.mutation` (a body-local `let mut` write) is bounded by the function
+/// and must have `contained == true` → `Effect::escapes()` returns false.
+/// All other escaping effects (global.mutation, IO, param.mutation, …) must
+/// have `contained == false` → `escapes()` returns true.
+#[test]
+fn local_mutation_is_contained_global_mutation_escapes() {
+    let out = analyze_fixture("mutation.rs");
+
+    // `locals()` has two `let mut x` writes → both should be local.mutation
+    // with contained == true.
+    let local_effects = effects_of(&out, "locals");
+    let local_muts: Vec<&Effect> = local_effects
+        .iter()
+        .filter(|e| e.kind.wire() == "local.mutation")
+        .collect();
+    assert!(
+        !local_muts.is_empty(),
+        "locals() must have at least one local.mutation effect"
+    );
+    for e in &local_muts {
+        assert!(
+            e.contained,
+            "local.mutation must be contained; got contained=false for evidence={}",
+            e.evidence
+        );
+        assert!(
+            !e.escapes(),
+            "local.mutation must not escape; escapes() returned true for evidence={}",
+            e.evidence
+        );
+    }
+
+    // `inc()` writes to the file-level `COUNT` static → global.mutation with
+    // contained == false (escapes to the caller / whole program).
+    let global_effects = effects_of(&out, "inc");
+    let global_muts: Vec<&Effect> = global_effects
+        .iter()
+        .filter(|e| e.kind.wire() == "global.mutation")
+        .collect();
+    assert!(
+        !global_muts.is_empty(),
+        "inc() must have at least one global.mutation effect"
+    );
+    for e in &global_muts {
+        assert!(
+            !e.contained,
+            "global.mutation must not be contained; got contained=true for evidence={}",
+            e.evidence
+        );
+        assert!(
+            e.escapes(),
+            "global.mutation must escape; escapes() returned false for evidence={}",
+            e.evidence
+        );
+    }
+}
