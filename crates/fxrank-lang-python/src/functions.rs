@@ -32,13 +32,20 @@ use libcst_native::{
 
 use crate::source::{SpanIndex, anchor_of_subslice};
 
-/// The body of a function-unit: a statement suite (`def`/method) or a single
-/// expression (`lambda`). Borrowed from the parsed `Module`.
+/// The body of a function-unit: a statement suite (`def`/method), a single
+/// expression (`lambda`), or a module's top-level statement list (the synthetic
+/// `<module>` unit). Borrowed from the parsed `Module`.
 pub enum FnBody<'a> {
     /// A `def`/`async def`/method body — a statement suite.
     Suite(&'a Suite<'a>),
     /// A `lambda` body — a single expression.
     Expr(&'a Expression<'a>),
+    /// The module's top-level statement list — used by the synthetic `<module>` unit
+    /// that scores import-time effects. The own-body walker treats this like a suite
+    /// of statements but does NOT descend into nested `def`/`class` bodies (those are
+    /// separate units), exactly matching the behaviour of `walk_compound` for nested
+    /// functions.
+    Module(&'a [Statement<'a>]),
 }
 
 /// A single function-shaped scope collected from the source.
@@ -132,6 +139,94 @@ pub fn collect<'a>(
     let lambda_node_count = ctx.lambda_idx;
     (ctx.out, lambda_node_count)
 }
+
+/// Build a synthetic [`FnUnit`] representing a module's top-level initialisation
+/// code — the statements that execute when the module is first imported.
+///
+/// The unit gets symbol `"<module>"`, `line = 1`, `col = 1`, and
+/// `body = FnBody::Module(&module.body)`. `is_root` is always `false` at the
+/// frontend level — the CLI sets the real value for explicit-file entries.
+///
+/// **Own-body semantics are preserved**: the own-body walker walks each top-level
+/// statement but does NOT descend into nested `def`/`class` bodies (those are
+/// separate units). Import statements (`import`, `from … import`) have no own-body
+/// runtime effect and are simply skipped by the detectors' `walk_small`
+/// (`Pass`/`Import`/`ImportFrom`/`Global`/`Nonlocal` → no-op arm).
+///
+/// Returns `None` when the module has no top-level executable statements (e.g.
+/// a module containing only `import` declarations and function/class definitions),
+/// because the caller will score first and skip emission when there are no effects
+/// — returning `None` early avoids building empty units. Callers should additionally
+/// skip emitting the resulting `Hotspot` when `hotspot.effects.is_empty()`.
+pub fn module_init_unit<'a>(module: &'a Module<'a>) -> Option<FnUnit<'a>> {
+    // A module with only imports and function/class definitions has no top-level
+    // executable statements that can produce import-time effects. Detect this
+    // cheaply: if every statement is either an import or a compound def/class,
+    // return None early. (The walker itself would produce no effects anyway, but
+    // returning None avoids building the synthetic unit at all.)
+    let has_executable = module.body.iter().any(|stmt| {
+        match stmt {
+            Statement::Simple(line) => line.body.iter().any(|small| {
+                // Import* and Pass and Global/Nonlocal/Break/Continue carry no
+                // import-time effects; everything else (Expr, Assign, AugAssign,
+                // AnnAssign, Return, Raise, Assert, Del, TypeAlias) might.
+                !matches!(
+                    small,
+                    SmallStatement::Import(_)
+                        | SmallStatement::ImportFrom(_)
+                        | SmallStatement::Pass(_)
+                        | SmallStatement::Global(_)
+                        | SmallStatement::Nonlocal(_)
+                        | SmallStatement::Break(_)
+                        | SmallStatement::Continue(_)
+                )
+            }),
+            Statement::Compound(c) => {
+                // `def` at top level is its OWN unit; only the `def` statement itself
+                // runs at import time (no body effects) — not executable for module-init.
+                // A `class` at top level IS executable: its body runs at class-definition
+                // time (import time).  `class C: DATA = load_config()` runs `load_config()`
+                // at import.  (Methods inside are their own units and are handled by the
+                // walker, not here.)
+                // Other compound statements (if, for, while, try, with, match) also run
+                // at import time.
+                !matches!(c, CompoundStatement::FunctionDef(_))
+            }
+        }
+    });
+
+    if !has_executable {
+        return None;
+    }
+
+    Some(FnUnit {
+        symbol: "<module>".to_owned(),
+        line: 1,
+        col: 1,
+        is_async: false,
+        is_test_unit: false,
+        body: FnBody::Module(&module.body),
+        params: &EMPTY_PARAMS,
+        decorators: &[],
+        returns: None,
+    })
+}
+
+/// A static empty `Parameters` used as the `params` field for the synthetic
+/// `<module>` unit (which has no parameters).
+///
+/// All fields are empty / `None`, so `Parameters<'static>` has no actual
+/// lifetime-dependent borrows. A `&'static Parameters<'static>` satisfies any
+/// `&'a Parameters<'a>` constraint via lifetime coercion (`'static: 'a`).
+static EMPTY_PARAMS: std::sync::LazyLock<libcst_native::Parameters<'static>> =
+    std::sync::LazyLock::new(|| libcst_native::Parameters {
+        params: vec![],
+        posonly_params: vec![],
+        star_arg: None,
+        kwonly_params: vec![],
+        star_kwarg: None,
+        posonly_ind: None,
+    });
 
 /// Enclosing class context for source-based test detection.
 ///
@@ -443,7 +538,7 @@ fn collect_in_expr<'a>(expr: &'a Expression<'a>, ctx: &mut Ctx<'a, '_>) {
     match expr {
         Expression::Lambda(l) => {
             // Pre-order: emit this lambda BEFORE descending into its body.
-            // Lambdas are never considered test units.
+            // Lambdas are never considered test units or roots.
             if let Some(&(line, col)) = ctx.anchors.get(ctx.lambda_idx) {
                 ctx.out.push(FnUnit {
                     symbol: format!("<lambda@L{line}C{col}>"),

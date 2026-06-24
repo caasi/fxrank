@@ -144,6 +144,15 @@ fn prescan_body(
     match body {
         FnBody::Suite(suite) => prescan_suite(suite, globals, nonlocals, locals),
         FnBody::Expr(_) => {} // lambdas have no statements
+        // The `<module>` unit: prescan each top-level statement. Module-level
+        // names that appear in a `global` declaration inside a nested def are
+        // handled by that nested def's own prescan; at module scope itself,
+        // every bare name assignment IS a module-level binding (no `global` needed).
+        FnBody::Module(stmts) => {
+            for stmt in *stmts {
+                prescan_stmt(stmt, globals, nonlocals, locals);
+            }
+        }
     }
 }
 
@@ -364,13 +373,13 @@ impl EffectSink for MutSink<'_> {
         let Some(root) = root_name_of_expr(&attr.value) else {
             return;
         };
-        let line = name_line_expr(&attr.value, self.span);
+        let (line, col) = name_line_col_expr(&attr.value, self.span);
         // Render the full receiver expression (the attribute chain) for evidence,
         // e.g. `self.items.append(…)` — not the misleading root-only `self.append(…)`.
         // Fall back to the root name for shapes `render_expr` doesn't model.
         let receiver = render_expr(&attr.value).unwrap_or_else(|| root.clone());
         let evidence = format!("{receiver}.{}(…)", attr.attr.value);
-        self.classify_and_push(root, line, evidence);
+        self.classify_and_push(root, line, col, evidence);
     }
 
     fn on_assert(&mut self, _assert: &Assert) {}
@@ -383,12 +392,13 @@ impl EffectSink for MutSink<'_> {
                 if let Expression::Name(n) = attr.value.as_ref()
                     && n.value == "self"
                 {
-                    let line = name_line(n, self.span);
+                    let (line, col) = name_line_col(n, self.span);
                     if self.is_init {
                         self.push(
                             EffectKind::LocalMutation,
                             Tier::Heuristic,
                             line,
+                            col,
                             "self.x = … (constructor init, contained)".to_string(),
                             true,
                         );
@@ -397,6 +407,7 @@ impl EffectSink for MutSink<'_> {
                             EffectKind::ThisMutation,
                             Tier::Heuristic,
                             line,
+                            col,
                             format!("self.{} = … (instance state)", attr.attr.value),
                             false,
                         );
@@ -405,9 +416,9 @@ impl EffectSink for MutSink<'_> {
                 }
                 // Non-self attribute write: `obj.attr = …` — root is `obj`.
                 if let Some(root) = root_name_of_expr(&attr.value) {
-                    let line = name_line_expr(&attr.value, self.span);
+                    let (line, col) = name_line_col_expr(&attr.value, self.span);
                     let evidence = format!("{root}.{} = …", attr.attr.value);
-                    self.classify_and_push(root, line, evidence);
+                    self.classify_and_push(root, line, col, evidence);
                 }
             }
             // `x = …` bare name. A plain `=` to a bare name is a *binding*, not a
@@ -418,9 +429,9 @@ impl EffectSink for MutSink<'_> {
             // mutation. An augmented `x += …` is always a mutation.
             AssignTargetExpression::Name(n) if is_aug => {
                 let name = n.value.to_owned();
-                let line = name_line(n, self.span);
+                let (line, col) = name_line_col(n, self.span);
                 let evidence = format!("{name} += …");
-                self.classify_and_push(name, line, evidence);
+                self.classify_and_push(name, line, col, evidence);
             }
             // Plain `=` to a bare name declared `global`/`nonlocal` is an escaping
             // rebind, not a local binding — emit. A true local binding emits nothing.
@@ -428,17 +439,17 @@ impl EffectSink for MutSink<'_> {
                 if self.globals.contains(n.value) || self.nonlocals.contains(n.value) =>
             {
                 let name = n.value.to_owned();
-                let line = name_line(n, self.span);
+                let (line, col) = name_line_col(n, self.span);
                 let evidence = format!("{name} = …");
-                self.classify_and_push(name, line, evidence);
+                self.classify_and_push(name, line, col, evidence);
             }
             AssignTargetExpression::Name(_) => {}
             // `d[k] = …` subscript write — root is `d`.
             AssignTargetExpression::Subscript(sub) => {
                 if let Some(root) = root_name_of_expr(&sub.value) {
-                    let line = name_line_expr(&sub.value, self.span);
+                    let (line, col) = name_line_col_expr(&sub.value, self.span);
                     let evidence = format!("{root}[…] = …");
-                    self.classify_and_push(root, line, evidence);
+                    self.classify_and_push(root, line, col, evidence);
                 }
             }
             // Starred / Tuple / List destructuring — skip (no single root).
@@ -449,7 +460,7 @@ impl EffectSink for MutSink<'_> {
 
 impl MutSink<'_> {
     /// Classify a write by root name and push an `(Effect, contained)` pair.
-    fn classify_and_push(&mut self, root: String, line: usize, evidence: String) {
+    fn classify_and_push(&mut self, root: String, line: usize, col: usize, evidence: String) {
         // Root-`self` method/subscript/aug writes (`self.items.append(…)`,
         // `self[i] = v`, `self += …`) mutate already-existing instance state — they
         // are escaping `ThisMutation`, contained=false, *even in `__init__`*. The
@@ -461,6 +472,7 @@ impl MutSink<'_> {
                 EffectKind::ThisMutation,
                 Tier::Heuristic,
                 line,
+                col,
                 evidence,
                 false,
             );
@@ -474,6 +486,7 @@ impl MutSink<'_> {
                 EffectKind::GlobalMutation,
                 Tier::Exact,
                 line,
+                col,
                 format!("global {root} ({evidence})"),
                 false,
             );
@@ -487,6 +500,7 @@ impl MutSink<'_> {
                 EffectKind::ThisMutation,
                 Tier::Exact,
                 line,
+                col,
                 format!("nonlocal {root} ({evidence})"),
                 false,
             );
@@ -499,6 +513,7 @@ impl MutSink<'_> {
                 EffectKind::ParamMutation,
                 Tier::Heuristic,
                 line,
+                col,
                 evidence,
                 false,
             );
@@ -507,7 +522,14 @@ impl MutSink<'_> {
 
         // Local binding mutation: root is locally assigned (and not global/nonlocal).
         if self.locals.contains(&root) {
-            self.push(EffectKind::LocalMutation, Tier::Exact, line, evidence, true);
+            self.push(
+                EffectKind::LocalMutation,
+                Tier::Exact,
+                line,
+                col,
+                evidence,
+                true,
+            );
             return;
         }
 
@@ -519,6 +541,7 @@ impl MutSink<'_> {
                 EffectKind::GlobalMutation,
                 Tier::Heuristic,
                 line,
+                col,
                 format!("{evidence} (imported `{root}`)"),
                 false,
             );
@@ -537,6 +560,7 @@ impl MutSink<'_> {
                 EffectKind::GlobalMutation,
                 Tier::Heuristic,
                 line,
+                col,
                 format!("{evidence} (module-level `{root}`)"),
                 false,
             );
@@ -548,13 +572,13 @@ impl MutSink<'_> {
         // bound syntactically → hidden.mutation (class 3, hidden:true,
         // contained:false), subreason "captured-binding". Mirrors the TS `captured`
         // hidden case (Milestone A left it un-emitted).
-        self.push_hidden(line, evidence, "captured-binding");
+        self.push_hidden(line, col, evidence, "captured-binding");
     }
 
     /// Push a `HiddenMutation` (`hidden:true` + a `subreason`), always escaping
     /// (`contained:false`). Used for writes whose root is an opaque captured /
     /// unresolved binding — the fallback after all named-binding cases are handled.
-    fn push_hidden(&mut self, line: usize, evidence: String, subreason: &str) {
+    fn push_hidden(&mut self, line: usize, col: usize, evidence: String, subreason: &str) {
         let kind = EffectKind::HiddenMutation;
         let tier = Tier::Heuristic;
         let class = kind.base_class();
@@ -565,8 +589,10 @@ impl MutSink<'_> {
                 discounted_to: None,
                 weight: weight_for_class(class),
                 line,
+                col,
                 tier,
                 hidden: true,
+                contained: false,
                 evidence,
                 discount: None,
                 subreason: Some(subreason.to_owned()),
@@ -581,6 +607,7 @@ impl MutSink<'_> {
         kind: EffectKind,
         tier: Tier,
         line: usize,
+        col: usize,
         evidence: String,
         contained: bool,
     ) {
@@ -592,8 +619,10 @@ impl MutSink<'_> {
                 discounted_to: None,
                 weight: weight_for_class(class),
                 line,
+                col,
                 tier,
                 hidden: false,
+                contained: false,
                 evidence,
                 discount: None,
                 subreason: None,
@@ -637,9 +666,11 @@ fn is_mutating_method(name: &str) -> bool {
     )
 }
 
-/// 1-based line of the leftmost `Name` in an expression.
-fn name_line_expr(expr: &Expression, span: &SpanIndex) -> usize {
-    leftmost_name(expr).map(|n| name_line(n, span)).unwrap_or(0)
+/// 1-based `(line, col)` of the leftmost `Name` in an expression.
+fn name_line_col_expr(expr: &Expression, span: &SpanIndex) -> (usize, usize) {
+    leftmost_name(expr)
+        .map(|n| name_line_col(n, span))
+        .unwrap_or((0, 0))
 }
 
 /// The leftmost `Name` in an expression chain.
@@ -653,9 +684,9 @@ fn leftmost_name<'a>(expr: &'a Expression<'a>) -> Option<&'a Name<'a>> {
     }
 }
 
-/// 1-based line of a `Name` node (pointer-arithmetic on its borrowed &str).
-fn name_line(name: &Name, span: &SpanIndex) -> usize {
-    span.line_col(anchor_of_subslice(span.src(), name.value)).0
+/// 1-based `(line, col)` of a `Name` node (pointer-arithmetic on its borrowed &str).
+fn name_line_col(name: &Name, span: &SpanIndex) -> (usize, usize) {
+    span.line_col(anchor_of_subslice(span.src(), name.value))
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────
@@ -836,7 +867,7 @@ mod tests {
             span: &span,
             effects: Vec::new(),
         };
-        sink.push_hidden(1, "outer_acc.append(…)".to_string(), "captured-binding");
+        sink.push_hidden(1, 1, "outer_acc.append(…)".to_string(), "captured-binding");
 
         assert_eq!(sink.effects.len(), 1);
         let (effect, contained) = &sink.effects[0];

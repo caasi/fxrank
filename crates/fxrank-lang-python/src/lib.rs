@@ -156,6 +156,47 @@ impl Frontend for PythonFrontend {
                                     &module_bindings,
                                     &span,
                                 ));
+                                output.records.push(detect::build_record(
+                                    unit,
+                                    &file.path,
+                                    &imports,
+                                    &module_bindings,
+                                    &span,
+                                ));
+                            }
+                        }
+
+                        // Module-init unit: score the module's top-level executable
+                        // statements as a synthetic `<module>` unit. Emitted only
+                        // when the module has ≥1 effect (import-time IO, effectful
+                        // top-level call, etc.). A pure module (imports + function/
+                        // class definitions only) produces no `<module>` entry.
+                        //
+                        // Root-ness is CLI-level, not a frontend heuristic: the
+                        // frontend always emits `record.is_root = false`; the CLI sets
+                        // `root` for units whose file was an explicit FILE arg (the
+                        // agent's observation focus). So the `<module>` unit is a root
+                        // iff its file is explicit, like any other unit — NOT
+                        // automatically. (Guideline: *Roots — the agent's observation
+                        // focus*.)
+                        if let Some(init_unit) = functions::module_init_unit(&module) {
+                            let h = detect::analyze_unit(
+                                &init_unit,
+                                &file.path,
+                                &imports,
+                                &module_bindings,
+                                &span,
+                            );
+                            if !h.effects.is_empty() {
+                                let rec = detect::build_record(
+                                    &init_unit,
+                                    &file.path,
+                                    &imports,
+                                    &module_bindings,
+                                    &span,
+                                );
+                                output.records.push(rec);
+                                output.functions.push(h);
                             }
                         }
                     }

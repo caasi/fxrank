@@ -78,7 +78,7 @@ struct RiskSink<'a> {
 }
 
 impl RiskSink<'_> {
-    fn push(&mut self, kind: RiskKind, tier: Tier, line: usize, evidence: String) {
+    fn push(&mut self, kind: RiskKind, tier: Tier, line: usize, col: usize, evidence: String) {
         let class = kind.class();
         self.features.push(RiskFeature {
             kind,
@@ -86,6 +86,7 @@ impl RiskSink<'_> {
             weight: weight_for_class(class),
             path: self.path.clone(),
             line,
+            col,
             evidence,
             tier,
         });
@@ -119,14 +120,13 @@ impl EffectSink for RiskSink<'_> {
             return;
         };
 
-        // ── line from the leftmost name anchor ──
-        let line = leftmost_name(&call.func)
+        // ── (line, col) from the leftmost name anchor ──
+        let (line, col) = leftmost_name(&call.func)
             .map(|n| {
                 self.span
                     .line_col(anchor_of_subslice(self.span.src(), n.value))
-                    .0
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0));
 
         // ── Bare builtin names — eval/exec/compile/__import__ ──────────────
         match rendered.as_str() {
@@ -135,6 +135,7 @@ impl EffectSink for RiskSink<'_> {
                     RiskKind::DynamicCode,
                     Tier::Exact,
                     line,
+                    col,
                     "eval(…) — dynamic code execution".into(),
                 );
                 return;
@@ -144,6 +145,7 @@ impl EffectSink for RiskSink<'_> {
                     RiskKind::DynamicCode,
                     Tier::Exact,
                     line,
+                    col,
                     "exec(…) — dynamic code execution".into(),
                 );
                 return;
@@ -153,6 +155,7 @@ impl EffectSink for RiskSink<'_> {
                     RiskKind::DynamicCode,
                     Tier::Exact,
                     line,
+                    col,
                     "compile(…) — dynamic code compilation".into(),
                 );
                 return;
@@ -162,6 +165,7 @@ impl EffectSink for RiskSink<'_> {
                     RiskKind::DynamicCode,
                     Tier::Exact,
                     line,
+                    col,
                     "__import__(…) — dynamic import".into(),
                 );
                 return;
@@ -182,6 +186,7 @@ impl EffectSink for RiskSink<'_> {
                         RiskKind::DynamicCode,
                         Tier::Heuristic,
                         line,
+                        col,
                         format!("setattr({}, …) — monkey-patch on imported name", n.value),
                     );
                 }
@@ -201,6 +206,7 @@ impl EffectSink for RiskSink<'_> {
                     RiskKind::DynamicCode,
                     Tier::Path,
                     line,
+                    col,
                     "subprocess(shell=True) — shell-injection surface".into(),
                 );
                 return;
@@ -214,6 +220,7 @@ impl EffectSink for RiskSink<'_> {
                     RiskKind::DynamicCode,
                     Tier::Path,
                     line,
+                    col,
                     format!("{full}(…) — unsafe deserialization"),
                 );
                 return;
@@ -227,6 +234,7 @@ impl EffectSink for RiskSink<'_> {
                     RiskKind::DynamicCode,
                     Tier::Path,
                     line,
+                    col,
                     "yaml.load(…) — unsafe YAML deserialization (use safe_load)".into(),
                 );
                 return;
@@ -241,6 +249,7 @@ impl EffectSink for RiskSink<'_> {
                 RiskKind::DynamicCode,
                 Tier::Path,
                 line,
+                col,
                 "importlib.import_module(…) — dynamic import".into(),
             );
         }
