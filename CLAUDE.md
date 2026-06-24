@@ -20,6 +20,23 @@ Milestone A ships three frontends — Rust (`syn`), TS/JS (`swc`), and Python (`
 all **primarily syntactic** (no borrow-checker / type inference); type-dependent signals
 are heuristic and carry a confidence penalty.
 
+**Cross-file propagation (spec 025).** On top of own-body scoring, a scan now resolves calls
+across the scanned files and folds **escaping** effects along the call graph, so a function's
+`propagated_score` reflects the effect blast-radius of everything it (transitively) calls — closing
+the extract-method score-washing hole (pushing IO into a callee no longer hides it from the caller).
+The pipeline: each frontend emits language-neutral `UnitRecord`s (own effects + outgoing call refs,
+tagged `qualified`/`first_party`); the CLI **partitions records per language**, builds a
+`SymbolIndex` + `CallGraph`, and runs a Tarjan-SCC-condensed **fold** (`fxrank-core`, parser-free).
+Output gains: `propagated_score`/`propagated_max_class` + an `inherited[]` provenance list
+(`{kind, class, from, via}`) per hotspot; a `root: bool` annotation (the agent's observation
+focus — set at the CLI from explicit FILE args; directory-walked files are context, not roots —
+language-neutral, no program-entry heuristic); and `scope.external_reaches[]`
+(`{specifier, kind, site}`, `kind` ∈ `FirstPartyOutOfScope`|`ThirdParty`) recording the app's
+outward dependency surface. Third-party boundaries stay opaque (class-2 `external.unresolved`), not
+followed. `--no-resolve` disables the whole pass (per-file own scores only). **Own-body output is
+byte-identical to pre-025** — propagation only *adds* fields. Deferred: module-tree precise
+resolution (#36), React-inheritance fold retrofit (#37); see spec 025 §13a.
+
 ## Workspace layout
 
 A Cargo workspace, one shipped binary, language frontends feature-gated:
@@ -60,7 +77,8 @@ cargo build -p fxrank --no-default-features --features rust    # slim Rust-only 
 cargo build -p fxrank --no-default-features --features ts      # slim TS-only build
 cargo build -p fxrank --no-default-features --features python  # slim Python-only build
 cargo run -p fxrank -- scan <path>                       # run the tool
-cargo run -p fxrank -- scan crates/ | jq                 # dogfood on our own source
+cargo run -p fxrank -- scan crates/ | jq                 # dogfood on our own source (with cross-file propagation)
+cargo run -p fxrank -- scan crates/ --no-resolve         # per-file own scores only (skip cross-file resolution + propagation)
 cargo run -p fxrank -- scan crates/ --include-tests      # score test code too (skipped by default)
 cargo run -p fxrank -- scan crates/fxrank-lang-python/src/  # dogfood the Python frontend's own Rust source
 cargo run -p fxrank -- scan <path> --exclude 'node_modules,*.min.js,*.stories.*'  # replaces the default skip list
@@ -152,9 +170,21 @@ SourceFile(s) → RustFrontend::analyze (parse + per-file `use` table + static n
   → detect::analyze_unit(unit, imports, statics):
         gather  → calls/macros/mutation/risk detectors push Vec<Effect> (+ risks)
         fold    → own_score, max_class (incl. risk_class), risk_weight, confidence, async
-  → FrontendOutput { functions: Vec<Hotspot>, module_risks, diagnostics }
-CLI → core::Report::build(scope, hotspots, diagnostics, limit)  → compact JSON to stdout
+  → also detect::build_record(unit, …) → UnitRecord { effects, refs: Vec<CallSiteRef>, qualified/first_party, language, is_root }
+  → FrontendOutput { functions: Vec<Hotspot>, records: Vec<UnitRecord>, module_risks, diagnostics }
+CLI → cross-file fold (spec 025, unless --no-resolve):
+        partition_by_language(records) → per language group:
+          SymbolIndex::from_records → CallGraph::from_records (Tarjan SCC condense)
+          → fold (escaping-only, reverse-topo, join-not-sum) → apply_fold(&mut hotspots)  (adds propagated_*/inherited/root by unit_id; own-body untouched)
+        external_reaches unioned once over all groups
+  → core::Report::build(scope, hotspots, diagnostics, limit)  → compact JSON to stdout
 ```
+
+The cross-file layer lives in `fxrank-core` (`record`/`resolve`/`graph`/`fold`) and stays
+**parser-free**: frontends emit neutral `UnitRecord`s and tag refs `qualified`/`first_party`
+(a `bool`); core only branches on those bools — no language syntax in resolution. A module's
+import-time code is scored as a synthetic `<module>` unit (own-body = top-level statements only).
+See spec 025 + `docs/cross-file-resolution-guideline.md`.
 
 - **Adding a detector** = one `effects.extend(<detector>::detect(...))` line in
   `detect/mod.rs::gather`. Each detector is a `syn::visit::Visit` walker following the
@@ -331,7 +361,9 @@ Specs live in `docs/superpowers/specs/`, implementation plans in `docs/superpowe
 source of truth for every score, class, discount, and schema field — **read it before
 changing scoring behavior**; when code and spec disagree, the spec wins. (For mutation
 classification specifically, `docs/superpowers/specs/008-cross-language-mutation-alignment.md` + the guideline
-above govern the cross-frontend behavior.) Its *Known
-Limitations* section records the accepted deferrals (call-graph propagation /
-`inherited_score`, FFI call-site detection, `global.mutation` class-4 downgrade, and a
-full semantic/type-resolution pass).
+above govern the cross-frontend behavior. For **cross-file resolution + call-graph propagation**,
+`docs/superpowers/specs/025-cross-file-resolution-and-propagation.md` + `docs/cross-file-resolution-guideline.md`
+govern — read §13/§13a for the current Known Limitations and the deferred 3e/3f.) Spec 001's *Known
+Limitations* section records the older deferrals; note **call-graph propagation / `inherited_score` is
+now DELIVERED by spec 025** (no longer deferred), while FFI call-site detection, `global.mutation` class-4
+downgrade, and a full semantic/type-resolution pass remain.
