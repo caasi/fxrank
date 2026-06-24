@@ -1,6 +1,22 @@
 use crate::effect::{Effect, RiskFeature};
+use crate::record::ExternalReach;
 use crate::score::rank_key;
 use serde::Serialize;
+
+/// One escaping effect or risk a hotspot inherited from a transitive callee,
+/// carrying bounded (exemplar) provenance. The `kind`/`class` describe the
+/// signal; `from`/`via` describe where it came from and one representative
+/// discovery path. Compact wire form — see the fold's `Inherited` for the source.
+#[derive(Debug, Clone, Serialize)]
+pub struct InheritedSignal {
+    /// Effect or risk wire string (e.g. `"net.fs.db"`, `"ffi.call"`).
+    pub kind: String,
+    pub class: u8,
+    /// Origin unit id (`path:line:col:symbol`) where the signal was first seen.
+    pub from: String,
+    /// One exemplar discovery path from this hotspot to the origin.
+    pub via: String,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Scope {
@@ -11,6 +27,9 @@ pub struct Scope {
     pub skipped_tests: usize,
     pub skipped_excluded: usize,
     pub risk_features: Vec<RiskFeature>,
+    /// Corpus-boundary reaches (third-party / out-of-scope call sites) observed
+    /// across the whole scan, deduped. Cross-file propagation surface.
+    pub external_reaches: Vec<ExternalReach>,
 }
 
 impl Scope {
@@ -23,6 +42,7 @@ impl Scope {
             skipped_tests: 0,
             skipped_excluded: 0,
             risk_features: vec![],
+            external_reaches: vec![],
         }
     }
 }
@@ -33,6 +53,13 @@ pub struct Summary {
     pub max_class: u8,
     pub risk_weight: u32,
     pub confidence: f64,
+    /// Propagated aggregates (own ∪ inherited): the max effect class and score
+    /// after cross-file folding. These drive the ranking; the own-body fields
+    /// above describe each function's local cost.
+    pub propagated_score: f64,
+    pub propagated_max_class: u8,
+    /// Deduped union of corpus-boundary reaches across all hotspots + scope.
+    pub external_reaches: Vec<ExternalReach>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +76,51 @@ pub struct Hotspot {
     pub await_count: usize,
     pub effects: Vec<Effect>,
     pub risk_features: Vec<RiskFeature>,
+    /// Propagated aggregates (own ∪ inherited). Before cross-file folding wires
+    /// these (a later task), they mirror the own-body fields — see `own_seed`.
+    pub propagated_score: f64,
+    pub propagated_max_class: u8,
+    /// True when this unit's file was an explicit CLI FILE argument (or stdin) —
+    /// the agent's observation focus. Set centrally by the CLI; `apply_fold`
+    /// copies it from `record.is_root`. Annotation only (the fold never seeds
+    /// from it). See the guideline *Roots — the agent's observation focus*.
+    pub root: bool,
+    /// Escaping signals folded in from transitive callees, each with bounded
+    /// provenance. Empty until cross-file folding wires it.
+    pub inherited: Vec<InheritedSignal>,
+    /// Corpus-boundary reaches contributed by this function (own + transitive).
+    /// Empty until cross-file folding wires it.
+    pub external_reaches: Vec<ExternalReach>,
+}
+
+impl Hotspot {
+    /// Seed the propagated fields for a not-yet-folded hotspot: propagated
+    /// mirrors own (`propagated_score == own_score`, `propagated_max_class ==
+    /// max_class`), `root == false` (stub — phase-3 roots wiring sets `true` for
+    /// actual roots), and the inherited/reach sets are empty. Used as the `..`
+    /// base in frontend construction so a frontend only supplies the own-body
+    /// fields; cross-file folding overwrites these later.
+    pub fn own_seed(own_score: f64, max_class: u8) -> Hotspot {
+        Hotspot {
+            id: String::new(),
+            symbol: String::new(),
+            path: String::new(),
+            line: 0,
+            max_class,
+            own_score,
+            risk_weight: 0,
+            confidence: 1.0,
+            async_boundary: false,
+            await_count: 0,
+            effects: vec![],
+            risk_features: vec![],
+            propagated_score: own_score,
+            propagated_max_class: max_class,
+            root: false,
+            inherited: vec![],
+            external_reaches: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +138,28 @@ pub struct Report {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Deduped union of the external reaches carried by `scope` and every hotspot,
+/// keyed by `(specifier, site)`. First occurrence wins; order is insertion order
+/// (scope first, then hotspots) so output is deterministic.
+fn dedup_reaches(scope: &Scope, hotspots: &[Hotspot]) -> Vec<ExternalReach> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut push = |r: &ExternalReach, out: &mut Vec<ExternalReach>| {
+        if seen.insert((r.specifier.clone(), r.site.clone())) {
+            out.push(r.clone());
+        }
+    };
+    for r in &scope.external_reaches {
+        push(r, &mut out);
+    }
+    for h in hotspots {
+        for r in &h.external_reaches {
+            push(r, &mut out);
+        }
+    }
+    out
+}
+
 impl Report {
     pub fn build(
         scope: Scope,
@@ -73,10 +167,21 @@ impl Report {
         diagnostics: Vec<Diagnostic>,
         limit: Option<usize>,
     ) -> Report {
-        // Sort descending by rank_key, tie-break by id ascending (stable sort preserves equal-key order)
+        // Sort descending by the PROPAGATED rank_key (own ∪ inherited cost),
+        // tie-break by id ascending (stable sort preserves equal-key order).
         hotspots.sort_by(|a, b| {
-            let ka = rank_key(a.max_class, a.own_score, a.risk_weight, a.confidence);
-            let kb = rank_key(b.max_class, b.own_score, b.risk_weight, b.confidence);
+            let ka = rank_key(
+                a.propagated_max_class,
+                a.propagated_score,
+                a.risk_weight,
+                a.confidence,
+            );
+            let kb = rank_key(
+                b.propagated_max_class,
+                b.propagated_score,
+                b.risk_weight,
+                b.confidence,
+            );
             kb.cmp(&ka).then_with(|| a.id.cmp(&b.id))
         });
 
@@ -110,11 +215,32 @@ impl Report {
                 .fold(f64::INFINITY, f64::min)
         };
 
+        // Propagated aggregates: max over hotspots' propagated values, with the
+        // scope risk class still able to dominate `propagated_max_class` (a risk
+        // feature carries no propagated/own distinction — it is a scope-level
+        // fact, just like for the own-body `max_class`).
+        let propagated_score = hotspots
+            .iter()
+            .map(|h| h.propagated_score)
+            .fold(0.0_f64, f64::max);
+        let propagated_max_class = hotspots
+            .iter()
+            .map(|h| h.propagated_max_class)
+            .max()
+            .unwrap_or(0)
+            .max(max_class_scope);
+
+        // Deduped union of external reaches across all hotspots + scope.
+        let external_reaches = dedup_reaches(&scope, &hotspots);
+
         let summary = Summary {
             own_score,
             max_class,
             risk_weight,
             confidence,
+            propagated_score,
+            propagated_max_class,
+            external_reaches,
         };
 
         // Truncate AFTER computing summary
@@ -137,20 +263,40 @@ mod tests {
     use crate::effect::{RiskFeature, RiskKind, Tier};
     use crate::score::weight_for_class;
 
+    /// A legacy own-only hotspot: propagated mirrors own (via `own_seed`), so the
+    /// pre-propagation ranking/summary assertions still hold unchanged.
     fn hot(id: &str, max_class: u8, own_score: f64, conf: f64) -> Hotspot {
         Hotspot {
             id: id.into(),
             symbol: id.into(),
             path: "f.rs".into(),
             line: 1,
-            max_class,
-            own_score,
-            risk_weight: 0,
             confidence: conf,
-            async_boundary: false,
-            await_count: 0,
-            effects: vec![],
-            risk_features: vec![],
+            ..Hotspot::own_seed(own_score, max_class)
+        }
+    }
+
+    /// A hotspot with DISTINCT own vs propagated values — used to prove ranking
+    /// keys off the propagated aggregates, not the own-body ones.
+    fn hot_prop(
+        id: &str,
+        own_max_class: u8,
+        own_score: f64,
+        prop_max_class: u8,
+        prop_score: f64,
+        conf: f64,
+    ) -> Hotspot {
+        Hotspot {
+            id: id.into(),
+            symbol: id.into(),
+            path: "f.rs".into(),
+            line: 1,
+            max_class: own_max_class,
+            own_score,
+            confidence: conf,
+            propagated_score: prop_score,
+            propagated_max_class: prop_max_class,
+            ..Hotspot::own_seed(own_score, own_max_class)
         }
     }
 
@@ -161,6 +307,7 @@ mod tests {
             weight: weight_for_class(kind.class()),
             path: path.into(),
             line,
+            col: 1,
             evidence: kind.wire().into(),
             tier: Tier::Exact,
         }
@@ -177,6 +324,7 @@ mod tests {
                 skipped_tests: 0,
                 skipped_excluded: 0,
                 risk_features: vec![],
+                external_reaches: vec![],
             },
             vec![hot("a", 4, 5.0, 0.9), hot("b", 7, 25.5, 0.6)],
             vec![],
@@ -219,6 +367,7 @@ mod tests {
             skipped_tests: 0,
             skipped_excluded: 0,
             risk_features: vec![risk(RiskKind::ImplDrop, "f.rs", 3)], // class 2, weight 2
+            external_reaches: vec![],
         };
         let report = Report::build(scope, vec![], vec![], None);
         assert_eq!(report.summary.max_class, 2); // from scope risk, not a hotspot
@@ -236,6 +385,7 @@ mod tests {
             skipped_tests: 0,
             skipped_excluded: 0,
             risk_features: vec![risk(RiskKind::Transmute, "f.rs", 1)],
+            external_reaches: vec![],
         };
         let report = Report::build(scope, vec![hot("a", 4, 5.0, 0.9)], vec![], None);
         assert_eq!(report.summary.max_class, 7); // scope risk wins over hotspot's 4
@@ -253,6 +403,7 @@ mod tests {
                 skipped_tests: 3,
                 skipped_excluded: 5,
                 risk_features: vec![],
+                external_reaches: vec![],
             },
             vec![],
             vec![],
@@ -275,6 +426,7 @@ mod tests {
                 skipped_tests: 0,
                 skipped_excluded: 0,
                 risk_features: vec![],
+                external_reaches: vec![],
             },
             vec![
                 hot("a", 4, 5.0, 0.9),
@@ -287,5 +439,93 @@ mod tests {
         assert_eq!(report.hotspots.len(), 1); // truncated
         assert_eq!(report.hotspots[0].id, "b"); // the top-ranked one kept
         assert_eq!(report.summary.max_class, 7); // summary still over ALL functions
+    }
+
+    #[test]
+    fn ranks_by_propagated_not_own() {
+        // "a": own class 0 / score 0 BUT propagated class 7 / score 28.5 — a pure
+        // wrapper whose callee does IO. "b": own class 4 / score 5, no callees so
+        // propagated == own. Ranking is by propagated, so "a" must come first.
+        let report = Report::build(
+            Scope::empty("x"),
+            vec![
+                hot_prop("a", 0, 0.0, 7, 28.5, 0.9),
+                hot_prop("b", 4, 5.0, 4, 5.0, 0.9),
+            ],
+            vec![],
+            None,
+        );
+        assert_eq!(report.hotspots[0].id, "a");
+        assert_eq!(report.summary.propagated_max_class, 7);
+        assert_eq!(report.summary.propagated_score, 28.5);
+        // own-body summary still reflects the LOCAL cost, unchanged by propagation.
+        assert_eq!(report.summary.max_class, 4);
+        assert_eq!(report.summary.own_score, 5.0);
+    }
+
+    #[test]
+    fn scope_risk_dominates_propagated_max_class() {
+        // RiskKind::Transmute => class 7; both hotspots propagate at most class 4.
+        let scope = Scope {
+            input: "f.rs".into(),
+            files: 1,
+            parsed: 1,
+            functions: 1,
+            skipped_tests: 0,
+            skipped_excluded: 0,
+            risk_features: vec![risk(RiskKind::Transmute, "f.rs", 1)],
+            external_reaches: vec![],
+        };
+        let report = Report::build(
+            scope,
+            vec![hot_prop("a", 4, 5.0, 4, 5.0, 0.9)],
+            vec![],
+            None,
+        );
+        assert_eq!(report.summary.propagated_max_class, 7); // scope risk wins
+    }
+
+    #[test]
+    fn summary_external_reaches_dedup_union() {
+        use crate::record::{ExternalReach, ReachKind};
+        let reach = |spec: &str, site: &str| ExternalReach {
+            specifier: spec.into(),
+            kind: ReachKind::ThirdParty,
+            site: site.into(),
+        };
+        let mut h1 = hot("a", 7, 21.0, 0.9);
+        h1.external_reaches = vec![reach("axios", "a.ts:1"), reach("fs", "a.ts:2")];
+        let mut h2 = hot("b", 7, 21.0, 0.9);
+        // "axios" at the same (specifier, site) is a duplicate; "lodash" is new.
+        h2.external_reaches = vec![reach("axios", "a.ts:1"), reach("lodash", "b.ts:9")];
+
+        let report = Report::build(Scope::empty("x"), vec![h1, h2], vec![], None);
+        let specs: Vec<&str> = report
+            .summary
+            .external_reaches
+            .iter()
+            .map(|r| r.specifier.as_str())
+            .collect();
+        assert_eq!(specs, vec!["axios", "fs", "lodash"]); // deduped, insertion order
+    }
+
+    #[test]
+    fn propagated_fields_serialize_after_own_body() {
+        let report = Report::build(
+            Scope::empty("f.rs"),
+            vec![hot_prop("x", 3, 3.0, 7, 28.0, 0.9)],
+            vec![],
+            None,
+        );
+        let json = serde_json::to_string(&report).unwrap();
+        // own-body fields appear before the propagated ones in the hotspot object.
+        let own = json.find("\"own_score\":3.0").unwrap();
+        let prop = json.find("\"propagated_score\":28.0").unwrap();
+        assert!(
+            own < prop,
+            "own-body fields must serialize before propagated"
+        );
+        // whole f64 renders with point-zero (spec-001 convention).
+        assert!(json.contains("\"propagated_score\":28.0"));
     }
 }
