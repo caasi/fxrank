@@ -440,10 +440,11 @@ fn apply_conditionality_discount(e: &mut Effect, phase: HookPhase) {
     }
 }
 
-/// Fold inherited hook-callback raw signals into the owning component, then
-/// recompute the score.
+/// Fold the raw signals of an adopted/owned nested unit (hook callback, JSX
+/// handler, named handler, object-literal hook-arg callback — any depth) into the
+/// owning component, then recompute the score.
 ///
-/// Each inherited effect's REAL `contained` flag is preserved from the gather
+/// Each adopted effect's REAL `contained` flag is preserved from the gather
 /// tuple, then refined by the React containment classifier ([`react_contained`]):
 /// a `state.transition` is contained (own internal state, stays in `own`); a
 /// world effect / `useContext` / `ref-cell-write` escapes. `contained` drives
