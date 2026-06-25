@@ -18,9 +18,17 @@ use syn::visit::Visit;
 ///
 /// Nested calls are captured because the default `visit_*` recursion is called
 /// after recording each site.
-pub fn extract(block: &syn::Block, imports: &ImportTable) -> Vec<CallSiteRef> {
+///
+/// `referencing_mod` is the module the calling unit lives in (e.g.
+/// `["crate","net"]`), used to expand `self::`/`super::` relative paths.
+pub fn extract(
+    block: &syn::Block,
+    imports: &ImportTable,
+    referencing_mod: &[String],
+) -> Vec<CallSiteRef> {
     let mut walker = RefsWalker {
         imports,
+        referencing_mod,
         refs: Vec::new(),
     };
     walker.visit_block(block);
@@ -29,6 +37,7 @@ pub fn extract(block: &syn::Block, imports: &ImportTable) -> Vec<CallSiteRef> {
 
 struct RefsWalker<'a> {
     imports: &'a ImportTable,
+    referencing_mod: &'a [String],
     refs: Vec<CallSiteRef>,
 }
 
@@ -50,6 +59,7 @@ impl<'a, 'ast> Visit<'ast> for RefsWalker<'a> {
             let first_party = effective_path.starts_with("crate::")
                 || effective_path.starts_with("super::")
                 || effective_path.starts_with("self::");
+            let resolved_target = resolve_in_crate(&base, self.imports, self.referencing_mod);
             self.refs.push(CallSiteRef {
                 kind: RefKind::Free,
                 base,
@@ -58,6 +68,7 @@ impl<'a, 'ast> Visit<'ast> for RefsWalker<'a> {
                 col: start.column + 1,
                 qualified,
                 first_party,
+                resolved_target,
             });
         }
         // Recurse so nested calls inside arguments are also captured.
@@ -75,8 +86,66 @@ impl<'a, 'ast> Visit<'ast> for RefsWalker<'a> {
             col: start.column + 1,
             qualified: false,
             first_party: false,
+            resolved_target: None,
         });
         syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+/// Expand a written call path to an in-crate canonical segment vector, or `None`
+/// for external / unresolvable targets. (025-3e §5.1)
+///
+/// `referencing_mod` is the module the calling unit lives in (e.g.
+/// `["crate","net"]`), already anchored at `"crate"`. An EMPTY `referencing_mod`
+/// means the calling file has no crate root in scope — then `self`/`super` cannot
+/// be anchored and MUST return `None` (anchoring at a fabricated `["crate"]` could
+/// false-resolve in an adopted mixed batch — the exact bug 3e kills).
+fn resolve_in_crate(
+    base: &str,
+    imports: &ImportTable,
+    referencing_mod: &[String],
+) -> Option<Vec<String>> {
+    // Resolve a bare leading name through the import table first.
+    let head = base.split("::").next().unwrap_or(base);
+    let effective: String = match imports.resolve(head) {
+        Some(full) => {
+            // replace the head with its imported full path
+            let rest = base.strip_prefix(head).unwrap_or("");
+            format!("{full}{rest}")
+        }
+        None => base.to_string(),
+    };
+    let segs: Vec<String> = effective.split("::").map(|s| s.to_string()).collect();
+    match segs.first().map(String::as_str) {
+        Some("crate") => Some(segs),
+        Some("self") | Some("super") => {
+            if referencing_mod.is_empty() {
+                return None; // cannot anchor a relative path with no module context
+            }
+            let mut module = referencing_mod.to_vec();
+            // Consume the LEADING run of self/super, walking up for each super.
+            let mut rest = segs.into_iter().peekable();
+            while let Some(seg) = rest.peek() {
+                match seg.as_str() {
+                    "self" => {
+                        rest.next();
+                    }
+                    "super" => {
+                        rest.next();
+                        module.pop(); // up one module
+                    }
+                    _ => break,
+                }
+            }
+            // After walking up, the module must still be anchored at `crate`;
+            // otherwise the path escaped the crate root → not in-crate → None.
+            if module.first().map(String::as_str) != Some("crate") {
+                return None;
+            }
+            module.extend(rest);
+            Some(module)
+        }
+        _ => None, // std::, other crates, unresolved bare names → external/opaque
     }
 }
 
@@ -111,7 +180,124 @@ mod tests {
                 }
             })
             .unwrap();
-        extract(&block, &imports)
+        extract(&block, &imports, &[])
+    }
+
+    fn refs_with_ctx(src: &str, referencing_mod: &[&str]) -> Vec<CallSiteRef> {
+        let file = syn::parse_file(src).unwrap();
+        let imports = ImportTable::from_file(&file);
+        // Find the FIRST fn item — the fixture may start with a `use` (so items[0]
+        // is not a fn). Mirrors the existing `refs_of` helper pattern in this file.
+        let block = file
+            .items
+            .iter()
+            .find_map(|it| match it {
+                syn::Item::Fn(f) => Some((*f.block).clone()),
+                _ => None,
+            })
+            .expect("fixture must contain a fn item");
+        let rmod: Vec<String> = referencing_mod.iter().map(|s| s.to_string()).collect();
+        extract(&block, &imports, &rmod)
+    }
+
+    #[test]
+    fn resolves_crate_self_super_paths() {
+        let src = r#"
+            fn caller() {
+                crate::helpers::write();
+                self::local();
+                super::sibling();
+                std::fs::write();
+            }
+        "#;
+        // referencing module = crate::net (so super:: → crate)
+        let refs = refs_with_ctx(src, &["crate", "net"]);
+        let t = |b: &str| {
+            refs.iter()
+                .find(|r| r.base == b)
+                .unwrap()
+                .resolved_target
+                .clone()
+        };
+        assert_eq!(
+            t("crate::helpers::write"),
+            Some(vec!["crate".into(), "helpers".into(), "write".into()])
+        );
+        assert_eq!(
+            t("self::local"),
+            Some(vec!["crate".into(), "net".into(), "local".into()])
+        );
+        assert_eq!(
+            t("super::sibling"),
+            Some(vec!["crate".into(), "sibling".into()])
+        );
+        // std:: is external → None (→ qualified miss → opaque; the false-resolve fix)
+        assert_eq!(t("std::fs::write"), None);
+    }
+
+    #[test]
+    fn bare_import_resolved_to_crate_path() {
+        let src = r#"
+            use crate::helpers::write;
+            fn caller() { write(); }
+        "#;
+        let refs = refs_with_ctx(src, &["crate"]);
+        let w = refs.iter().find(|r| r.base == "write").unwrap();
+        assert_eq!(
+            w.resolved_target,
+            Some(vec!["crate".into(), "helpers".into(), "write".into()])
+        );
+    }
+
+    #[test]
+    fn super_super_walks_up_two_modules() {
+        let src = r#"fn caller() { super::super::sibling(); }"#;
+        // referencing module crate::a::b → super::super → crate
+        let refs = refs_with_ctx(src, &["crate", "a", "b"]);
+        let t = refs
+            .iter()
+            .find(|r| r.base == "super::super::sibling")
+            .unwrap();
+        assert_eq!(
+            t.resolved_target,
+            Some(vec!["crate".into(), "sibling".into()])
+        );
+    }
+
+    #[test]
+    fn relative_paths_unanchorable_in_rootless_file_are_none() {
+        // Root-less file → empty referencing module → self/super cannot anchor → None
+        // (must NOT fabricate a ["crate"] target that could false-resolve).
+        let src = r#"fn caller() { self::local(); super::up(); }"#;
+        let refs = refs_with_ctx(src, &[]); // empty referencing module
+        assert_eq!(
+            refs.iter()
+                .find(|r| r.base == "self::local")
+                .unwrap()
+                .resolved_target,
+            None
+        );
+        assert_eq!(
+            refs.iter()
+                .find(|r| r.base == "super::up")
+                .unwrap()
+                .resolved_target,
+            None
+        );
+    }
+
+    #[test]
+    fn super_past_crate_root_is_none() {
+        // super from a unit directly at the crate root pops "crate" → escapes → None.
+        let src = r#"fn caller() { super::x(); }"#;
+        let refs = refs_with_ctx(src, &["crate"]);
+        assert_eq!(
+            refs.iter()
+                .find(|r| r.base == "super::x")
+                .unwrap()
+                .resolved_target,
+            None
+        );
     }
 
     #[test]

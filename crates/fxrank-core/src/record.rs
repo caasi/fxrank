@@ -16,13 +16,23 @@ pub struct SiteKey {
 }
 
 /// How the callee is referenced at a call site.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RefKind {
+    #[default]
     Free,
     Ctor,
     Method,
     Member,
     ModuleInit,
+}
+
+/// A re-export alias fact: `alias_path` names the same definition as `target`.
+/// Emitted by a frontend per re-export (`pub use`, TS barrel, Python `__init__`);
+/// the core indexes it as an extra key in `CanonicalIndex` (spec 025-3e §4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasFact {
+    pub alias_path: Vec<String>,
+    pub target: Vec<String>,
 }
 
 /// A single outgoing call / reference inside a function body.
@@ -49,6 +59,11 @@ pub struct CallSiteRef {
     /// unresolved + qualified + !first_party → `ThirdParty`.
     /// Default `false` preserves the historical `ThirdParty` behaviour.
     pub first_party: bool,
+    /// Frontend's import-resolved canonical callee path (spec 025-3e §4.1).
+    /// `Some(path)` = resolved against the module tree; `None` = not produced
+    /// (frontend not adopted, or attempted-but-out-of-corpus). The
+    /// adopted/non-adopted distinction is by the partition gate, not this field.
+    pub resolved_target: Option<Vec<String>>,
 }
 
 /// All information the resolver needs about one function unit, emitted by a
@@ -65,8 +80,14 @@ pub struct UnitRecord {
     /// Annotation only — the fold never seeds from it.  See the guideline
     /// *Roots — the agent's observation focus*.
     pub is_root: bool,
-    /// `(module_id, exported_name)` when the unit is re-exported.
-    pub export: Option<(String, String)>,
+    /// Unit's canonical fully-qualified path as segments, e.g.
+    /// `["crate","helpers","write"]` (spec 025-3e §4.1). Empty ⇒ the frontend
+    /// could not assign one (no crate root in scope, cfg/macro module, …) ⇒
+    /// the unit participates only via the degradation rules.
+    pub canonical_path: Vec<String>,
+    /// Re-export alias facts emitted by the frontend (replaces the old, unused
+    /// `export` field). One per detected re-export.
+    pub aliases: Vec<AliasFact>,
     pub effects: Vec<crate::effect::Effect>,
     pub risks: Vec<crate::effect::RiskFeature>,
     pub refs: Vec<CallSiteRef>,
@@ -107,7 +128,8 @@ mod tests {
             col: 1,
             symbol: "f".into(),
             is_root: true,
-            export: None,
+            canonical_path: vec![],
+            aliases: vec![],
             effects: vec![],
             risks: vec![],
             refs: vec![CallSiteRef {
@@ -118,6 +140,7 @@ mod tests {
                 col: 3,
                 qualified: false,
                 first_party: false,
+                resolved_target: None,
             }],
             async_boundary: false,
             await_count: 0,
@@ -136,7 +159,8 @@ mod tests {
             col: 1,
             symbol: "f".into(),
             is_root: false,
-            export: None,
+            canonical_path: vec![],
+            aliases: vec![],
             effects: vec![],
             risks: vec![],
             refs: vec![],
@@ -145,6 +169,45 @@ mod tests {
             language: Language::Rust,
         };
         assert_eq!(r.language, Language::Rust);
+    }
+
+    #[test]
+    fn new_neutral_fields_default_to_non_adopted() {
+        let r = UnitRecord {
+            unit_id: "a.rs:1:1:f".into(),
+            path: "a.rs".into(),
+            line: 1,
+            col: 1,
+            symbol: "f".into(),
+            is_root: false,
+            canonical_path: vec![],
+            aliases: vec![],
+            effects: vec![],
+            risks: vec![],
+            refs: vec![CallSiteRef {
+                kind: RefKind::Free,
+                base: "g".into(),
+                module: None,
+                line: 2,
+                col: 3,
+                qualified: false,
+                first_party: false,
+                resolved_target: None,
+            }],
+            async_boundary: false,
+            await_count: 0,
+            language: Language::Rust,
+        };
+        assert!(r.canonical_path.is_empty());
+        assert!(r.aliases.is_empty());
+        assert_eq!(r.refs[0].resolved_target, None);
+        // AliasFact constructs and compares by value.
+        let a = AliasFact {
+            alias_path: vec!["m".into(), "x".into()],
+            target: vec!["n".into(), "x".into()],
+        };
+        assert_eq!(a.alias_path, vec!["m".to_string(), "x".to_string()]);
+        assert_eq!(RefKind::default(), RefKind::Free);
     }
 
     #[test]

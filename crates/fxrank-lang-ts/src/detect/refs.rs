@@ -66,6 +66,7 @@ impl Visit for RefsWalker<'_> {
                 col,
                 qualified,
                 first_party,
+                resolved_target: None,
             });
         }
         // Recurse so nested calls (f(g()), a.b().c()) are captured.

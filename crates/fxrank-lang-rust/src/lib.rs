@@ -3,6 +3,7 @@
 pub mod detect;
 pub mod functions;
 pub mod imports;
+pub mod module_tree;
 
 use fxrank_core::CorpusProfile;
 use fxrank_core::frontend::{Frontend, FrontendOutput, Language, SourceFile};
@@ -48,6 +49,7 @@ impl Frontend for RustFrontend {
 
     fn analyze(&self, files: &[SourceFile]) -> FrontendOutput {
         let mut output = FrontendOutput::default();
+        let module_tree = module_tree::ModuleTree::build(files);
 
         for source in files {
             match syn::parse_file(&source.text) {
@@ -67,9 +69,12 @@ impl Frontend for RustFrontend {
                             output
                                 .functions
                                 .push(detect::analyze_unit(unit, &imports, &statics));
-                            output
-                                .records
-                                .push(detect::build_record(unit, &imports, &statics));
+                            output.records.push(detect::build_record(
+                                unit,
+                                &imports,
+                                &statics,
+                                &module_tree,
+                            ));
                         }
                     } else {
                         let mut skipped = 0usize;
@@ -80,9 +85,12 @@ impl Frontend for RustFrontend {
                                 output
                                     .functions
                                     .push(detect::analyze_unit(unit, &imports, &statics));
-                                output
-                                    .records
-                                    .push(detect::build_record(unit, &imports, &statics));
+                                output.records.push(detect::build_record(
+                                    unit,
+                                    &imports,
+                                    &statics,
+                                    &module_tree,
+                                ));
                             }
                         }
                         output.skipped_tests += skipped;
@@ -132,5 +140,51 @@ mod tests {
         .corpus_profile();
         assert_eq!(p.prune_dirs, CORPUS_PROFILE.prune_dirs);
         assert_eq!(p.test_file_globs, CORPUS_PROFILE.test_file_globs);
+    }
+
+    /// End-to-end: a crate with a lone `Foo::write` and a `std::fs::write` caller.
+    /// After adoption (canonical_path set), `resolve_ref_precise` must return
+    /// `Edge::Opaque` for the std call — NOT `Edge::Resolved` to `Foo::write`.
+    /// This proves the 025-3e false-resolve fix end to end. (025-3e §8)
+    #[test]
+    fn false_resolve_killed_std_write_not_resolved_to_local_write() {
+        use fxrank_core::frontend::SourceFile;
+        use fxrank_core::graph::Edge;
+        use fxrank_core::resolve::{CanonicalIndex, resolve_ref_precise};
+
+        // Crate with a lone `Foo::write` and a caller that calls std::fs::write.
+        let files = vec![SourceFile {
+            path: "src/lib.rs".into(),
+            text: "pub struct Foo;\n\
+                   impl Foo { pub fn write(&self) {} }\n\
+                   pub fn caller() { std::fs::write(\"a\", b\"b\").unwrap(); }"
+                .into(),
+        }];
+        let out = RustFrontend::default().analyze(&files);
+        let idx = CanonicalIndex::from_records(&out.records);
+        assert!(
+            idx.adopted(),
+            "Rust partition must be adopted (canonical_path set)"
+        );
+
+        // Find the caller's std::fs::write ref and resolve it.
+        let caller = out
+            .records
+            .iter()
+            .find(|r| r.symbol == "caller")
+            .expect("expected a 'caller' unit in records");
+        let std_ref = caller
+            .refs
+            .iter()
+            .find(|r| r.base.contains("fs") && r.base.ends_with("write"))
+            .expect("expected a ref with base containing 'fs' and ending with 'write'");
+        let edge = resolve_ref_precise(std_ref, &idx, &caller.path);
+        // MUST be opaque (external), NOT Resolved to Foo::write.
+        let is_opaque = matches!(edge, Some(Edge::Opaque(_)));
+        assert!(
+            is_opaque,
+            "std::fs::write must resolve to Edge::Opaque (external), \
+             not Edge::Resolved to Foo::write — false-resolve not killed"
+        );
     }
 }

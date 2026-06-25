@@ -433,8 +433,9 @@ pub fn record_from_hotspot(
         line: unit.line,
         col: unit.col,
         symbol: unit.symbol.clone(),
-        is_root: false, // root is set by the CLI for explicit-file entries
-        export: None,
+        is_root: false,         // root is set by the CLI for explicit-file entries
+        canonical_path: vec![], // 025-3e: frontend not yet adopted → non-adopted partition
+        aliases: vec![],
         effects: h.effects.clone(),
         risks: h.risk_features.clone(),
         refs,
