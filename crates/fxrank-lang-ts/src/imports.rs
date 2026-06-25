@@ -92,11 +92,27 @@ pub fn module_bindings(module: &Module) -> HashSet<String> {
     out
 }
 
+/// What a local import binding refers to in the source module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportTarget {
+    /// `import { x }` (export = "x") or `import { x as y }` (export = "x", the original).
+    Named(String),
+    /// `import * as ns`.
+    Namespace,
+    /// `import x` / default binding.
+    Default,
+}
+
+struct ImportEntry {
+    specifier: String,
+    target: ImportTarget,
+}
+
 /// Mapping from local names to their module source strings, built from the
 /// `import` declarations and top-level `const x = require(...)` calls in a
 /// single swc `Module`.
 pub struct ImportTable {
-    map: HashMap<String, String>,
+    map: HashMap<String, ImportEntry>,
     has_dynamic: bool,
 }
 
@@ -115,13 +131,30 @@ impl ImportTable {
                     // UTF-8 `Atom` (reallocates only for lone surrogates).
                     let src = decl.src.value.to_atom_lossy().to_string();
                     for spec in &decl.specifiers {
-                        use swc_ecma_ast::ImportSpecifier::*;
-                        let local = match spec {
-                            Named(s) => s.local.sym.to_string(),
-                            Default(s) => s.local.sym.to_string(),
-                            Namespace(s) => s.local.sym.to_string(),
+                        use swc_ecma_ast::{ImportSpecifier::*, ModuleExportName};
+                        let (local, target) = match spec {
+                            Named(s) => {
+                                let local = s.local.sym.to_string();
+                                // `imported` is Some for `{ orig as local }`; None means export == local.
+                                let export = match &s.imported {
+                                    Some(ModuleExportName::Ident(i)) => i.sym.to_string(),
+                                    Some(ModuleExportName::Str(st)) => {
+                                        st.value.to_atom_lossy().to_string()
+                                    }
+                                    None => local.clone(),
+                                };
+                                (local, ImportTarget::Named(export))
+                            }
+                            Default(s) => (s.local.sym.to_string(), ImportTarget::Default),
+                            Namespace(s) => (s.local.sym.to_string(), ImportTarget::Namespace),
                         };
-                        table.map.insert(local, src.clone());
+                        table.map.insert(
+                            local,
+                            ImportEntry {
+                                specifier: src.clone(),
+                                target,
+                            },
+                        );
                     }
                 }
                 ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) => {
@@ -195,8 +228,15 @@ impl ImportTable {
             };
 
             // Bind the left-hand side identifier to the module source.
+            // require() is a default-style binding; member calls on it won't resolve.
             if let Pat::Ident(binding) = &decl.name {
-                self.map.insert(binding.id.sym.to_string(), module_src);
+                self.map.insert(
+                    binding.id.sym.to_string(),
+                    ImportEntry {
+                        specifier: module_src,
+                        target: ImportTarget::Default,
+                    },
+                );
             }
         }
     }
@@ -240,7 +280,12 @@ impl ImportTable {
     /// Returns `None` if the name is not covered by any `import` declaration or
     /// `require()` call found in this file.
     pub fn resolve(&self, local: &str) -> Option<&str> {
-        self.map.get(local).map(String::as_str)
+        self.map.get(local).map(|e| e.specifier.as_str())
+    }
+
+    /// The import kind + original export name for a local binding (None if not imported).
+    pub fn import_target(&self, local: &str) -> Option<&ImportTarget> {
+        self.map.get(local).map(|e| &e.target)
     }
 
     /// Returns `true` if any dynamic or unresolvable import was found.

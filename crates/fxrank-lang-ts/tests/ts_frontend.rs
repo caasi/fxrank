@@ -587,6 +587,7 @@ fn test_file_included_when_include_tests_true() {
     let frontend = TsFrontend {
         lang: Lang::Ts,
         include_tests: true,
+        tsconfig: None,
     };
     let out = frontend.analyze(&[make_source("x.test.ts", TEST_SRC)]);
     assert_eq!(
@@ -704,6 +705,7 @@ fn analyze_module_src(src: &str) -> Vec<Hotspot> {
     let frontend = TsFrontend {
         lang: Lang::Ts,
         include_tests: false,
+        tsconfig: None,
     };
     let out = frontend.analyze(&[make_source("module_init.ts", src)]);
     out.functions

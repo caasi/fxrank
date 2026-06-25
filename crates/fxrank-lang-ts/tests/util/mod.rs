@@ -14,6 +14,7 @@ pub fn analyze_tsx(src: &str) -> Vec<Hotspot> {
     let frontend = TsFrontend {
         lang: Lang::Tsx,
         include_tests: false,
+        tsconfig: None,
     };
     let files = [SourceFile {
         path: "c.tsx".to_string(),
