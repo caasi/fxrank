@@ -301,7 +301,9 @@ pub struct ComponentSignal {
 ///    - (a) `returns_jsx(&unit.body)` — strong signal.
 ///    - (b) `path` ends in `.tsx` or `.jsx` — medium signal.
 ///    - (c) the body calls at least one React hook (bare-ident callee matching
-///      `/^use[A-Z]/`) — medium, corroborating only, never sufficient alone.
+///      `/^use[A-Z]/`) — a recognizer per spec §4.1. Combined with the
+///      PascalCase gate it CAN be sufficient alone, but as the only weak signal
+///      it yields lower confidence (0.8).
 ///
 /// Confidence: `1.0` when `returns_jsx` holds or ≥2 weak signals fire;
 /// `0.8` when exactly one medium signal fires alone. `is = false` ⇒
