@@ -424,12 +424,13 @@ fn apply_conditionality_discount(e: &mut Effect, phase: HookPhase) {
     // "captured-binding"). Only set it if no prior classification exists; the
     // phase rationale always goes into `discount` (the DISCOUNT axis).
     if e.subreason.is_none() {
-        e.subreason = Some("phase:event".to_string());
+        e.subreason = Some(match phase {
+            HookPhase::Unknown => "phase:unknown".to_string(),
+            _ => "phase:event".to_string(),
+        });
     }
     e.discount = Some(match phase {
-        HookPhase::Unknown => {
-            "phase:event — conditional on interaction (unknown callback schedule)".to_string()
-        }
+        HookPhase::Unknown => "phase:unknown — deferred (unknown callback schedule)".to_string(),
         _ => "phase:event — conditional on interaction".to_string(),
     });
     if phase == HookPhase::Unknown {
@@ -928,6 +929,89 @@ mod tests {
             e.subreason.as_deref(),
             Some("phase:event"),
             "no prior classification → phase subreason recorded"
+        );
+    }
+
+    /// Finding (Copilot round-7): `apply_conditionality_discount` with
+    /// `HookPhase::Unknown` must use DISTINCT "phase:unknown" labels in both
+    /// `discount` and `subreason` — NOT "phase:event". A callback passed to an
+    /// unrecognised `use[A-Z]…` hook (e.g. `useWhatever(() => fetch('/api'))`)
+    /// has an UNKNOWN invocation schedule, not a known event/interaction schedule,
+    /// so labelling it "phase:event" is misleading. Event-phase effects
+    /// (onClick etc.) must still say "phase:event".
+    #[test]
+    fn conditionality_discount_unknown_phase_uses_distinct_label() {
+        // --- Unknown-phase: callback to a custom/unrecognised hook ---
+        let mut e_unknown = Effect {
+            kind: EffectKind::NetFsDb,
+            class: 7,
+            discounted_to: None,
+            weight: weight_for_class(7),
+            line: 1,
+            col: 1,
+            tier: Tier::Path,
+            hidden: false,
+            contained: false,
+            evidence: "fetch('/api')".into(),
+            discount: None,
+            subreason: None,
+            confidence: 1.0,
+        };
+        apply_conditionality_discount(&mut e_unknown, HookPhase::Unknown);
+
+        // discount must NOT mention "phase:event"
+        let discount_text = e_unknown.discount.as_deref().unwrap_or("");
+        assert!(
+            !discount_text.contains("phase:event"),
+            "unknown-phase discount must NOT say phase:event, got: {discount_text:?}"
+        );
+        // discount must say "phase:unknown"
+        assert!(
+            discount_text.contains("phase:unknown"),
+            "unknown-phase discount must say phase:unknown, got: {discount_text:?}"
+        );
+        // subreason must be "phase:unknown"
+        assert_eq!(
+            e_unknown.subreason.as_deref(),
+            Some("phase:unknown"),
+            "unknown-phase: subreason must be phase:unknown, not phase:event"
+        );
+        // class-7 → discounted to 6 (1-class cap)
+        assert_eq!(
+            e_unknown.discounted_to,
+            Some(6),
+            "unknown-phase class-7 effect: discounted one notch to 6"
+        );
+
+        // --- Event-phase: onClick handler still uses "phase:event" ---
+        let mut e_event = Effect {
+            kind: EffectKind::NetFsDb,
+            class: 7,
+            discounted_to: None,
+            weight: weight_for_class(7),
+            line: 2,
+            col: 1,
+            tier: Tier::Path,
+            hidden: false,
+            contained: false,
+            evidence: "fetch('/api')".into(),
+            discount: None,
+            subreason: None,
+            confidence: 1.0,
+        };
+        apply_conditionality_discount(&mut e_event, HookPhase::Event);
+        assert!(
+            e_event
+                .discount
+                .as_deref()
+                .unwrap_or("")
+                .contains("phase:event"),
+            "event-phase discount must still say phase:event"
+        );
+        assert_eq!(
+            e_event.subreason.as_deref(),
+            Some("phase:event"),
+            "event-phase: subreason must remain phase:event"
         );
     }
 }
