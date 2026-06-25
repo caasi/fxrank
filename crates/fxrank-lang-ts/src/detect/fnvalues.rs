@@ -296,6 +296,17 @@ impl FnValueWalker<'_> {
         match node.args.get(idx).map(|a| a.expr.as_ref()) {
             Some(Expr::Arrow(a)) => self.push_arrow(a, phase),
             Some(Expr::Fn(f)) => self.push_fn_expr(f, phase),
+            // A NAMED function value (`useEffect(run, [])`, `useCallback(handler)`)
+            // routes by provenance exactly like the JSX-prop path: LocalDefined →
+            // adopt, Imported → edge, Received → ignore, Unknown → unknown_count++.
+            // Safe here: built-in data-arg hooks (useRef, …) never reach
+            // `handle_call_arg`, so this cannot adopt `useRef(namedFn)`'s DATA arg.
+            // A named NON-function (`useState(initialCount)`) resolves to a
+            // non-function provenance and `handle_ident_value` skips it.
+            Some(Expr::Ident(id)) => {
+                let (line, col) = self.lines.line_col(id.span);
+                self.handle_ident_value(id.sym.as_ref(), line, col, phase);
+            }
             Some(Expr::Object(obj)) if !is_builtin => self.handle_options_object(obj, phase),
             _ => {}
         }
@@ -656,6 +667,64 @@ mod tests {
         );
         assert!(v.edges.is_empty());
         assert!(v.received_passed.is_empty());
+    }
+
+    #[test]
+    fn named_local_fn_passed_to_useeffect_is_owned() {
+        // Finding 1 (Copilot R4): `useEffect(run, [])` where `run` is a local fn
+        // value passes a NAMED function value to a hook. It must be routed through
+        // `handle_ident_value` (LocalDefined → adopt) exactly like the JSX-prop
+        // path, so the component owns the effect (Effect phase).
+        let v = fn_values(
+            "function C(){ const run = () => { fetch('/x'); }; useEffect(run, []); return <div/>; }",
+            "C",
+        );
+        assert_eq!(
+            v.owned_value_sites.len(),
+            1,
+            "named local fn passed to useEffect is owned"
+        );
+        assert_eq!(
+            v.owned_value_sites[0].phase,
+            HookPhase::Effect,
+            "useEffect named callback is effect phase"
+        );
+        assert!(v.edges.is_empty());
+    }
+
+    #[test]
+    fn named_imported_fn_passed_to_hook_is_edge() {
+        // Finding 1 (Copilot R4): an Imported named handler passed to a hook →
+        // graph EDGE (propagate the import's effects), not owned.
+        let v = fn_values(
+            "import { handler } from './h';\n\
+             function C(){ useCallback(handler, []); return <div/>; }",
+            "C",
+        );
+        assert!(
+            v.owned_value_sites.is_empty(),
+            "imported named hook value is NOT owned"
+        );
+        assert_eq!(v.edges.len(), 1, "imported named hook value emits one edge");
+        assert_eq!(v.edges[0].base, "handler");
+        assert_eq!(v.edges[0].module.as_deref(), Some("./h"));
+    }
+
+    #[test]
+    fn named_fn_passed_to_useref_is_not_adopted() {
+        // Finding 1 regression guard (Copilot R4): `useRef(someNamedFn)` must NOT
+        // adopt. useRef is a built-in hook that never reaches `handle_call_arg`
+        // (its args[0] is DATA), so routing Ident in `handle_call_arg` must not
+        // touch it.
+        let v = fn_values(
+            "function C(){ const someNamedFn = () => { fetch('/x'); }; const r = useRef(someNamedFn); return <div/>; }",
+            "C",
+        );
+        assert!(
+            v.owned_value_sites.is_empty(),
+            "useRef named arg is DATA — the function is NOT adopted as a callback"
+        );
+        assert!(v.edges.is_empty());
     }
 
     #[test]
