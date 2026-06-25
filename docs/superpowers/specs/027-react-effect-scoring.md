@@ -24,6 +24,8 @@ A component **owns every effect lexically defined within its function body** —
 ### 2.2 CPS containment discount
 An effect that touches only the component's **own internal** state/ref/memo (`useState` set/read, a `useRef().current` used as private storage, a pure `useMemo`) is **contained** → discounts low (class ~1, the React analog of Rust `&mut self`). An effect that **reaches the world** (`fetch`/net/fs/db, global/module mutation, the real DOM outside React's managed tree, **time, random**) is **escaping** → full class. The discount always carries a recorded rationale.
 
+> **Implementation note — `ref-cell-write` is conservatively escaping.** Private-ref containment is the *intent* above (a `useRef().current` used purely as private storage should be contained), but the current implementation cannot distinguish private storage from a `ref` that is DOM-attached or forwarded to a consumer (`ref={domNode}`, `forwardRef`, passed to a child) **without ref-forwarding-chain analysis** (deferred — see §6, "ref-forwarding chains"). So a `ref-cell-write` (`HiddenMutation`, `subreason: "ref-cell-write"`) is classified **escaping** by default — the conservative choice (under-discount, never a false purity). This is a deliberate decision, not a bug; the `adopted_ref_cell_write_is_escaping_conservative` test pins it.
+
 ### 2.3 Cross-boundary = consumer's responsibility (onXxx and ref, one rule)
 Control/cells handed across the component boundary are the **consumer's** responsibility, not the definer's-callee's:
 - **Calling a *received* `onXxx`/prop/param callback → NOT charged.** The effect belongs to whoever defined and passed it.
