@@ -89,9 +89,9 @@ mod tests {
 
     #[test]
     fn rank_key_orders_by_max_class_first() {
-        let soup = rank_key(4, 27.5, 0, 0.9); // logging soup
-        let io = rank_key(7, 21.0, 0, 0.9); // one IO
-        assert!(io > soup);
+        let lower_class = rank_key(4, 27.5, 0, 0.9); // higher own_score, lower max_class
+        let io = rank_key(7, 21.0, 0, 0.9); // one IO — higher max_class
+        assert!(io > lower_class);
     }
 
     #[test]
