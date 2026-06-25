@@ -1170,7 +1170,8 @@ pub fn build_record(
         col: unit.col,
         symbol: unit.symbol.clone(),
         is_root: false,
-        export: None,
+        canonical_path: vec![], // 025-3e: frontend not yet adopted → non-adopted partition
+        aliases: vec![],
         effects,
         risks,
         refs: call_refs,

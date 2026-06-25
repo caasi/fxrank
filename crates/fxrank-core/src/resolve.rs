@@ -114,6 +114,131 @@ pub fn resolve_ref(r: &CallSiteRef, idx: &SymbolIndex, referencing_path: &str) -
     }
 }
 
+/// Path-precise index for spec 025-3e. Holds the 025 `SymbolIndex` as the
+/// name-based fallback backend, plus a primary map (canonical path → units),
+/// an alias map (re-export path → target path), and the partition-adoption flag.
+pub struct CanonicalIndex {
+    primary: HashMap<Vec<String>, Vec<UnitId>>,
+    aliases: HashMap<Vec<String>, Vec<String>>,
+    name_idx: SymbolIndex,
+    adopted: bool,
+}
+
+impl CanonicalIndex {
+    pub fn from_records(records: &[UnitRecord]) -> Self {
+        let mut primary: HashMap<Vec<String>, Vec<UnitId>> = HashMap::new();
+        let mut aliases: HashMap<Vec<String>, Vec<String>> = HashMap::new();
+        let mut adopted = false;
+        for rec in records {
+            if !rec.canonical_path.is_empty() {
+                adopted = true;
+                primary
+                    .entry(rec.canonical_path.clone())
+                    .or_default()
+                    .push(rec.unit_id.clone());
+            }
+            for a in &rec.aliases {
+                aliases.insert(a.alias_path.clone(), a.target.clone());
+            }
+        }
+        let name_idx = SymbolIndex::from_records(records);
+        Self {
+            primary,
+            aliases,
+            name_idx,
+            adopted,
+        }
+    }
+
+    pub fn adopted(&self) -> bool {
+        self.adopted
+    }
+
+    /// The name-based fallback backend (025 SymbolIndex).
+    pub(crate) fn name_index(&self) -> &SymbolIndex {
+        &self.name_idx
+    }
+
+    /// Unique primary hit, else None (a multi-unit collision is ambiguous → drop).
+    fn lookup_canonical(&self, path: &[String]) -> Option<&UnitId> {
+        match self.primary.get(path).map(|v| v.as_slice()) {
+            Some([id]) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Follow the alias map transitively to a unique primary hit, cycle-guarded.
+    fn follow_alias(&self, path: &[String]) -> Option<&UnitId> {
+        let mut cur = path.to_vec();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if let Some(id) = self.lookup_canonical(&cur) {
+                return Some(id);
+            }
+            if !seen.insert(cur.clone()) {
+                return None; // cycle
+            }
+            match self.aliases.get(&cur) {
+                Some(next) => cur = next.clone(),
+                None => return None,
+            }
+        }
+    }
+}
+
+/// Path-precise resolution with the spec 025-3e adoption gate.
+///
+/// Step 0 — gate: a non-adopted partition (no unit has a canonical_path) runs the
+/// 025 name-based `resolve_ref` verbatim. Steps 1–3 apply when adopted (Step 3's
+/// unqualified-miss branch still reuses the 025 leaf fallback).
+/// Step 1 — `RefKind::Method` drops (no receiver type).
+/// Step 2 — `resolved_target` canonical lookup, then transitive alias follow.
+/// Step 3 — miss: a QUALIFIED ref goes Opaque (NEVER a leaf lookup — this is the
+/// false-resolve fix); an UNqualified bare ref may leaf-fall-back via the 025
+/// `SymbolIndex`, else None.
+pub fn resolve_ref_precise(
+    r: &CallSiteRef,
+    idx: &CanonicalIndex,
+    referencing_path: &str,
+) -> Option<Edge> {
+    // Step 0 — adoption gate.
+    if !idx.adopted() {
+        return resolve_ref(r, idx.name_index(), referencing_path);
+    }
+    // Step 1 — method early-drop.
+    if r.kind == RefKind::Method {
+        return None;
+    }
+    // Step 2 — canonical resolution.
+    if let Some(path) = &r.resolved_target {
+        if let Some(id) = idx
+            .lookup_canonical(path)
+            .or_else(|| idx.follow_alias(path))
+        {
+            return Some(Edge::Resolved(id.clone()));
+        }
+    }
+    // Step 3 — miss handling.
+    let site = format!("{referencing_path}:{}:{}", r.line, r.col);
+    if r.qualified {
+        // QUALIFIED miss → opaque external reach. NEVER a leaf lookup.
+        let kind = if r.first_party {
+            ReachKind::FirstPartyOutOfScope
+        } else {
+            ReachKind::ThirdParty
+        };
+        Some(Edge::Opaque(ExternalReach {
+            specifier: r.module.clone().unwrap_or_else(|| r.base.clone()),
+            kind,
+            site,
+        }))
+    } else {
+        // UNqualified bare name → 025 leaf fallback (safe: not the import surface).
+        // Reuse the 025 resolver, which leaf-looks-up and returns None for bare misses.
+        resolve_ref(r, idx.name_index(), referencing_path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,7 +252,8 @@ mod tests {
             col: 1,
             symbol: sym.into(),
             is_root: false,
-            export: None,
+            canonical_path: vec![],
+            aliases: vec![],
             effects: vec![],
             risks: vec![],
             refs: vec![],
@@ -154,6 +280,7 @@ mod tests {
             col: 3,
             qualified: false,
             first_party: false,
+            resolved_target: None,
         };
         assert!(
             matches!(resolve_ref(&call, &idx, "b.rs"), Some(Edge::Resolved(ref id)) if id == "a.rs:1:1:helper")
@@ -168,6 +295,7 @@ mod tests {
             col: 3,
             qualified: true,
             first_party: false,
+            resolved_target: None,
         };
         assert!(matches!(
             resolve_ref(&qualified, &idx, "b.rs"),
@@ -183,6 +311,7 @@ mod tests {
             col: 3,
             qualified: false,
             first_party: false,
+            resolved_target: None,
         };
         assert!(resolve_ref(&bare, &idx, "b.rs").is_none());
 
@@ -195,6 +324,7 @@ mod tests {
             col: 5,
             qualified: false,
             first_party: false,
+            resolved_target: None,
         };
         assert!(resolve_ref(&bare_some, &idx, "b.rs").is_none());
 
@@ -207,6 +337,7 @@ mod tests {
             col: 2,
             qualified: false,
             first_party: false,
+            resolved_target: None,
         };
         assert!(resolve_ref(&method_call, &idx, "b.rs").is_none());
 
@@ -221,6 +352,7 @@ mod tests {
             col: 1,
             qualified: false,
             first_party: false,
+            resolved_target: None,
         };
         assert!(resolve_ref(&dup_call, &idx2, "c.rs").is_none());
     }
@@ -239,6 +371,7 @@ mod tests {
             col: 5,
             qualified: true,
             first_party: true,
+            resolved_target: None,
         };
         let edge = resolve_ref(&fp_ref, &idx, "src/main.rs");
         assert!(
@@ -258,6 +391,7 @@ mod tests {
             col: 5,
             qualified: true,
             first_party: false,
+            resolved_target: None,
         };
         let edge2 = resolve_ref(&tp_ref, &idx, "src/main.rs");
         assert!(
@@ -286,6 +420,7 @@ mod tests {
             col: 1,
             qualified: true,
             first_party: true,
+            resolved_target: None,
         };
         assert!(
             matches!(
@@ -312,6 +447,7 @@ mod tests {
             col: 1,
             qualified: false,
             first_party: false,
+            resolved_target: None,
         };
         assert!(
             resolve_ref(&call, &idx, "c.ts").is_none(),
@@ -342,6 +478,7 @@ mod tests {
             col: 3,
             qualified: false,
             first_party: false,
+            resolved_target: None,
         };
         assert!(
             resolve_ref(&method_ref, &idx, "b.rs").is_none(),
@@ -365,6 +502,7 @@ mod tests {
             col: 5,
             qualified: false,
             first_party: false,
+            resolved_target: None,
         };
         assert!(
             matches!(
@@ -390,10 +528,80 @@ mod tests {
             col: 5,
             qualified: true,
             first_party: false,
+            resolved_target: None,
         };
         assert!(
             resolve_ref(&method_ref, &idx, "src/lib.rs").is_none(),
             "Method-kind + qualified=true + no match must return None, not Opaque"
+        );
+    }
+
+    #[test]
+    fn canonical_index_adopted_flag() {
+        // No canonical paths → not adopted.
+        let mut r0 = rec("a.rs:1:1:f", "f");
+        r0.canonical_path = vec![];
+        let idx0 = CanonicalIndex::from_records(std::slice::from_ref(&r0));
+        assert!(!idx0.adopted(), "no canonical_path ⇒ not adopted");
+
+        // ≥1 canonical path → adopted, and unique primary lookup hits.
+        let mut r1 = rec("a.rs:1:1:write", "write");
+        r1.canonical_path = vec!["crate".into(), "a".into(), "write".into()];
+        let idx1 = CanonicalIndex::from_records(std::slice::from_ref(&r1));
+        assert!(idx1.adopted(), "a canonical_path ⇒ adopted");
+        assert_eq!(
+            idx1.lookup_canonical(&["crate".into(), "a".into(), "write".into()]),
+            Some(&"a.rs:1:1:write".to_string())
+        );
+        // Wrong full path ⇒ no hit (this is the false-resolve fix in microcosm).
+        assert_eq!(
+            idx1.lookup_canonical(&["std".into(), "fs".into(), "write".into()]),
+            None
+        );
+    }
+
+    #[test]
+    fn canonical_index_full_path_collision_is_ambiguous() {
+        let mut a = rec("a.rs:1:1:dup", "dup");
+        a.canonical_path = vec!["crate".into(), "dup".into()];
+        let mut b = rec("b.rs:1:1:dup", "dup");
+        b.canonical_path = vec!["crate".into(), "dup".into()]; // same full path (cfg dup)
+        let idx = CanonicalIndex::from_records(&[a, b]);
+        assert_eq!(
+            idx.lookup_canonical(&["crate".into(), "dup".into()]),
+            None,
+            "full-path collision ⇒ ambiguous drop"
+        );
+    }
+
+    #[test]
+    fn canonical_index_alias_hop_and_cycle() {
+        let mut def = rec("a.rs:1:1:thing", "thing");
+        def.canonical_path = vec!["crate".into(), "internal".into(), "thing".into()];
+        // re-export: crate::api::thing → crate::internal::thing
+        def.aliases = vec![AliasFact {
+            alias_path: vec!["crate".into(), "api".into(), "thing".into()],
+            target: vec!["crate".into(), "internal".into(), "thing".into()],
+        }];
+        let idx = CanonicalIndex::from_records(std::slice::from_ref(&def));
+        assert_eq!(
+            idx.follow_alias(&["crate".into(), "api".into(), "thing".into()]),
+            Some(&"a.rs:1:1:thing".to_string()),
+            "alias path resolves to the canonical definition"
+        );
+
+        // A self-referential alias cycle must terminate (return None, not loop).
+        let mut cyc = rec("c.rs:1:1:x", "x");
+        cyc.canonical_path = vec!["crate".into(), "x".into()];
+        cyc.aliases = vec![AliasFact {
+            alias_path: vec!["crate".into(), "loop".into()],
+            target: vec!["crate".into(), "loop".into()], // points at itself
+        }];
+        let idxc = CanonicalIndex::from_records(std::slice::from_ref(&cyc));
+        assert_eq!(
+            idxc.follow_alias(&["crate".into(), "loop".into()]),
+            None,
+            "alias cycle terminates"
         );
     }
 
@@ -412,6 +620,7 @@ mod tests {
             col: 1,
             qualified: true,
             first_party: true,
+            resolved_target: None,
         };
         assert!(
             matches!(
@@ -420,5 +629,122 @@ mod tests {
             ),
             "Rust Foo::bar must still resolve via the `bar` simple name"
         );
+    }
+
+    fn precise_rec(id: &str, canon: &[&str]) -> UnitRecord {
+        let mut r = rec(id, id.rsplit([':', '.']).next().unwrap_or(id));
+        r.canonical_path = canon.iter().map(|s| s.to_string()).collect();
+        r
+    }
+
+    #[test]
+    fn precise_win_resolves_what_025_had_to_drop() {
+        // a::write and b::write are leaf-ambiguous under 025 (both → "write" → dropped).
+        let aw = precise_rec("a.rs:1:1:write", &["crate", "a", "write"]);
+        let bw = precise_rec("b.rs:1:1:write", &["crate", "b", "write"]);
+        let idx = CanonicalIndex::from_records(&[aw, bw]);
+        // A call whose frontend resolved the target to crate::a::write resolves to it ONLY.
+        let call = CallSiteRef {
+            kind: RefKind::Free,
+            base: "a::write".into(),
+            module: None,
+            line: 9,
+            col: 1,
+            qualified: true,
+            first_party: true,
+            resolved_target: Some(vec!["crate".into(), "a".into(), "write".into()]),
+        };
+        assert!(matches!(
+            resolve_ref_precise(&call, &idx, "c.rs"),
+            Some(Edge::Resolved(ref id)) if id == "a.rs:1:1:write"
+        ));
+    }
+
+    #[test]
+    fn precise_qualified_miss_goes_opaque_never_leaf() {
+        // The headline false-resolve: a lone Foo::write in scope, a qualified std::fs::write call.
+        let foo = precise_rec("a.rs:1:1:write", &["crate", "Foo", "write"]);
+        let idx = CanonicalIndex::from_records(std::slice::from_ref(&foo));
+        let stdcall = CallSiteRef {
+            kind: RefKind::Free,
+            base: "std::fs::write".into(),
+            module: Some("std".into()),
+            line: 3,
+            col: 5,
+            qualified: true,
+            first_party: false,
+            resolved_target: None, // frontend could not resolve (out of corpus)
+        };
+        // MUST be Opaque(ThirdParty), MUST NOT resolve to Foo::write.
+        assert!(matches!(
+            resolve_ref_precise(&stdcall, &idx, "b.rs"),
+            Some(Edge::Opaque(ref reach)) if matches!(reach.kind, ReachKind::ThirdParty)
+        ));
+    }
+
+    #[test]
+    fn precise_unqualified_miss_may_leaf_fallback_in_adopted() {
+        // In an adopted partition, a BARE unqualified call may still leaf-resolve a local.
+        let helper = precise_rec("a.rs:1:1:helper", &["crate", "helper"]);
+        let idx = CanonicalIndex::from_records(std::slice::from_ref(&helper));
+        let bare = CallSiteRef {
+            kind: RefKind::Free,
+            base: "helper".into(),
+            module: None,
+            line: 2,
+            col: 2,
+            qualified: false,
+            first_party: false,
+            resolved_target: None, // frontend left it uncanonicalized
+        };
+        assert!(matches!(
+            resolve_ref_precise(&bare, &idx, "b.rs"),
+            Some(Edge::Resolved(ref id)) if id == "a.rs:1:1:helper"
+        ));
+    }
+
+    #[test]
+    fn precise_non_adopted_delegates_to_025_verbatim() {
+        // No canonical paths anywhere → 025 name-based path runs. A qualified call with a
+        // lone leaf match leaf-resolves (the 025 behavior we must preserve until adoption).
+        let helper = rec("a.rs:1:1:helper", "helper"); // canonical_path empty
+        let idx = CanonicalIndex::from_records(std::slice::from_ref(&helper));
+        assert!(!idx.adopted());
+        let call = CallSiteRef {
+            kind: RefKind::Free,
+            base: "helper".into(),
+            module: None,
+            line: 2,
+            col: 3,
+            qualified: false,
+            first_party: false,
+            resolved_target: None,
+        };
+        assert!(matches!(
+            resolve_ref_precise(&call, &idx, "b.rs"),
+            Some(Edge::Resolved(ref id)) if id == "a.rs:1:1:helper"
+        ));
+    }
+
+    #[test]
+    fn precise_method_kind_drops() {
+        // An adopted index so Step 0 is skipped and the adopted-path Step 1 Method-drop fires.
+        let dummy = precise_rec("a.rs:1:1:f", &["crate", "f"]);
+        let idx = CanonicalIndex::from_records(std::slice::from_ref(&dummy));
+        assert!(
+            idx.adopted(),
+            "guard: this test must exercise the adopted Step 1 path"
+        );
+        let m = CallSiteRef {
+            kind: RefKind::Method,
+            base: "len".into(),
+            module: None,
+            line: 1,
+            col: 1,
+            qualified: false,
+            first_party: false,
+            resolved_target: None,
+        };
+        assert!(resolve_ref_precise(&m, &idx, "b.rs").is_none());
     }
 }

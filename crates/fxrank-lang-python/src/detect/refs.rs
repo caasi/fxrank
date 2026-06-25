@@ -86,6 +86,7 @@ impl EffectSink for RefSink<'_> {
             col,
             qualified,
             first_party,
+            resolved_target: None,
         });
     }
 

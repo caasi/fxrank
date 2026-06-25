@@ -86,7 +86,8 @@ mod tests {
             col: 1,
             symbol: id.into(),
             is_root: id == "root",
-            export: None,
+            canonical_path: vec![],
+            aliases: vec![],
             effects: vec![],
             risks: vec![],
             refs: refs
@@ -99,6 +100,7 @@ mod tests {
                     col: 1,
                     qualified: false,
                     first_party: false,
+                    resolved_target: None,
                 })
                 .collect(),
             async_boundary: false,

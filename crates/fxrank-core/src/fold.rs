@@ -667,7 +667,8 @@ mod tests {
             col: 1,
             symbol: id.into(),
             is_root: id == "root",
-            export: None,
+            canonical_path: vec![],
+            aliases: vec![],
             effects,
             risks,
             refs: vec![],
@@ -727,7 +728,8 @@ mod tests {
             col: 1,
             symbol: id.into(),
             is_root: id == "root",
-            export: None,
+            canonical_path: vec![],
+            aliases: vec![],
             effects,
             risks,
             refs: refs
@@ -740,6 +742,7 @@ mod tests {
                     col: 1,
                     qualified: false,
                     first_party: false,
+                    resolved_target: None,
                 })
                 .collect(),
             async_boundary: false,
@@ -1447,7 +1450,8 @@ mod tests {
             col: 1,
             symbol: "f".into(),
             is_root: false,
-            export: None,
+            canonical_path: vec![],
+            aliases: vec![],
             effects: vec![],
             risks: vec![],
             refs: vec![
@@ -1459,6 +1463,7 @@ mod tests {
                     col: 5,
                     qualified: true,
                     first_party: false,
+                    resolved_target: None,
                 },
                 CallSiteRef {
                     kind: RefKind::Free,
@@ -1468,6 +1473,7 @@ mod tests {
                     col: 5,
                     qualified: true,
                     first_party: false,
+                    resolved_target: None,
                 },
             ],
             async_boundary: false,
