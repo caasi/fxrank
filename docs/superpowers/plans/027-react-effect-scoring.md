@@ -6,7 +6,7 @@
 
 **Architecture:** TS-frontend-only. `fxrank-core` stays language-neutral and parser-free — **no new core field, no React concept in core**. The frontend computes phase / hook semantics / JSX / component identity / provenance and **materializes** them into existing neutral `Effect` fields (`contained`, `discounted_to`, `discount`, `subreason`, `confidence`) before records enter the fold. The current `analyze_units` (`lib.rs`) keyed-by-`(line,col)` single-hop suppression is replaced by a tree-aware ownership pass; `detect::{raw_signals, adopt_effects, augment_component}` are rewritten so they no longer drop/force the `contained` tuple.
 
-**Tech Stack:** Rust (edition 2021 workspace), swc (`swc_ecma_ast` / `swc_ecma_visit`) for the TS AST, `insta` for snapshots. Touches only `crates/fxrank-lang-ts/` (+ its fixtures/snapshots). Core is read-only here except where 028 (a separate plan, same PR) touches it.
+**Tech Stack:** Rust (edition 2024 workspace), swc (`swc_ecma_ast` / `swc_ecma_visit`) for the TS AST, `insta` for snapshots. Touches only `crates/fxrank-lang-ts/` (+ its fixtures/snapshots). Core is read-only here except where 028 (a separate plan, same PR) touches it.
 
 ## Global Constraints
 
