@@ -410,7 +410,12 @@ fn apply_conditionality_discount(e: &mut Effect, phase: HookPhase) {
     let down = base.saturating_sub(1).max(1); // cap 1 class, floor 1
     if down < base {
         e.discounted_to = Some(down);
-        e.subreason = Some("phase:event".to_string());
+        // `subreason` is the CLASSIFICATION axis (e.g. "ref-cell-write",
+        // "captured-binding"). Only set it if no prior classification exists; the
+        // phase rationale always goes into `discount` (the DISCOUNT axis).
+        if e.subreason.is_none() {
+            e.subreason = Some("phase:event".to_string());
+        }
         e.discount = Some(match phase {
             HookPhase::Unknown => {
                 "phase:event — conditional on interaction (unknown callback schedule)".to_string()
@@ -813,5 +818,69 @@ mod tests {
             "027 keeps ref-cell-write conservatively escaping (no DOM precision)"
         );
         assert!(rc.escapes(), "conservative ref-cell-write must escape");
+    }
+
+    /// Finding A (Copilot round-3): `apply_conditionality_discount` must NOT
+    /// overwrite an existing `subreason` (the classification axis) when it applies
+    /// the phase discount. The phase rationale belongs in `discount`, not
+    /// `subreason`. If the effect already has a classification subreason (e.g.
+    /// `"ref-cell-write"` on a `HiddenMutation`), that classification is preserved;
+    /// `discount` always records the event-phase rationale.
+    #[test]
+    fn conditionality_discount_preserves_prior_subreason() {
+        // Build a component with an empty body; adopt a ref-cell-write effect at
+        // event-phase (simulating a `r.current = x` inside a JSX onClick handler
+        // that was adopted into the component).
+        let src_c = "function C(){ const r = useRef(null); return null; }";
+        let (units_c, imports_c, mb_c, lines_c, idx_c) = unit_and_ctx(src_c, "C");
+        let mut h = analyze_unit(&units_c[idx_c], &imports_c, &lines_c, &mb_c);
+
+        // Construct a RawSignals carrying a HiddenMutation with subreason
+        // "ref-cell-write" (class 3, escaping) — as produced by mutation::detect
+        // for a `r.current = x` write.
+        let cb_src = "function cb(){ r.current = 1; }";
+        let (units_cb, imports_cb, mb_cb, lines_cb, idx_cb) = unit_and_ctx(cb_src, "cb");
+        let mut refs = HashSet::new();
+        refs.insert("r".to_string());
+        let raw = raw_signals(&units_cb[idx_cb], &imports_cb, &lines_cb, &mb_cb, &refs);
+
+        // Confirm the raw signal has a ref-cell-write subreason before adoption.
+        assert!(
+            raw.effects
+                .iter()
+                .any(|(e, _)| e.subreason.as_deref() == Some("ref-cell-write")),
+            "pre-condition: raw must carry a ref-cell-write effect"
+        );
+
+        // Adopt at HookPhase::Event → conditionality discount applies.
+        adopt_effects(&mut h, vec![(HookPhase::Event, raw)]);
+
+        let rc = h
+            .effects
+            .iter()
+            .find(|e| e.kind == EffectKind::HiddenMutation)
+            .expect("expected adopted HiddenMutation");
+
+        // The classification subreason must survive — discount must NOT clobber it.
+        assert_eq!(
+            rc.subreason.as_deref(),
+            Some("ref-cell-write"),
+            "conditionality discount must not clobber a prior classification subreason"
+        );
+        // The phase rationale must be in discount, not overwritten into subreason.
+        assert!(
+            rc.discount.is_some(),
+            "discount must carry the event-phase rationale"
+        );
+        assert!(
+            rc.discount.as_deref().unwrap_or("").contains("phase:event"),
+            "discount text must mention phase:event"
+        );
+        // Class-3 effect → discounted to 2 (1-class cap, floor 1).
+        assert_eq!(
+            rc.discounted_to,
+            Some(2),
+            "class-3 ref-cell-write in event phase: down to 2"
+        );
     }
 }
