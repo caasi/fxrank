@@ -1,0 +1,54 @@
+---
+source: crates/fxrank-lang-ts/tests/react.rs
+expression: snapshot
+---
+[
+  {
+    "async_boundary": false,
+    "await_count": 0,
+    "confidence": 0.6,
+    "effects": [
+      {
+        "class": 3,
+        "discounted_to": null,
+        "hidden": true,
+        "kind": "hidden.mutation",
+        "subreason": "ref-cell-write",
+        "tier": "heuristic"
+      },
+      {
+        "class": 1,
+        "discounted_to": null,
+        "hidden": false,
+        "kind": "state.transition",
+        "subreason": "useState",
+        "tier": "heuristic"
+      }
+    ],
+    "max_class": 3,
+    "own_score": 3.5,
+    "risk_features": [],
+    "risk_weight": 0,
+    "symbol": "StateOnly"
+  },
+  {
+    "async_boundary": false,
+    "await_count": 0,
+    "confidence": 0.9,
+    "effects": [
+      {
+        "class": 7,
+        "discounted_to": 6,
+        "hidden": false,
+        "kind": "net.fs.db",
+        "subreason": "phase:event",
+        "tier": "path"
+      }
+    ],
+    "max_class": 6,
+    "own_score": 13.0,
+    "risk_features": [],
+    "risk_weight": 0,
+    "symbol": "FetchingComponent"
+  }
+]

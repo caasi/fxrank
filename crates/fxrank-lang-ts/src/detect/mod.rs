@@ -8,6 +8,7 @@
 //! Adding a detector is a one-line addition to the `gather` step.
 
 pub mod calls;
+pub mod fnvalues;
 pub mod mutation;
 pub mod refs;
 pub mod risk;
@@ -210,11 +211,14 @@ fn count_awaits(body: &FnBodyOwned) -> usize {
 /// score, which the boundary discount could have floored to 0).
 ///
 /// `await_count` and `is_async` carry the callback's async metadata so
-/// [`absorb_inherited`] can fold them into the owning component's `await_count`
+/// [`adopt_effects`] can fold them into the owning component's `await_count`
 /// and `async_boundary` fields, enabling the `0.8` await-confidence penalty to
 /// apply even when the awaits live inside an inherited callback.
 pub struct RawSignals {
-    pub effects: Vec<Effect>,
+    /// (effect, contained) — the gather tuple is PRESERVED (RAW = undiscounted).
+    /// `adopt_effects` reads the `contained` flag and runs the React containment
+    /// classifier over it; it must not be dropped here. See spec 027 §4.4.
+    pub effects: Vec<(Effect, bool)>,
     pub risks: Vec<RiskFeature>,
     pub await_count: usize,
     pub is_async: bool,
@@ -236,12 +240,10 @@ pub fn raw_signals(
     module_bindings: &HashSet<String>,
     ref_bindings: &HashSet<String>,
 ) -> RawSignals {
-    // Pre-discount effects: drop the `contained` flag — the absorbing component
-    // forces `contained = false` on every inherited effect anyway.
-    let effects: Vec<Effect> = gather(unit, imports, lines, module_bindings, ref_bindings)
-        .into_iter()
-        .map(|(e, _contained)| e)
-        .collect();
+    // Pre-discount effects: PRESERVE the `(Effect, contained)` tuple. The
+    // absorbing component's `adopt_effects` reads `contained` and runs the React
+    // containment classifier over it (spec 027 §4.4) — the flag must survive.
+    let effects: Vec<(Effect, bool)> = gather(unit, imports, lines, module_bindings, ref_bindings);
 
     let mut risks: Vec<RiskFeature> = Vec::new();
     // The coverage gate owns the `any`-family `type.escape` risk.
@@ -262,7 +264,7 @@ pub fn raw_signals(
     // Per-body risks: non-null assertion, dynamic.code, proto.pollution, html.injection.
     risks.extend(risk::detect(&unit.body, &unit.path, lines));
 
-    // Capture the callback's async metadata so absorb_inherited can fold it into
+    // Capture the callback's async metadata so adopt_effects can fold it into
     // the owning component, propagating the await-confidence penalty.
     let await_count = count_awaits(&unit.body);
     let is_async = unit.is_async;
@@ -279,7 +281,10 @@ pub fn raw_signals(
 /// impure (and so earns an `EffectInRender` risk)?
 ///
 /// This is an **explicit kind match**, not a class threshold: `env.read` /
-/// `logging` / `panic` are class 4, so a `class >= 5` test would miss them.
+/// `panic` are class 4, so a `class >= 5` test would miss them.
+/// `Logging` is **excluded** — `console.*` is a benign annotation (class 2)
+/// and does not constitute the wrong-place IO that `EffectInRender` flags.
+/// `TimeRead`/`Random` stay: nondeterminism during render is a legitimate concern.
 /// `AmbientRead` is deliberately EXCLUDED — `useContext` reuses it and must
 /// never trip `EffectInRender`.
 fn world_effect(kind: EffectKind) -> bool {
@@ -292,7 +297,6 @@ fn world_effect(kind: EffectKind) -> bool {
             | EffectKind::TimeRead
             | EffectKind::Random
             | EffectKind::EnvRead
-            | EffectKind::Logging
             | EffectKind::Panic
     )
 }
@@ -314,17 +318,24 @@ fn effect_in_render_risk(path: &str, line: usize, col: usize) -> RiskFeature {
 
 /// Augment a component's own `Hotspot` with its React render-body signals.
 ///
-/// Pushes `state_transitions` + `context_reads` effects (all `contained =
-/// false`, so the boundary discount never zeroes a class-2 `useContext`), adds
-/// an `EffectInRender` risk for each of the component's OWN-body world effects,
-/// then recomputes the score.
+/// Pushes `state_transitions` (CONTAINED — bounded internal state, the React
+/// `&mut self`) and `context_reads` (ESCAPING — `useContext` reaches outside
+/// the component) effects, adds an `EffectInRender` risk for each of the
+/// component's OWN-body world effects, then recomputes the score.
+///
+/// `contained` is set EXPLICITLY per kind (it drives `Effect::escapes()` and the
+/// cross-file fold). The constructors in `react.rs` default `contained = false`;
+/// we override only `state.transition` to `true` here. `discounted_to` stays
+/// `None`: these synthetic render-body effects have no signature boundary.
 pub fn augment_component(h: &mut Hotspot, unit: &FnUnit, lines: &SpanLines) {
     for mut e in react::state_transitions(&unit.body, lines) {
-        e.discounted_to = None;
+        // Bounded internal state ⇒ contained ⇒ stays in own, does not propagate.
+        e.contained = true;
         h.effects.push(e);
     }
-    for mut e in react::context_reads(&unit.body, lines) {
-        e.discounted_to = None;
+    for e in react::context_reads(&unit.body, lines) {
+        // useContext reaches outside the component ⇒ escaping (contained = false,
+        // already the constructor default).
         h.effects.push(e);
     }
     // The component's own-body world effects run during render: flag each.
@@ -341,21 +352,134 @@ pub fn augment_component(h: &mut Hotspot, unit: &FnUnit, lines: &SpanLines) {
     recompute(h);
 }
 
-/// Fold inherited hook-callback raw signals into the owning component, then
-/// recompute the score.
+/// Apply the React containment classifier (spec 027 §2.2 / §4.4) to one
+/// adopted effect, overriding the raw `contained` flag for the React-specific
+/// kinds the gather step cannot classify on its own.
 ///
-/// Each inherited effect is forced `contained = false` / `discounted_to = None`
-/// (the component never benefits from a child's boundary discount). For a
-/// `HookPhase::Render` callback (`useMemo` and the `useState`/`useReducer` lazy
-/// initializers — bodies that run during render), each inherited world effect
-/// additionally earns an `EffectInRender` risk; `HookPhase::Effect` callbacks
-/// (`useEffect` / `useLayoutEffect` / `useCallback`) do not — their bodies run
-/// outside render (after commit, or on invocation), so running effects there is
-/// the honest baseline.
-pub fn absorb_inherited(h: &mut Hotspot, raws: Vec<(HookPhase, RawSignals)>) {
+/// CONTAINED (`true`): `useState`/`useReducer` state transitions — the React
+/// analog of `&mut self`, bounded internal state declared by the component.
+/// ESCAPING (`false`): every world effect (`world_effect`); `useContext`
+/// ambient reads (they reach outside the component); and — conservatively —
+/// `ref-cell-write`. A precise "ref forwarded to a DOM node ⇒ escaping vs. used
+/// as private storage ⇒ contained" classifier needs ref-forwarding-chain
+/// analysis (spec 027 §6, deferred); until then a `ref-cell-write` stays
+/// `contained = false` (escaping). We do NOT claim DOM precision here.
+///
+/// Any other kind keeps the raw `contained` flag the gather step produced (e.g.
+/// a body-local `local.mutation` inside a callback stays contained).
+fn react_contained(effect: &Effect, raw_contained: bool) -> bool {
+    // Anti-Goodhart: a world effect is never contained, whatever the raw flag says.
+    if world_effect(effect.kind) {
+        return false;
+    }
+    match effect.kind {
+        // Bounded internal state — contained (the React `&mut self`).
+        EffectKind::StateTransition => true,
+        // useContext reaches outside the component → escaping (matches today).
+        EffectKind::AmbientRead => false,
+        // Conservative: a useRef().current write stays escaping until a precise
+        // DOM-forward classifier exists (§6). Private-storage vs DOM-attach is
+        // indistinguishable without ref-forwarding-chain analysis.
+        EffectKind::HiddenMutation if effect.subreason.as_deref() == Some("ref-cell-write") => {
+            false
+        }
+        // Everything else keeps the gathered containment (body-local writes, etc).
+        _ => raw_contained,
+    }
+}
+
+/// Apply the conditionality (phase) discount to one adopted effect (spec 027
+/// §2.4 — the C1 fix).
+///
+/// This is a NEW, ORTHOGONAL axis to the spec-003 containment discount: it is a
+/// DIRECT write of `discounted_to`/`discount`/`subreason`, never a call to
+/// `apply_discount` (the Rust `&mut`/`&self` mutation-channel discount, no React
+/// analog) nor `apply_boundary_discount` (contained-only, refuses escaping
+/// effects). An event-phase effect runs only on interaction, so it drops ONE
+/// class — but it is **capped at 1 class and floored at class 1**: a world effect
+/// is nudged one notch, NEVER erased to 0. It never touches `contained`.
+///
+/// For a class-1 effect the class formula is a no-op: `1.saturating_sub(1) = 0`,
+/// `0.max(1) = 1`, and `1 < 1` is false ⇒ `discounted_to` stays `None` (correct
+/// — a class-1 effect cannot be nudged below the floor). The phase RATIONALE
+/// (`discount`, and `subreason` if unset) is still recorded even at the floor so
+/// users see why it is event-phase (spec §2.4); only the class change is skipped.
+///
+/// An `Unknown` phase additionally lowers `confidence` (the invocation schedule
+/// is not known) and records the unknown-schedule rationale.
+fn apply_conditionality_discount(e: &mut Effect, phase: HookPhase) {
+    let base = e.effective_class();
+    let down = base.saturating_sub(1).max(1); // cap 1 class, floor 1
+    if down < base {
+        // A real class change: write the downshift target.
+        e.discounted_to = Some(down);
+    }
+    // Record the phase rationale REGARDLESS of whether a class change occurred
+    // (spec §2.4): even an event-phase effect already at the class-1 floor — where
+    // there is no notch left to drop — should carry the recorded reason so users
+    // see *why* it is treated as event-phase. At the floor `discounted_to` stays
+    // `None` (no class change, just the recorded rationale).
+    //
+    // `subreason` is the CLASSIFICATION axis (e.g. "ref-cell-write",
+    // "captured-binding"). Only set it if no prior classification exists; the
+    // phase rationale always goes into `discount` (the DISCOUNT axis).
+    if e.subreason.is_none() {
+        e.subreason = Some(match phase {
+            HookPhase::Unknown => "phase:unknown".to_string(),
+            _ => "phase:event".to_string(),
+        });
+    }
+    e.discount = Some(match phase {
+        HookPhase::Unknown => "phase:unknown — deferred (unknown callback schedule)".to_string(),
+        _ => "phase:event — conditional on interaction".to_string(),
+    });
+    if phase == HookPhase::Unknown {
+        // Unknown invocation schedule ⇒ lower confidence (applies whether or not
+        // a class downshift was written, e.g. for a class-1 effect).
+        e.confidence *= 0.8;
+    }
+}
+
+/// Fold the raw signals of an adopted/owned nested unit (hook callback, JSX
+/// handler, named handler, object-literal hook-arg callback — any depth) into the
+/// owning component, then recompute the score.
+///
+/// Each adopted effect's REAL `contained` flag is preserved from the gather
+/// tuple, then refined by the React containment classifier ([`react_contained`]):
+/// a `state.transition` is contained (own internal state, stays in `own`); a
+/// world effect / `useContext` / `ref-cell-write` escapes. `contained` drives
+/// `Effect::escapes()`, which the shared cross-file fold reads — so a contained
+/// adopted effect stays in the component's own score and does not propagate.
+///
+/// Adopted effects have no signature, so the spec-003 boundary discount does not
+/// apply: `discounted_to` starts `None`. The **conditionality (phase) discount**
+/// (spec 027 §2.4 — the C1 fix) is then layered on as a NEW, ORTHOGONAL axis:
+/// for an event-phase (`HookPhase::Event`) or unknown-schedule (`HookPhase::Unknown`)
+/// effect — one that runs only on interaction — we DIRECTLY write `discounted_to`
+/// (NOT `apply_discount`/`apply_boundary_discount`, which key on `&mut`/containment
+/// and have no React analog). The discount is capped at one class and floored at
+/// class 1, so a world effect is *nudged one notch, never erased* — never to 0.
+/// It never touches `contained` (orthogonal to spec 003).
+///
+/// For a `HookPhase::Render` callback (`useMemo` and the `useState`/`useReducer`
+/// lazy initializers — bodies that run during render), each inherited world
+/// effect additionally earns an `EffectInRender` risk; `HookPhase::Effect`
+/// callbacks (`useEffect` / `useLayoutEffect`) do not — their bodies run outside
+/// render, so running effects there is the honest baseline (≈ full, no discount).
+/// An `Unknown` phase additionally lowers the effect's `confidence` (unknown
+/// invocation schedule).
+pub fn adopt_effects(h: &mut Hotspot, raws: Vec<(HookPhase, RawSignals)>) {
     for (phase, raw) in raws {
-        for mut e in raw.effects {
+        for (mut e, raw_contained) in raw.effects {
+            e.contained = react_contained(&e, raw_contained);
+            // Adopted effects carry no signature ⇒ no spec-003 boundary discount.
             e.discounted_to = None;
+            // Conditionality (phase) discount (spec 027 §2.4): event/unknown-phase
+            // effects run only on interaction ⇒ ONE-class downshift, floored at 1.
+            // Direct write — NOT apply_discount/apply_boundary_discount.
+            if matches!(phase, HookPhase::Event | HookPhase::Unknown) {
+                apply_conditionality_discount(&mut e, phase);
+            }
             e.sync_weight();
             if phase == HookPhase::Render && world_effect(e.kind) {
                 h.risk_features
@@ -380,7 +504,7 @@ pub fn absorb_inherited(h: &mut Hotspot, raws: Vec<(HookPhase, RawSignals)>) {
 /// Recompute `own_score` / `max_class` / `risk_weight` / `confidence` from
 /// `h.effects` + `h.risk_features`, using the core scoring functions.
 ///
-/// Shared by [`augment_component`] and [`absorb_inherited`] after they mutate
+/// Shared by [`augment_component`] and [`adopt_effects`] after they mutate
 /// the effect/risk vectors. Mirrors the fold in [`analyze_unit`] (it does not
 /// touch `async_boundary` / `await_count`, which are body-structural and set
 /// once at collection).
@@ -407,7 +531,7 @@ fn recompute(h: &mut Hotspot) {
 ///
 /// This is the React-two-pass-safe analog of the Rust/Python `build_record`:
 /// because a component's Hotspot has already absorbed its inherited hook-callback
-/// signals (via [`absorb_inherited`]) and its own render-body signals (via
+/// signals (via [`adopt_effects`]) and its own render-body signals (via
 /// [`augment_component`]) by the time we emit, copying `effects` / `risks` /
 /// `async_boundary` / `await_count` straight off `h` guarantees the record's
 /// own-data is *exactly* the Hotspot's own-data — including those absorbed
@@ -581,6 +705,314 @@ mod tests {
             rec.refs.iter().any(|r| r.base == "helper"),
             "expected own-body refs to be populated, got: {:?}",
             rec.refs
+        );
+    }
+
+    // ----- Task 4: React containment classifier -----
+
+    /// Build a `RawSignals` carrying the effects gathered from `fn_name`'s body
+    /// (tuple-preserving), threading an empty ref set. Helper for adoption tests.
+    fn raw_for(src: &str, fn_name: &str) -> RawSignals {
+        let (units, imports, mb, lines, idx) = unit_and_ctx(src, fn_name);
+        raw_signals(&units[idx], &imports, &lines, &mb, &HashSet::new())
+    }
+
+    /// A useState-derived `StateTransition` adopted onto a component must be
+    /// `contained` (own internal state) ⇒ does NOT escape ⇒ stays in `own`.
+    #[test]
+    fn adopted_state_transition_is_contained() {
+        // Component holds state; the StateTransition is augmented onto it.
+        let src = "function C(){ const [v,setV]=useState(0); return v; }";
+        let (units, imports, mb, lines, idx) = unit_and_ctx(src, "C");
+        let mut h = analyze_unit(&units[idx], &imports, &lines, &mb);
+        augment_component(&mut h, &units[idx], &lines);
+        let st = h
+            .effects
+            .iter()
+            .find(|e| e.kind == EffectKind::StateTransition)
+            .expect("expected a state.transition effect");
+        assert!(
+            st.contained,
+            "state.transition is bounded internal state ⇒ contained"
+        );
+        assert!(!st.escapes(), "contained state.transition must not escape");
+    }
+
+    /// A `NetFsDb` adopted from a hook callback must be `contained = false` ⇒
+    /// it escapes and propagates through the fold.
+    #[test]
+    fn adopted_fetch_is_escaping_not_contained() {
+        // Component with an empty body; we adopt a fetching effect callback.
+        let src_c = "function C(){ return null; }";
+        let (units_c, imports_c, mb_c, lines_c, idx_c) = unit_and_ctx(src_c, "C");
+        let mut h = analyze_unit(&units_c[idx_c], &imports_c, &lines_c, &mb_c);
+
+        let cb_src = "function cb(){ fetch('/x'); }";
+        let raw = raw_for(cb_src, "cb");
+        adopt_effects(&mut h, vec![(HookPhase::Effect, raw)]);
+
+        let net = h
+            .effects
+            .iter()
+            .find(|e| e.kind == EffectKind::NetFsDb)
+            .expect("expected an adopted net.fs.db effect");
+        assert!(
+            !net.contained,
+            "a world effect (fetch) is never contained; got contained={}",
+            net.contained
+        );
+        assert!(net.escapes(), "adopted fetch must escape");
+    }
+
+    /// `raw_signals` preserves the `(Effect, contained)` tuple: a body-local
+    /// write inside an adopted callback keeps `contained = true`.
+    #[test]
+    fn raw_signals_preserves_contained_tuple() {
+        let cb_src = "function cb(){ let x = 0; x = 1; }";
+        let raw = raw_for(cb_src, "cb");
+        let (e, contained) = raw
+            .effects
+            .iter()
+            .find(|(e, _)| e.kind == EffectKind::LocalMutation)
+            .expect("expected a local.mutation effect in raw signals");
+        assert!(
+            *contained,
+            "body-local write must keep contained=true in RawSignals"
+        );
+        // And the flag is honoured when the effect is later adopted.
+        let src_c = "function C(){ return null; }";
+        let (units_c, imports_c, mb_c, lines_c, idx_c) = unit_and_ctx(src_c, "C");
+        let mut h = analyze_unit(&units_c[idx_c], &imports_c, &lines_c, &mb_c);
+        adopt_effects(&mut h, vec![(HookPhase::Effect, raw_for(cb_src, "cb"))]);
+        let local = h
+            .effects
+            .iter()
+            .find(|e| e.kind == EffectKind::LocalMutation)
+            .expect("expected adopted local.mutation");
+        assert!(
+            local.contained && !local.escapes(),
+            "adopted body-local write stays contained"
+        );
+        let _ = e; // pattern-bind use
+    }
+
+    /// A `ref-cell-write` adopted from a callback stays `contained = false`
+    /// (escaping) — the conservative 027 default (no DOM-forward classifier).
+    #[test]
+    fn adopted_ref_cell_write_is_escaping_conservative() {
+        // The component declares the ref; the callback writes `.current`.
+        let src_c = "function C(){ const r = useRef(null); return null; }";
+        let (units_c, imports_c, mb_c, lines_c, idx_c) = unit_and_ctx(src_c, "C");
+        let mut h = analyze_unit(&units_c[idx_c], &imports_c, &lines_c, &mb_c);
+
+        // Harvest the callback with the component's ref binding threaded in so
+        // `r.current = …` classifies as ref-cell-write.
+        let cb_src = "function cb(){ r.current = 1; }";
+        let (units_cb, imports_cb, mb_cb, lines_cb, idx_cb) = unit_and_ctx(cb_src, "cb");
+        let mut refs = HashSet::new();
+        refs.insert("r".to_string());
+        let raw = raw_signals(&units_cb[idx_cb], &imports_cb, &lines_cb, &mb_cb, &refs);
+        let has_ref_cell = raw
+            .effects
+            .iter()
+            .any(|(e, _)| e.subreason.as_deref() == Some("ref-cell-write"));
+        assert!(has_ref_cell, "expected a ref-cell-write in raw signals");
+
+        adopt_effects(&mut h, vec![(HookPhase::Effect, raw)]);
+        let rc = h
+            .effects
+            .iter()
+            .find(|e| e.subreason.as_deref() == Some("ref-cell-write"))
+            .expect("expected adopted ref-cell-write");
+        assert!(
+            !rc.contained,
+            "027 keeps ref-cell-write conservatively escaping (no DOM precision)"
+        );
+        assert!(rc.escapes(), "conservative ref-cell-write must escape");
+    }
+
+    /// Finding A (Copilot round-3): `apply_conditionality_discount` must NOT
+    /// overwrite an existing `subreason` (the classification axis) when it applies
+    /// the phase discount. The phase rationale belongs in `discount`, not
+    /// `subreason`. If the effect already has a classification subreason (e.g.
+    /// `"ref-cell-write"` on a `HiddenMutation`), that classification is preserved;
+    /// `discount` always records the event-phase rationale.
+    #[test]
+    fn conditionality_discount_preserves_prior_subreason() {
+        // Build a component with an empty body; adopt a ref-cell-write effect at
+        // event-phase (simulating a `r.current = x` inside a JSX onClick handler
+        // that was adopted into the component).
+        let src_c = "function C(){ const r = useRef(null); return null; }";
+        let (units_c, imports_c, mb_c, lines_c, idx_c) = unit_and_ctx(src_c, "C");
+        let mut h = analyze_unit(&units_c[idx_c], &imports_c, &lines_c, &mb_c);
+
+        // Construct a RawSignals carrying a HiddenMutation with subreason
+        // "ref-cell-write" (class 3, escaping) — as produced by mutation::detect
+        // for a `r.current = x` write.
+        let cb_src = "function cb(){ r.current = 1; }";
+        let (units_cb, imports_cb, mb_cb, lines_cb, idx_cb) = unit_and_ctx(cb_src, "cb");
+        let mut refs = HashSet::new();
+        refs.insert("r".to_string());
+        let raw = raw_signals(&units_cb[idx_cb], &imports_cb, &lines_cb, &mb_cb, &refs);
+
+        // Confirm the raw signal has a ref-cell-write subreason before adoption.
+        assert!(
+            raw.effects
+                .iter()
+                .any(|(e, _)| e.subreason.as_deref() == Some("ref-cell-write")),
+            "pre-condition: raw must carry a ref-cell-write effect"
+        );
+
+        // Adopt at HookPhase::Event → conditionality discount applies.
+        adopt_effects(&mut h, vec![(HookPhase::Event, raw)]);
+
+        let rc = h
+            .effects
+            .iter()
+            .find(|e| e.kind == EffectKind::HiddenMutation)
+            .expect("expected adopted HiddenMutation");
+
+        // The classification subreason must survive — discount must NOT clobber it.
+        assert_eq!(
+            rc.subreason.as_deref(),
+            Some("ref-cell-write"),
+            "conditionality discount must not clobber a prior classification subreason"
+        );
+        // The phase rationale must be in discount, not overwritten into subreason.
+        assert!(
+            rc.discount.is_some(),
+            "discount must carry the event-phase rationale"
+        );
+        assert!(
+            rc.discount.as_deref().unwrap_or("").contains("phase:event"),
+            "discount text must mention phase:event"
+        );
+        // Class-3 effect → discounted to 2 (1-class cap, floor 1).
+        assert_eq!(
+            rc.discounted_to,
+            Some(2),
+            "class-3 ref-cell-write in event phase: down to 2"
+        );
+    }
+
+    /// Finding 3 (Copilot round-4): for an event-phase effect already at the
+    /// class-1 floor (no downshift possible), the phase rationale must STILL be
+    /// recorded (spec §2.4 — the conditionality treatment is recorded so users
+    /// see why it is event-phase), with `discounted_to` left `None` (no class
+    /// change).
+    #[test]
+    fn conditionality_discount_records_rationale_at_class_1_floor() {
+        let mut e = Effect {
+            kind: EffectKind::LocalMutation,
+            class: 1,
+            discounted_to: None,
+            weight: weight_for_class(1),
+            line: 1,
+            col: 1,
+            tier: Tier::Heuristic,
+            hidden: false,
+            contained: false, // escaping
+            evidence: "x = 1".into(),
+            discount: None,
+            subreason: None,
+            confidence: 1.0,
+        };
+        apply_conditionality_discount(&mut e, HookPhase::Event);
+        assert_eq!(
+            e.discounted_to, None,
+            "class-1 floor: no class change, discounted_to stays None"
+        );
+        assert!(
+            e.discount.as_deref().unwrap_or("").contains("phase:event"),
+            "phase rationale recorded in discount even at the class-1 floor"
+        );
+        assert_eq!(
+            e.subreason.as_deref(),
+            Some("phase:event"),
+            "no prior classification → phase subreason recorded"
+        );
+    }
+
+    /// Finding (Copilot round-7): `apply_conditionality_discount` with
+    /// `HookPhase::Unknown` must use DISTINCT "phase:unknown" labels in both
+    /// `discount` and `subreason` — NOT "phase:event". A callback passed to an
+    /// unrecognised `use[A-Z]…` hook (e.g. `useWhatever(() => fetch('/api'))`)
+    /// has an UNKNOWN invocation schedule, not a known event/interaction schedule,
+    /// so labelling it "phase:event" is misleading. Event-phase effects
+    /// (onClick etc.) must still say "phase:event".
+    #[test]
+    fn conditionality_discount_unknown_phase_uses_distinct_label() {
+        // --- Unknown-phase: callback to a custom/unrecognised hook ---
+        let mut e_unknown = Effect {
+            kind: EffectKind::NetFsDb,
+            class: 7,
+            discounted_to: None,
+            weight: weight_for_class(7),
+            line: 1,
+            col: 1,
+            tier: Tier::Path,
+            hidden: false,
+            contained: false,
+            evidence: "fetch('/api')".into(),
+            discount: None,
+            subreason: None,
+            confidence: 1.0,
+        };
+        apply_conditionality_discount(&mut e_unknown, HookPhase::Unknown);
+
+        // discount must NOT mention "phase:event"
+        let discount_text = e_unknown.discount.as_deref().unwrap_or("");
+        assert!(
+            !discount_text.contains("phase:event"),
+            "unknown-phase discount must NOT say phase:event, got: {discount_text:?}"
+        );
+        // discount must say "phase:unknown"
+        assert!(
+            discount_text.contains("phase:unknown"),
+            "unknown-phase discount must say phase:unknown, got: {discount_text:?}"
+        );
+        // subreason must be "phase:unknown"
+        assert_eq!(
+            e_unknown.subreason.as_deref(),
+            Some("phase:unknown"),
+            "unknown-phase: subreason must be phase:unknown, not phase:event"
+        );
+        // class-7 → discounted to 6 (1-class cap)
+        assert_eq!(
+            e_unknown.discounted_to,
+            Some(6),
+            "unknown-phase class-7 effect: discounted one notch to 6"
+        );
+
+        // --- Event-phase: onClick handler still uses "phase:event" ---
+        let mut e_event = Effect {
+            kind: EffectKind::NetFsDb,
+            class: 7,
+            discounted_to: None,
+            weight: weight_for_class(7),
+            line: 2,
+            col: 1,
+            tier: Tier::Path,
+            hidden: false,
+            contained: false,
+            evidence: "fetch('/api')".into(),
+            discount: None,
+            subreason: None,
+            confidence: 1.0,
+        };
+        apply_conditionality_discount(&mut e_event, HookPhase::Event);
+        assert!(
+            e_event
+                .discount
+                .as_deref()
+                .unwrap_or("")
+                .contains("phase:event"),
+            "event-phase discount must still say phase:event"
+        );
+        assert_eq!(
+            e_event.subreason.as_deref(),
+            Some("phase:event"),
+            "event-phase: subreason must remain phase:event"
         );
     }
 }

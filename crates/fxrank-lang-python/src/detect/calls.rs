@@ -324,7 +324,7 @@ fn classify_resolved(full: &str) -> Option<(EffectKind, Tier)> {
         return Some((EnvRead, Tier::Path));
     }
 
-    // ── logging (class 4) ──
+    // ── logging (class 2) ──
     if root == "logging" {
         return Some((Logging, Tier::Path));
     }
@@ -391,7 +391,7 @@ mod tests {
 
         let io: Vec<_> = by_fn["io_boundary"].clone();
         assert!(io.contains(&(NetFsDb, 7))); // open + requests.get
-        assert!(io.contains(&(Logging, 4))); // logging.info
+        assert!(io.contains(&(Logging, 2))); // logging.info
 
         let env = &by_fn["env_and_rng"];
         assert!(env.contains(&(ProcessControl, 6))); // subprocess.run
@@ -536,6 +536,53 @@ mod tests {
             net[0].col, net[1].col,
             "two open() calls on the same line must have distinct cols, got col={} and col={}",
             net[0].col, net[1].col
+        );
+    }
+
+    /// Regression pin (spec 028 §2.3): `TimeRead` and `Random` call-effects are world
+    /// effects and must never be marked contained.  They are scored as escaping so that
+    /// cross-file propagation folds them into callers — a future containment discount
+    /// (e.g. a per-kind flag or a caller-site wrap) would silently wash the score unless
+    /// this pin catches it.
+    ///
+    /// The `analyze_fixture` helper returns `(EffectKind, class)` pairs and drops the
+    /// `contained` field; this test uses `effects_for_src` instead to inspect the raw
+    /// `Effect` struct directly.
+    #[test]
+    fn time_read_and_random_are_not_contained() {
+        let src = "import time\nimport random\ndef f():\n    t = time.time()\n    r = random.random()\n    return t + r\n";
+        let effects = effects_for_src(src);
+
+        let time_effect = effects
+            .iter()
+            .find(|e| e.kind == TimeRead)
+            .expect("time.time() must emit a TimeRead effect");
+        assert!(
+            !time_effect.contained,
+            "TimeRead must be escaping (contained=false); got contained=true — \
+             time is a world effect and must propagate to callers"
+        );
+        assert!(
+            time_effect.escapes(),
+            "TimeRead must satisfy escapes() — contained={} kind={:?}",
+            time_effect.contained,
+            time_effect.kind
+        );
+
+        let rng_effect = effects
+            .iter()
+            .find(|e| e.kind == Random)
+            .expect("random.random() must emit a Random effect");
+        assert!(
+            !rng_effect.contained,
+            "Random must be escaping (contained=false); got contained=true — \
+             random is a world effect and must propagate to callers"
+        );
+        assert!(
+            rng_effect.escapes(),
+            "Random must satisfy escapes() — contained={} kind={:?}",
+            rng_effect.contained,
+            rng_effect.kind
         );
     }
 }

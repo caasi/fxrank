@@ -5,6 +5,8 @@ pub mod detect;
 pub mod functions;
 pub mod imports;
 pub mod module_map;
+pub mod ownership;
+pub mod provenance;
 pub mod react;
 pub mod source;
 pub mod tsconfig;
@@ -169,19 +171,26 @@ impl Frontend for TsFrontend {
     }
 }
 
-/// Score every `FnUnit` in one parsed file, routing inline hook-callback arrows
-/// into the components that own them (the React two-pass).
+/// Score every `FnUnit` in one parsed file, re-parenting the nested units a
+/// component OWNS into that component (the React two-pass).
 ///
-/// **Pass 1** — find the components (`returns_jsx`), their `useRef`-binding sets,
-/// and the inline arrows they pass to built-in hooks (`inherited_callbacks`),
-/// keyed by `(line, col)`.
+/// **Pass 1 — ownership resolution.** Recognize components via
+/// [`react::is_component`], then for each component run
+/// [`ownership::resolve_ownership`] to walk its full lexical subtree (any depth)
+/// and decide which nested function units it OWNS. An owned unit is one whose
+/// value-flow stays inside the component: inline hook-callback arrows, inline
+/// JSX-handler arrows, and bare-ident JSX handlers resolving to a local
+/// function. Received / imported / non-function / unknown values are NOT owned —
+/// they stay standalone, reached over the call graph. Each owned unit has a
+/// single lexical parent, so the global `owned` map records `unit_id → (owning
+/// component id, phase)` with no double-ownership.
 ///
-/// **Pass 2** — score each unit. An arrow whose `(line, col)` is an inherited
-/// callback is **suppressed** as a standalone hotspot; its raw (pre-discount)
-/// signals are stashed and later folded into the owning component
-/// (`absorb_inherited`). A component's own hotspot is additionally augmented with
-/// its render-body React signals (`augment_component`). Emission order matches
-/// the input unit order.
+/// **Pass 2 — score + re-parent.** An owned unit is **suppressed** (no standalone
+/// hotspot, no record); its raw (pre-discount) effects + outgoing refs are MOVED
+/// onto the owning component (`detect::adopt_effects`), so every effect has
+/// exactly one owner (no double-count). A component's own hotspot is additionally
+/// augmented with its render-body React signals (`augment_component`). Emission
+/// order matches the input unit order.
 fn analyze_units(
     units: &[FnUnit],
     imports: &ImportTable,
@@ -191,60 +200,89 @@ fn analyze_units(
     out: &mut Vec<Hotspot>,
     records: &mut Vec<fxrank_core::record::UnitRecord>,
 ) {
-    // Pass 1: components, their ref-binding sets, and the inherited arrows.
+    // Pass 1: recognize components and resolve tree-aware ownership. The `owned`
+    // map keys every adopted unit by id → (owning component id, phase). A unit
+    // has a single lexical parent, so a later component cannot re-own it (first
+    // owner wins; in practice subtrees do not overlap).
     let components: Vec<&FnUnit> = units
         .iter()
-        .filter(|u| react::returns_jsx(&u.body))
+        .filter(|u| react::is_component(u, &u.path).is)
         .collect();
     let comp_refs: HashMap<String, HashSet<String>> = components
         .iter()
         .map(|c| (c.id.clone(), react::ref_bindings(&c.body)))
         .collect();
-    // (line, col) of an inline hook arrow -> (owning component id, phase).
-    let mut inherited: HashMap<(usize, usize), (String, react::HookPhase)> = HashMap::new();
+    // unit_id -> (owning component id, phase).
+    let mut owned: HashMap<String, (String, react::HookPhase)> = HashMap::new();
+    // Imported function values a component passes as a prop/hook-arg surface as
+    // graph edges (spec 027 §4.5 #2): the import owns the effects, so they
+    // PROPAGATE to the component via the cross-file fold (never copied). Keyed by
+    // owning component id; merged into the component's record refs below.
+    let mut imported_edges: HashMap<String, Vec<CallSiteRef>> = HashMap::new();
+    // component id → unknown_count from ownership resolution (spec 027 §4.5):
+    // each Unknown-provenance function value the component passes as a prop/hook-arg
+    // could not be classified, so we lower the component's confidence after the
+    // final recompute. Stored here (Pass 1) and consumed after adopt_effects (Pass 2).
+    let mut comp_unknown: HashMap<String, usize> = HashMap::new();
     for c in &components {
-        for ((l, col), phase) in react::inherited_callbacks(&c.body, lines) {
-            inherited.insert((l, col), (c.id.clone(), phase));
+        let prov = crate::provenance::ProvenanceTable::build(c, imports);
+        let adoption = ownership::resolve_ownership(c, units, &prov, imports, lines, module_map);
+        for (unit_id, ctx) in adoption.owned {
+            // First lexical owner wins (single parent; defensive against any
+            // overlap from a future relaxation of the frontier).
+            owned.entry(unit_id).or_insert((c.id.clone(), ctx.phase));
+        }
+        if !adoption.edges.is_empty() {
+            imported_edges
+                .entry(c.id.clone())
+                .or_default()
+                .extend(adoption.edges);
+        }
+        if adoption.unknown_count > 0 {
+            *comp_unknown.entry(c.id.clone()).or_insert(0) += adoption.unknown_count;
         }
     }
 
-    // Pass 2: score each unit, routing inherited arrows into their component.
+    // Pass 2: score each unit, re-parenting owned units into their component.
     let mut by_id: HashMap<String, Hotspot> = HashMap::new();
+    // id -> component-recognition confidence (< 1.0 for a weak PascalCase+.tsx
+    // recognition). Applied in the final recompute loop as a min-clamp so a
+    // re-recompute (adopt_effects) cannot overwrite it. Spec 027 §4.5.
+    let mut comp_recognition_conf: HashMap<String, f64> = HashMap::new();
     // id -> &FnUnit for every emitted (non-suppressed) unit, so the final loop
     // can recover the unit to build its record (path/col + own-body refs).
-    // Suppressed arrows are never inserted here (they `continue` below), so a
-    // record is built iff a Hotspot is pushed → 1:1.
+    // Suppressed (owned) units are never inserted here (they `continue` below),
+    // so a record is built iff a Hotspot is pushed → 1:1.
     let mut unit_by_id: HashMap<&str, &FnUnit> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut pending: HashMap<String, Vec<(react::HookPhase, detect::RawSignals)>> = HashMap::new();
-    // Outgoing call refs absorbed from suppressed hook-callback arrows, keyed by
-    // the owning component id. These are merged into the component's record refs
-    // so that cross-file propagation can follow calls made inside hook callbacks
+    // Outgoing call refs harvested from suppressed owned units, keyed by the
+    // owning component id. These are merged into the component's record refs so
+    // that cross-file propagation can follow calls made inside owned handlers
     // (e.g. `useEffect(() => helper())` gives the component an edge to `helper`).
     let mut pending_refs: HashMap<String, Vec<CallSiteRef>> = HashMap::new();
     // Shared empty set used as a borrow fallback when a component has no ref bindings.
-    // Avoids cloning the per-component HashSet<String> for every suppressed callback.
+    // Avoids cloning the per-component HashSet<String> for every suppressed unit.
     let empty_refs: HashSet<String> = HashSet::new();
     for unit in units {
-        // `unit.col` is a real field (Task 4) — NEVER parse it out of `id`.
-        let key = (unit.line, unit.col);
-        if let Some((comp_id, phase)) = inherited.get(&key).cloned() {
-            // Suppress this arrow as a standalone hotspot; stash its raw signals.
-            // Thread the owning component's ref-binding set so a `r.current = …`
-            // write inside this callback still classifies as ref-cell-write (the
-            // arrow alone can't know `r` is a useRef binding from the component).
+        if let Some((comp_id, phase)) = owned.get(&unit.id).cloned() {
+            // Suppress this owned unit as a standalone hotspot; harvest its raw
+            // signals. Thread the owning component's ref-binding set so a
+            // `r.current = …` write inside this unit still classifies as
+            // ref-cell-write (the unit alone can't know `r` is a useRef binding
+            // from the component).
             let refs = comp_refs.get(comp_id.as_str()).unwrap_or(&empty_refs);
             let raw = detect::raw_signals(unit, imports, lines, module_bindings, refs);
             pending
                 .entry(comp_id.clone())
                 .or_default()
                 .push((phase, raw));
-            // Also collect this arrow's outgoing call refs so the component's
-            // record carries edges to functions called inside hook callbacks.
+            // Also collect this unit's outgoing call refs so the component's
+            // record carries edges to functions called inside owned handlers.
             // `refs::extract` uses own-body semantics (stops at nested arrows/fns),
-            // which is correct here — the callback IS the body we want.
-            // Pass the arrow's file path (same as the component's) + the map so
-            // absorbed refs also carry resolved_target.
+            // which is correct here — this unit's own body is what we want; its
+            // own owned children are harvested separately as their own pending
+            // entries.
             let arrow_refs =
                 detect::refs::extract(&unit.body, imports, lines, &unit.path, module_map);
             if !arrow_refs.is_empty() {
@@ -253,23 +291,29 @@ fn analyze_units(
             continue;
         }
         let mut h = detect::analyze_unit(unit, imports, lines, module_bindings);
-        if react::returns_jsx(&unit.body) {
+        let signal = react::is_component(unit, &unit.path);
+        if signal.is {
             detect::augment_component(&mut h, unit, lines);
+            // Spec 027 §4.5: a weak recognition (PascalCase + `.tsx` alone, no
+            // JSX/hook strong signal) carries confidence < 1.0. Min-clamp it into
+            // the hotspot so the heuristic uncertainty of "is this even a
+            // component?" surfaces (mirrors the unknown_count penalty below).
+            comp_recognition_conf.insert(unit.id.clone(), signal.confidence);
         }
         by_id.insert(unit.id.clone(), h);
         unit_by_id.insert(unit.id.as_str(), unit);
         order.push(unit.id.clone());
     }
 
-    // Fold each component's inherited raw signals in, then recompute.
+    // Fold each component's harvested raw signals in, then recompute.
     for (comp_id, raws) in pending {
         if let Some(h) = by_id.get_mut(&comp_id) {
-            detect::absorb_inherited(h, raws);
+            detect::adopt_effects(h, raws);
         }
     }
 
     for id in order {
-        let h = by_id.remove(&id).expect("hotspot present for ordered id");
+        let mut h = by_id.remove(&id).expect("hotspot present for ordered id");
         // Build the record FROM the final Hotspot (own-data copied, incl. a
         // component's absorbed inherited signals), then push both 1:1.
         // Pass the absorbed arrow refs so cross-file propagation can follow
@@ -277,7 +321,35 @@ fn analyze_units(
         let unit = unit_by_id
             .get(id.as_str())
             .expect("unit present for ordered id");
-        let absorbed_refs = pending_refs.remove(id.as_str()).unwrap_or_default();
+
+        // Spec 027 §4.5: lower the component's confidence by any Unknown-provenance
+        // function values the ownership pass encountered. Unknown values are function
+        // values passed as JSX props or hook args whose provenance the analyzer
+        // could not classify (not Imported, not Received, not LocalDefined). Each
+        // unknown source means the component's effect surface may include effects
+        // we missed — a genuine heuristic uncertainty. Apply a per-unknown 0.9
+        // multiplier (conservative, same scale as the shadowed-path penalty), then
+        // take the min against the already-computed confidence so `function_confidence`'s
+        // weakest-link invariant holds. This runs AFTER adopt_effects (last recompute)
+        // so the penalty is not overwritten.
+        if let Some(&unknown_count) = comp_unknown.get(id.as_str()) {
+            let penalty = 0.9_f64.powi(unknown_count as i32);
+            h.confidence = h.confidence.min(penalty);
+        }
+
+        // Spec 027 §4.5 (Copilot finding #37): min-clamp by the component-
+        // recognition confidence. A weak recognition (PascalCase + `.tsx` alone,
+        // no JSX/hook strong signal) carries 0.8; this surfaces the heuristic
+        // uncertainty of the component-vs-plain-function call. Runs in the last
+        // recompute so `adopt_effects` cannot overwrite it (weakest-link min).
+        if let Some(&recog_conf) = comp_recognition_conf.get(id.as_str()) {
+            h.confidence = h.confidence.min(recog_conf);
+        }
+
+        let mut absorbed_refs = pending_refs.remove(id.as_str()).unwrap_or_default();
+        // Plus the imported-handler edges this component passed as a prop/hook-arg
+        // (spec 027 §4.5 #2) — so the import's effects propagate via the fold.
+        absorbed_refs.extend(imported_edges.remove(id.as_str()).unwrap_or_default());
         records.push(detect::record_from_hotspot(
             unit,
             &h,
@@ -659,6 +731,119 @@ mod tests {
         assert!(
             is_resolved,
             ".tsx→.ts relative import must resolve cross-dialect (Edge::Resolved)"
+        );
+    }
+
+    /// Task 1: verify that a default-exported component's body effects do NOT
+    /// appear as a `<module>` unit. Function-decl bodies are excluded from
+    /// `module_init_unit` by construction (only top-level statements enter it).
+    ///
+    /// Task 3 wired `is_component` into `analyze_units`, so the `App` unit is
+    /// recognised as a component and its body effects are never re-emitted as a
+    /// `<module>` unit (function-decl bodies never enter `module_init_unit`).
+    #[test]
+    fn default_export_component_body_not_in_module_unit() {
+        let src = "import React,{useState} from 'react';\n\
+                   export default function App(){ const [v,setV]=useState(0); fetch('/a'); return null; }\n";
+        let (out, _records) = analyze_src(src);
+        // App is recognized + owns the fetch; there must be NO <module> hotspot
+        // carrying that fetch (function-decl bodies never enter module_init_unit).
+        assert!(out.iter().any(|h| h.symbol == "App"));
+        assert!(
+            !out.iter().any(|h| h.symbol == "<module>"),
+            "App's body effects must not also appear as a <module> unit"
+        );
+    }
+
+    /// Spec 027 §4.5: a component that passes an Unknown-provenance function value
+    /// (a bare ident the analyzer cannot classify — not imported, not a local fn,
+    /// not a param) as a JSX prop must have its confidence lowered below 1.0.
+    ///
+    /// Scenario: `Comp` passes `onClick={unknownHandler}` where `unknownHandler`
+    /// is not imported, not declared locally, and not a param — provenance resolves
+    /// to `Unknown`, bumping `adoption.unknown_count`. `analyze_units` must consume
+    /// this and lower `h.confidence` by the 0.9-per-unknown penalty.
+    ///
+    /// The test verifies the FAIL-before / PASS-after contract:
+    ///   - Before the fix, `unknown_count` is computed but never consumed;
+    ///     `h.confidence` stays at 1.0 (no effects → `function_confidence(&[]) == 1.0`).
+    ///   - After the fix, the 0.9 penalty is applied: `confidence < 1.0`.
+    #[test]
+    fn unknown_provenance_handler_lowers_component_confidence() {
+        // `Comp` passes a JSX prop whose value is an ident with Unknown provenance
+        // (not imported, not a local fn, not a param — resolve → Unknown).
+        // The component body has no other effects, so without the unknown_count
+        // penalty the confidence would be exactly 1.0.
+        let src = "function Comp() {\n\
+                   return <button onClick={unknownHandler}/>;\n\
+                   }\n";
+        let (out, _records) = analyze_src(src);
+        let comp = out
+            .iter()
+            .find(|h| h.symbol == "Comp")
+            .expect("Comp hotspot present");
+        assert!(
+            comp.confidence < 1.0,
+            "a component with Unknown-provenance prop handler must have confidence < 1.0; \
+             got confidence={}",
+            comp.confidence
+        );
+        // The penalty should be exactly 0.9^1 = 0.9 for one unknown.
+        assert!(
+            (comp.confidence - 0.9).abs() < 1e-9,
+            "one unknown handler should lower confidence to 0.9 (penalty = 0.9^1); \
+             got confidence={}",
+            comp.confidence
+        );
+    }
+
+    /// Task 7: proves ONE fold implementation — React inheritance rides the shared
+    /// `fxrank_core::fold` (via `Effect::escapes()`), no second bespoke absorption path.
+    ///
+    /// A component with both `useState` (CONTAINED) and an `onClick` `fetch` (ESCAPING)
+    /// is examined at the record level. The shared fold seeds from `Effect::escapes()`:
+    /// - `state.transition` has `contained = true` ⇒ `!escapes()` ⇒ stays in `own`, NOT propagated.
+    /// - `net.fs.db` (fetch) has `contained = false` ⇒ `escapes()` ⇒ propagated through fold.
+    ///
+    /// This is the record-level pre-condition test (matching
+    /// `hook_callback_refs_routed_into_component_record`). The actual propagation fold
+    /// lives in `fxrank-cli`; what we verify here is that the correct `contained` / `escapes()`
+    /// flags are set on the component's record effects — which is what drives the fold.
+    #[test]
+    fn contained_state_stays_own_escaping_fetch_propagates_via_record() {
+        let src = "import React,{useState} from 'react';\n\
+                   function C(){ const [v,setV]=useState(0); \
+                     return <button onClick={() => fetch('/x')}/>; }\n";
+        let (out, records) = analyze_src(src);
+        let c = out.iter().find(|h| h.symbol == "C").unwrap();
+        let rec = records.iter().find(|r| r.unit_id == c.id).unwrap();
+
+        // state.transition is contained → does NOT escape (won't propagate).
+        let st = rec
+            .effects
+            .iter()
+            .find(|e| e.kind == fxrank_core::effect::EffectKind::StateTransition)
+            .expect("component record must carry a state.transition effect from useState");
+        assert!(
+            !st.escapes(),
+            "contained state.transition must not escape (stays in own, no propagation); \
+             contained={}, escapes()={}",
+            st.contained,
+            st.escapes()
+        );
+
+        // net.fs.db (fetch inside onClick → Event-phase → adopted, escaping) → WILL propagate.
+        let f = rec
+            .effects
+            .iter()
+            .find(|e| e.kind == fxrank_core::effect::EffectKind::NetFsDb)
+            .expect("component record must carry a net.fs.db effect from the onClick fetch");
+        assert!(
+            f.escapes(),
+            "escaping fetch must escape (propagates via the shared fold); \
+             contained={}, escapes()={}",
+            f.contained,
+            f.escapes()
         );
     }
 

@@ -1,0 +1,71 @@
+---
+source: crates/fxrank-lang-ts/tests/react.rs
+expression: snapshot
+---
+[
+  {
+    "async_boundary": false,
+    "await_count": 0,
+    "confidence": 0.9,
+    "effects": [
+      {
+        "class": 7,
+        "discounted_to": null,
+        "hidden": false,
+        "kind": "net.fs.db",
+        "subreason": null,
+        "tier": "path"
+      }
+    ],
+    "max_class": 7,
+    "own_score": 21.0,
+    "risk_features": [
+      {
+        "class": 4,
+        "kind": "effect.in.render"
+      }
+    ],
+    "risk_weight": 5,
+    "symbol": "RenderPhase"
+  },
+  {
+    "async_boundary": false,
+    "await_count": 0,
+    "confidence": 0.9,
+    "effects": [
+      {
+        "class": 7,
+        "discounted_to": null,
+        "hidden": false,
+        "kind": "net.fs.db",
+        "subreason": null,
+        "tier": "path"
+      }
+    ],
+    "max_class": 7,
+    "own_score": 21.0,
+    "risk_features": [],
+    "risk_weight": 0,
+    "symbol": "EffectPhase"
+  },
+  {
+    "async_boundary": false,
+    "await_count": 0,
+    "confidence": 0.9,
+    "effects": [
+      {
+        "class": 7,
+        "discounted_to": 6,
+        "hidden": false,
+        "kind": "net.fs.db",
+        "subreason": "phase:event",
+        "tier": "path"
+      }
+    ],
+    "max_class": 6,
+    "own_score": 13.0,
+    "risk_features": [],
+    "risk_weight": 0,
+    "symbol": "EventPhase"
+  }
+]

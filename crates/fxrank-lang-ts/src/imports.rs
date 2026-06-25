@@ -288,6 +288,13 @@ impl ImportTable {
         self.map.get(local).map(|e| &e.target)
     }
 
+    /// Iterate the local names bound by every `import` / `require()` in this
+    /// file. Used by the provenance pass (spec 027 §4.3) to seed imported
+    /// bindings as [`crate::provenance::Provenance::Imported`].
+    pub fn local_names(&self) -> impl Iterator<Item = &str> {
+        self.map.keys().map(|s| s.as_str())
+    }
+
     /// Returns `true` if any dynamic or unresolvable import was found.
     ///
     /// Callers may apply a confidence penalty when this is `true`, because a

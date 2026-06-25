@@ -1,0 +1,45 @@
+---
+source: crates/fxrank-lang-ts/tests/react.rs
+expression: snapshot
+---
+[
+  {
+    "async_boundary": false,
+    "await_count": 0,
+    "confidence": 1.0,
+    "effects": [],
+    "max_class": 0,
+    "own_score": 0.0,
+    "risk_features": [],
+    "risk_weight": 0,
+    "symbol": "CallbackChild"
+  },
+  {
+    "async_boundary": false,
+    "await_count": 0,
+    "confidence": 0.6,
+    "effects": [
+      {
+        "class": 1,
+        "discounted_to": null,
+        "hidden": false,
+        "kind": "state.transition",
+        "subreason": "useState",
+        "tier": "heuristic"
+      },
+      {
+        "class": 7,
+        "discounted_to": 6,
+        "hidden": false,
+        "kind": "net.fs.db",
+        "subreason": "phase:event",
+        "tier": "path"
+      }
+    ],
+    "max_class": 6,
+    "own_score": 13.5,
+    "risk_features": [],
+    "risk_weight": 0,
+    "symbol": "CallbackParent"
+  }
+]

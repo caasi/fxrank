@@ -60,10 +60,10 @@ impl EffectKind {
             NetFsDb => 7,
             ProcessControl | EnvWrite | Concurrency => 6,
             TimeRead | Random => 5,
-            EnvRead | Logging | Panic => 4,
+            EnvRead | Panic => 4,
             GlobalMutation => 6,
             HiddenMutation | ParamMutation => 3,
-            AmbientRead | UnknownMacro | ExternalUnresolved => 2,
+            AmbientRead | UnknownMacro | ExternalUnresolved | Logging => 2,
             LocalMutation | StateTransition => 1,
             ThisMutation => 3,
         }
@@ -216,6 +216,7 @@ mod tests {
         assert_eq!(EffectKind::GlobalMutation.base_class(), 6); // spec default, not 3
         assert_eq!(EffectKind::HiddenMutation.base_class(), 3);
         assert_eq!(EffectKind::UnknownMacro.base_class(), 2);
+        assert_eq!(EffectKind::Logging.base_class(), 2);
         assert_eq!(RiskKind::Transmute.class(), 7);
         assert_eq!(RiskKind::MemForget.wire(), "mem.forget");
         assert_eq!(RiskKind::ImplDrop.class(), 2);
