@@ -4,7 +4,7 @@ use fxrank_core::frontend::{FrontendOutput, Language, SourceFile};
 use fxrank_core::graph::CallGraph;
 use fxrank_core::model::{Diagnostic, Report, Scope};
 use fxrank_core::record::{ExternalReach, UnitRecord};
-use fxrank_core::resolve::{SymbolIndex, resolve_ref};
+use fxrank_core::resolve::{CanonicalIndex, resolve_ref_precise};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::PathBuf;
@@ -252,9 +252,9 @@ fn run_scan(
             // `idx` owns a cloned `HashMap` so building it from `&group` does NOT
             // borrow `group` past this line — no conflict when `group` moves into
             // `from_records`.
-            let idx = SymbolIndex::from_records(&group);
+            let idx = CanonicalIndex::from_records(&group);
             let graph = CallGraph::from_records(group, |r, owner, _nodes| {
-                resolve_ref(r, &idx, &owner.path) // returns Option<Edge> directly
+                resolve_ref_precise(r, &idx, &owner.path) // returns Option<Edge> directly
             });
             let folded = fold(&graph);
             apply_fold(&mut output.functions, &graph, &folded);
@@ -933,7 +933,8 @@ mod tests {
                 col: 1,
                 symbol: symbol.into(),
                 is_root: false,
-                export: None,
+                canonical_path: vec![],
+                aliases: vec![],
                 effects: vec![],
                 risks: vec![],
                 refs: vec![],
@@ -1008,6 +1009,7 @@ mod tests {
             col: 5,
             qualified: false,
             first_party: false,
+            resolved_target: None,
         };
 
         // Rust per-language index: resolves to exactly the Rust helper.
