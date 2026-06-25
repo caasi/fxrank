@@ -596,5 +596,3 @@ Add per-principle acceptance fixtures and validate the attribution metrics on om
 - Run `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` from the worktree before each commit.
 - Snapshots are re-accepted in Task 8 only — do not accept partial snapshots mid-stream.
 - Validate the plan via review-loop (per CLAUDE.md) before executing.
-</content>
-</invoke>
