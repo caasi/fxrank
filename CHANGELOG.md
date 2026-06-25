@@ -6,6 +6,60 @@ All notable changes to FxRank are documented here. The format follows
 schema may still change between releases, including patch releases — as the `id` format
 did in 0.1.1).
 
+## [0.4.0] - 2026-06-26
+
+A large release: effects now propagate **across files**, module resolution is
+**precise** (no more name-based false-resolves) in all three frontends, and the
+**React effect-scoring model is redesigned** alongside a cross-language scoring-table
+rebaseline. **Pre-1.0 output change (substantial):** scores, rankings, and the report
+schema all shift — a component now owns the effects of the handlers/hooks it defines,
+logging is re-weighted, and per-function `propagated_*`/`inherited[]`/`external_reaches[]`
+fields are added.
+
+### Added
+
+- **Cross-file resolution + transitive effect propagation** (specs 025 / 025-3e,
+  [#25]/[#28]/[#36]). A scan now resolves calls across the scanned files and folds
+  **escaping** effects along the call graph, so a function's `propagated_score` reflects
+  the effect blast-radius of everything it (transitively) calls — closing the
+  extract-method score-washing hole. New report fields: `propagated_score` /
+  `propagated_max_class`, an `inherited[]` provenance list per hotspot, a `root`
+  annotation (the agent's observation focus — explicit FILE args), and
+  `scope.external_reaches[]` (the app's outward dependency surface). `--no-resolve`
+  disables the pass (own-body scores only). Own-body output is byte-identical to pre-025.
+- **Precise cross-file module resolution** ([#36], spec 025-3e) across Rust/TS/Python —
+  replaces last-path-segment name matching (which false-resolved `std::fs::write` to a
+  lone `Foo::write`) with path-precise, never-guess resolution.
+- **TS cross-dialect resolution** ([#41]) — `.tsx`↔`.ts` imports (relative and alias)
+  now resolve as one TS module namespace.
+- **TS `tsconfig.json` `paths` aliases** via a tsc-compatible `--project`/`-p` flag
+  (025-3e) — `@/…`-style imports fold into propagation.
+- **`CorpusProfile`** ([#21]) — frontend-owned corpus hygiene: the `--exclude` default is
+  the union of the enabled frontends' profiles, plus a `pyvenv.cfg` content-marker prune.
+
+### Changed
+
+- **React effect-scoring redesign** ([#37], spec 027). A component is scored as CPS
+  (`value` props in, `onXxx`/JSX out): it **owns every effect lexically defined in its
+  body** (render + all hooks + all handlers, any depth, incl. `useMutation`/`useQuery`
+  object-arg callbacks and `return null` components) **minus** what it hands across the
+  boundary (received callbacks/refs are the consumer's). Adds a **CPS containment
+  discount** (internal state/ref/memo stay in `own`; world effects propagate) and an
+  **event-phase conditionality discount** (capped 1 class, floored, recorded). Replaces
+  the allowlist/single-hop two-pass and unifies on the shared fold. *Effect:* the
+  effect-blind 84%-own=0 problem and 55 orphan IO handlers (dogfood) collapse — handlers'
+  effects now attribute to their components.
+- **Cross-language scoring-table rebaseline** (spec 028). `Logging` class **4 → 2** (a
+  benign output, no longer dominating); `time`/`random` codified as escaping world
+  effects. Affects Rust/Python/TS rankings.
+
+[#21]: https://github.com/caasi/fxrank/issues/21
+[#25]: https://github.com/caasi/fxrank/issues/25
+[#28]: https://github.com/caasi/fxrank/issues/28
+[#36]: https://github.com/caasi/fxrank/issues/36
+[#37]: https://github.com/caasi/fxrank/issues/37
+[#41]: https://github.com/caasi/fxrank/issues/41
+
 ## [0.3.0] - 2026-06-23
 
 This release aligns mutation classification across all three frontends and adds a
@@ -113,6 +167,7 @@ rankings shift for affected code.
   skipped by default (`--include-tests` to score it).
 - Slim, feature-gated builds (`--features rust`, `--features ts`).
 
+[0.4.0]: https://github.com/caasi/fxrank/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/caasi/fxrank/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/caasi/fxrank/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/caasi/fxrank/compare/v0.1.0...v0.1.1
