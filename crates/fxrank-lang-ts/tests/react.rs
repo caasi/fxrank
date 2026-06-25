@@ -977,6 +977,71 @@ fn useref_data_arg_not_adopted_as_callback() {
     );
 }
 
+/// Finding (Copilot R6, #37): a non-`on*` JSX prop (render-prop like `renderItem`)
+/// is render-phase, NOT event-phase. Routing it as `Event` wrongly gives the
+/// conditionality discount — a world effect there runs during render (or on an
+/// unknown schedule), so it must score at full weight (`discounted_to == None`)
+/// AND earn `EffectInRender`.
+///
+/// Contrast with `onClick` (event-phase, discounted 7 → 6, no `EffectInRender`).
+#[test]
+fn render_prop_fetch_is_render_phase_no_conditionality_discount() {
+    // A non-`on*` prop: `renderItem={() => fetch('/x')}` runs during render.
+    let hs = util::analyze_tsx("function C(){ return <List renderItem={() => fetch('/x')}/>; }");
+    let c = hs.iter().find(|h| h.symbol == "C").expect("C");
+
+    let fetch = c
+        .effects
+        .iter()
+        .find(|e| e.kind == fxrank_core::effect::EffectKind::NetFsDb)
+        .expect("C owns the renderItem fetch (net.fs.db)");
+
+    // No conditionality discount — render-prop runs during render, not conditionally
+    // on user interaction.
+    assert_eq!(fetch.class, 7, "base class unchanged");
+    assert_eq!(
+        fetch.discounted_to, None,
+        "render-prop is render-phase: must NOT get the conditionality discount (was wrongly Some(6) before fix)"
+    );
+
+    // AND the world effect in render phase earns EffectInRender.
+    assert!(
+        c.risk_features
+            .iter()
+            .any(|r| r.kind == fxrank_core::effect::RiskKind::EffectInRender),
+        "render-prop fetch runs during render: C must carry EffectInRender (was missing before fix)"
+    );
+}
+
+/// Regression guard for the render-prop fix: `onClick` (an `on*` prop) must
+/// STILL get the event-phase conditionality discount (7 → 6) and must NOT carry
+/// `EffectInRender`. The render-prop fix must not change `on*` behavior.
+#[test]
+fn onclick_prop_is_still_event_phase_after_render_prop_fix() {
+    let hs = util::analyze_tsx("function C(){ return <button onClick={() => fetch('/x')}/>; }");
+    let c = hs.iter().find(|h| h.symbol == "C").expect("C");
+
+    let fetch = c
+        .effects
+        .iter()
+        .find(|e| e.kind == fxrank_core::effect::EffectKind::NetFsDb)
+        .expect("C owns the onClick fetch");
+
+    assert_eq!(fetch.class, 7, "base class unchanged");
+    assert_eq!(
+        fetch.discounted_to,
+        Some(6),
+        "onClick is event-phase: conditionality discount 7→6 must still apply"
+    );
+    assert_eq!(fetch.subreason.as_deref(), Some("phase:event"));
+    assert!(
+        c.risk_features
+            .iter()
+            .all(|r| r.kind != fxrank_core::effect::RiskKind::EffectInRender),
+        "onClick handler is event-time: C must not carry EffectInRender"
+    );
+}
+
 /// Finding 2 (Copilot, #37): `useInsertionEffect` IS an effect-phase hook (its
 /// args[0] is an effect callback, exactly like `useEffect`) — the explicit arm
 /// must keep adopting it so the regression is avoided.

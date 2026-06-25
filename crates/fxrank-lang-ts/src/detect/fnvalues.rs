@@ -36,7 +36,9 @@
 
 use std::collections::HashMap;
 
-use swc_ecma_ast::{ArrowExpr, CallExpr, Callee, Expr, JSXAttr, JSXAttrValue, JSXExpr};
+use swc_ecma_ast::{
+    ArrowExpr, CallExpr, Callee, Expr, JSXAttr, JSXAttrName, JSXAttrValue, JSXExpr,
+};
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::functions::FnBodyOwned;
@@ -178,16 +180,16 @@ impl FnValueWalker<'_> {
     ///
     /// JSX handlers run on interaction ⇒ **event phase** (spec 027 §2.4): their
     /// effects are conditional on interaction and earn the conditionality discount.
-    fn handle_jsx_prop_value(&mut self, e: &Expr) {
+    fn handle_jsx_prop_value(&mut self, e: &Expr, phase: HookPhase) {
         match e {
-            // `onClick={() => …}` — inline arrow handler (event phase).
-            Expr::Arrow(a) => self.push_arrow(a, HookPhase::Event),
-            // `onClick={function(){…}}` — inline fn-expr handler (event phase).
-            Expr::Fn(f) => self.push_fn_expr(f, HookPhase::Event),
-            // `onClick={handleClick}` — bare-ident handler.
+            // inline arrow handler — phase determined by the attribute name.
+            Expr::Arrow(a) => self.push_arrow(a, phase),
+            // inline fn-expr handler — phase determined by the attribute name.
+            Expr::Fn(f) => self.push_fn_expr(f, phase),
+            // bare-ident handler — phase determined by the attribute name.
             Expr::Ident(id) => {
                 let (line, col) = self.lines.line_col(id.span);
-                self.handle_ident_value(id.sym.as_ref(), line, col, HookPhase::Event);
+                self.handle_ident_value(id.sym.as_ref(), line, col, phase);
             }
             _ => {}
         }
@@ -263,7 +265,17 @@ impl Visit for FnValueWalker<'_> {
         if let Some(JSXAttrValue::JSXExprContainer(c)) = &node.value
             && let JSXExpr::Expr(e) = &c.expr
         {
-            self.handle_jsx_prop_value(e);
+            // Gate the phase on the attribute name: only `on[A-Z]…` props are
+            // event handlers (onClick, onSubmit, …). All other function-valued
+            // props — render-props (`renderItem`), children-as-fn (`children`),
+            // formatters (`formatter`) — run during render or on an unknown
+            // schedule, so they receive `Render` (conservative, no conditionality
+            // discount; a world effect there also earns `effect.in.render`).
+            let phase = match &node.name {
+                JSXAttrName::Ident(n) if is_event_handler_attr(n.sym.as_ref()) => HookPhase::Event,
+                _ => HookPhase::Render,
+            };
+            self.handle_jsx_prop_value(e, phase);
         }
         // Recurse so nested JSX (children) attributes are still visited.
         node.visit_children_with(self);
@@ -362,6 +374,20 @@ impl FnValueWalker<'_> {
             }
         }
     }
+}
+
+/// Return `true` if `name` is a JSX event-handler attribute (matches `on[A-Z]…`).
+///
+/// Only these props run conditionally on user interaction (event phase, eligible
+/// for the conditionality discount). All other function-valued props — render-props
+/// (`renderItem`), children-as-function (`children`), formatters — run during
+/// render or on an unknown schedule and must be treated as `Render` phase.
+fn is_event_handler_attr(name: &str) -> bool {
+    name.starts_with("on")
+        && name[2..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
 }
 
 /// Return the bare-ident callee name of a call, if any.
@@ -708,6 +734,50 @@ mod tests {
         assert_eq!(v.edges.len(), 1, "imported named hook value emits one edge");
         assert_eq!(v.edges[0].base, "handler");
         assert_eq!(v.edges[0].module.as_deref(), Some("./h"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Finding (Copilot R6, #37): JSX render-props vs event handlers.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn non_on_jsx_prop_is_render_phase() {
+        // A non-`on*` function-valued prop (`renderItem`, `formatter`, `children`)
+        // runs during render — must be Render phase (no conditionality discount,
+        // EffectInRender applies).
+        let v = fn_values(
+            "function C(){ return <List renderItem={() => fetch('/x')}/>; }",
+            "C",
+        );
+        assert_eq!(
+            v.owned_value_sites.len(),
+            1,
+            "render-prop inline arrow is owned"
+        );
+        assert_eq!(
+            v.owned_value_sites[0].phase,
+            HookPhase::Render,
+            "non-on* JSX prop → Render phase (was wrongly Event before fix)"
+        );
+    }
+
+    #[test]
+    fn on_upper_jsx_prop_is_event_phase() {
+        // An `on[A-Z]…` prop (onClick, onSubmit) runs on user interaction — Event phase.
+        let v = fn_values(
+            "function C(){ return <button onClick={() => fetch('/x')}/>; }",
+            "C",
+        );
+        assert_eq!(
+            v.owned_value_sites.len(),
+            1,
+            "onClick inline arrow is owned"
+        );
+        assert_eq!(
+            v.owned_value_sites[0].phase,
+            HookPhase::Event,
+            "on* JSX prop → Event phase (regression guard: must stay Event after fix)"
+        );
     }
 
     #[test]
