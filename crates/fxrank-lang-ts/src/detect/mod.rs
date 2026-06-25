@@ -424,8 +424,12 @@ pub fn record_from_hotspot(
     imports: &ImportTable,
     lines: &SpanLines,
     extra_refs: &[fxrank_core::record::CallSiteRef],
+    module_map: &crate::module_map::TsModuleMap,
 ) -> fxrank_core::record::UnitRecord {
-    let mut refs = refs::extract(&unit.body, imports, lines);
+    let module_key = module_map.module_of(&unit.path);
+    let mut canonical_path = vec![module_key];
+    canonical_path.extend(symbol_segments(&unit.symbol));
+    let mut refs = refs::extract(&unit.body, imports, lines, &unit.path, module_map);
     refs.extend_from_slice(extra_refs);
     fxrank_core::record::UnitRecord {
         unit_id: h.id.clone(),
@@ -433,9 +437,9 @@ pub fn record_from_hotspot(
         line: unit.line,
         col: unit.col,
         symbol: unit.symbol.clone(),
-        is_root: false,         // root is set by the CLI for explicit-file entries
-        canonical_path: vec![], // 025-3e: frontend not yet adopted → non-adopted partition
-        aliases: vec![],
+        is_root: false, // root is set by the CLI for explicit-file entries
+        canonical_path,
+        aliases: vec![], // barrel AliasFacts deferred (§9)
         effects: h.effects.clone(),
         risks: h.risk_features.clone(),
         refs,
@@ -443,6 +447,11 @@ pub fn record_from_hotspot(
         await_count: h.await_count,
         language: fxrank_core::frontend::Language::Ts,
     }
+}
+
+/// Split a TS display symbol into path segments (`C.method` → ["C","method"]).
+fn symbol_segments(symbol: &str) -> Vec<String> {
+    symbol.split('.').map(|s| s.to_string()).collect()
 }
 
 #[cfg(test)]
@@ -516,13 +525,39 @@ mod tests {
     }
 
     #[test]
+    fn record_from_hotspot_sets_canonical_path() {
+        use crate::module_map::TsModuleMap;
+        use fxrank_core::frontend::SourceFile;
+        // The existing `unit_and_ctx` helper parses at path "t.ts" → module key "t".
+        let mmap = TsModuleMap::build(&[SourceFile {
+            path: "t.ts".into(),
+            text: String::new(),
+        }]);
+        let src = "export function fetchUser() {}";
+        let (units, imports, module_bindings, lines, idx) = unit_and_ctx(src, "fetchUser");
+        let unit = &units[idx];
+        let h = analyze_unit(unit, &imports, &lines, &module_bindings);
+        let rec = record_from_hotspot(unit, &h, &imports, &lines, &[], &mmap);
+        assert_eq!(
+            rec.canonical_path,
+            vec!["t".to_string(), "fetchUser".into()]
+        );
+    }
+
+    #[test]
     fn record_from_hotspot_copies_final_hotspot_own_data() {
+        use crate::module_map::TsModuleMap;
+        use fxrank_core::frontend::SourceFile;
+        let mmap = TsModuleMap::build(&[SourceFile {
+            path: "t.ts".into(),
+            text: String::new(),
+        }]);
         let src = "import fs from 'node:fs';\n\
                    function writer(p: string) { fs.writeFileSync(p, 'x'); helper(); }";
         let (units, imports, module_bindings, lines, idx) = unit_and_ctx(src, "writer");
         let unit = &units[idx];
         let h = analyze_unit(unit, &imports, &lines, &module_bindings);
-        let rec = record_from_hotspot(unit, &h, &imports, &lines, &[]);
+        let rec = record_from_hotspot(unit, &h, &imports, &lines, &[], &mmap);
 
         assert_eq!(rec.unit_id, h.id, "unit_id must equal the Hotspot id");
         // `Effect`/`RiskFeature` are not `PartialEq`; compare the observable

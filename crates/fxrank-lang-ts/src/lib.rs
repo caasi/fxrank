@@ -4,8 +4,10 @@ pub mod coverage;
 pub mod detect;
 pub mod functions;
 pub mod imports;
+pub mod module_map;
 pub mod react;
 pub mod source;
+pub mod tsconfig;
 
 use std::collections::{HashMap, HashSet};
 
@@ -36,7 +38,9 @@ pub const CORPUS_PROFILE: CorpusProfile = CorpusProfile {
 
 use crate::functions::FnUnit;
 use crate::imports::ImportTable;
+use crate::module_map::TsModuleMap;
 use crate::source::{Lang, SpanLines};
+use crate::tsconfig::TsConfig;
 
 /// The TypeScript/JavaScript language frontend.
 ///
@@ -54,10 +58,15 @@ use crate::source::{Lang, SpanLines};
 /// `FrontendOutput::skipped_tests`. JS/TS convention keeps tests in separate
 /// files, so skipping is by file path (not by detecting `describe`/`it` inside
 /// app code), mirroring the Rust frontend's `skipped_tests` contract.
+///
+/// When `tsconfig` is `Some(cfg)`, the module map is built with alias resolution
+/// from the parsed tsconfig (`paths`/`baseUrl`). When `None` (the default), only
+/// relative imports are resolved; non-relative specifiers (aliases) stay opaque.
 #[derive(Default)]
 pub struct TsFrontend {
     pub lang: Lang,
     pub include_tests: bool,
+    pub tsconfig: Option<TsConfig>,
 }
 
 impl Frontend for TsFrontend {
@@ -71,6 +80,10 @@ impl Frontend for TsFrontend {
 
     fn analyze(&self, files: &[SourceFile]) -> FrontendOutput {
         let mut output = FrontendOutput::default();
+        let module_map = match &self.tsconfig {
+            Some(cfg) => TsModuleMap::build_with_tsconfig(files, cfg),
+            None => TsModuleMap::build(files),
+        };
 
         for source in files {
             match functions::parse_module(&source.text, &source.path, self.lang) {
@@ -99,6 +112,7 @@ impl Frontend for TsFrontend {
                             &imports,
                             &module_bindings,
                             &lines,
+                            &module_map,
                             &mut output.functions,
                             &mut output.records,
                         );
@@ -128,6 +142,7 @@ impl Frontend for TsFrontend {
                                     &imports,
                                     &lines,
                                     &[],
+                                    &module_map,
                                 );
                                 output.records.push(rec);
                                 output.functions.push(h);
@@ -160,6 +175,7 @@ fn analyze_units(
     imports: &ImportTable,
     module_bindings: &HashSet<String>,
     lines: &SpanLines,
+    module_map: &TsModuleMap,
     out: &mut Vec<Hotspot>,
     records: &mut Vec<fxrank_core::record::UnitRecord>,
 ) {
@@ -215,7 +231,10 @@ fn analyze_units(
             // record carries edges to functions called inside hook callbacks.
             // `refs::extract` uses own-body semantics (stops at nested arrows/fns),
             // which is correct here — the callback IS the body we want.
-            let arrow_refs = detect::refs::extract(&unit.body, imports, lines);
+            // Pass the arrow's file path (same as the component's) + the map so
+            // absorbed refs also carry resolved_target.
+            let arrow_refs =
+                detect::refs::extract(&unit.body, imports, lines, &unit.path, module_map);
             if !arrow_refs.is_empty() {
                 pending_refs.entry(comp_id).or_default().extend(arrow_refs);
             }
@@ -253,6 +272,7 @@ fn analyze_units(
             imports,
             lines,
             &absorbed_refs,
+            module_map,
         ));
         out.push(h);
     }
@@ -288,6 +308,12 @@ mod tests {
     /// Parse `src` as TSX, run the full `analyze_units` two-pass, and return
     /// `(hotspots, records)`.
     fn analyze_src(src: &str) -> (Vec<Hotspot>, Vec<fxrank_core::record::UnitRecord>) {
+        use fxrank_core::frontend::SourceFile;
+        let source = SourceFile {
+            path: "t.tsx".into(),
+            text: src.to_string(),
+        };
+        let module_map = TsModuleMap::build(&[source]);
         let (module, cm) = functions::parse_module(src, "t.tsx", Lang::Tsx).expect("parse");
         let lines = SpanLines::new(cm);
         let imports = ImportTable::from_module(&module);
@@ -300,6 +326,7 @@ mod tests {
             &imports,
             &module_bindings,
             &lines,
+            &module_map,
             &mut out,
             &mut records,
         );
@@ -438,6 +465,144 @@ mod tests {
             records.len(),
             out.len(),
             "records must be 1:1 with hotspots"
+        );
+    }
+
+    #[test]
+    fn false_resolve_killed_node_fs_not_resolved_to_local_readfile() {
+        use fxrank_core::frontend::SourceFile;
+        use fxrank_core::graph::Edge;
+        use fxrank_core::resolve::{CanonicalIndex, resolve_ref_precise};
+        // A project with a lone local `readFile` + a caller using node:fs's fs.readFile.
+        let files = vec![SourceFile {
+            path: "src/app.ts".into(),
+            text: "import fs from 'node:fs';\n\
+                   export function readFile() { return 1; }\n\
+                   export function caller() { fs.readFile('x', () => {}); }"
+                .into(),
+        }];
+        let out = TsFrontend::default().analyze(&files);
+        let idx = CanonicalIndex::from_records(&out.records);
+        assert!(idx.adopted(), "TS partition must be adopted");
+        let caller = out.records.iter().find(|r| r.symbol == "caller").unwrap();
+        let fs_ref = caller
+            .refs
+            .iter()
+            .find(|r| r.base.starts_with("fs"))
+            .unwrap();
+        let edge = resolve_ref_precise(fs_ref, &idx, &caller.path);
+        // `Edge` has no `Debug` derive, so pre-bind the boolean (no `{edge:?}`).
+        let is_opaque = matches!(edge, Some(Edge::Opaque(_)));
+        assert!(
+            is_opaque,
+            "node:fs fs.readFile must be opaque, not resolved to a local readFile"
+        );
+    }
+
+    /// e2e: an `@/util` alias import (tsconfig `@/* → ./src/*`) resolves to the
+    /// in-batch callee when `TsFrontend { tsconfig: Some(cfg) }` is used.
+    ///
+    /// Layout: `src/app.ts` calls `x()` imported from `@/util`; `src/util.ts`
+    /// exports `x` which calls `fetch` (net effect, class 7).
+    ///
+    /// With tsconfig → `load`'s `@/util::x` ref has `resolved_target = Some([…])`,
+    /// `CanonicalIndex::resolve_ref_precise` returns `Edge::Resolved`, and `load`
+    /// inherits `x`'s net effect.
+    ///
+    /// Without tsconfig → same ref has no `resolved_target`, the non-relative
+    /// specifier is opaque → `Edge::Opaque`.
+    #[test]
+    fn e2e_at_alias_resolves_with_project_tsconfig() {
+        use crate::tsconfig::TsConfig;
+        use fxrank_core::frontend::SourceFile;
+        use fxrank_core::graph::Edge;
+        use fxrank_core::resolve::{CanonicalIndex, resolve_ref_precise};
+
+        let app_src = "import { x } from '@/util';\n\
+                       export function load() { x(); }\n";
+        let util_src = "export function x() { return fetch('/u'); }\n";
+
+        let files = vec![
+            SourceFile {
+                path: "src/app.ts".into(),
+                text: app_src.into(),
+            },
+            SourceFile {
+                path: "src/util.ts".into(),
+                text: util_src.into(),
+            },
+        ];
+
+        let cfg = TsConfig {
+            base: "".into(),
+            paths: vec![("@/*".into(), vec!["./src/*".into()])],
+        };
+
+        // --- WITH tsconfig: alias resolves ---
+        let out = TsFrontend {
+            tsconfig: Some(cfg),
+            ..Default::default()
+        }
+        .analyze(&files);
+        let idx = CanonicalIndex::from_records(&out.records);
+        assert!(
+            idx.adopted(),
+            "TS partition must be adopted when canonical_paths are set"
+        );
+
+        let load_rec = out
+            .records
+            .iter()
+            .find(|r| r.symbol == "load")
+            .expect("load record must be present");
+        // Find the call ref for the @/util import (module = "@/util").
+        let x_ref = load_rec
+            .refs
+            .iter()
+            .find(|r| r.module.as_deref() == Some("@/util"))
+            .expect("load must have a ref with module='@/util'");
+        let edge = resolve_ref_precise(x_ref, &idx, &load_rec.path);
+        let is_resolved = matches!(edge, Some(Edge::Resolved(_)));
+        assert!(
+            is_resolved,
+            "with tsconfig, @/util ref must resolve to Edge::Resolved (got opaque or None)"
+        );
+
+        // load must inherit x's net/fetch effect (propagation pre-condition: the
+        // record carries the ref, the fold would propagate it; at the record level
+        // we verify resolved_target is set and the x hotspot has net effects).
+        let x_hotspot = out
+            .functions
+            .iter()
+            .find(|h| h.symbol == "x")
+            .expect("x hotspot must be present");
+        assert!(
+            x_hotspot
+                .effects
+                .iter()
+                .any(|e| e.kind == fxrank_core::effect::EffectKind::NetFsDb),
+            "x must have a net.fs.db (fetch) effect; effects={:?}",
+            x_hotspot.effects.iter().map(|e| e.kind).collect::<Vec<_>>()
+        );
+
+        // --- WITHOUT tsconfig: same import is opaque ---
+        let out_no_cfg = TsFrontend::default().analyze(&files);
+        let idx_no_cfg = CanonicalIndex::from_records(&out_no_cfg.records);
+        let load_rec_no_cfg = out_no_cfg
+            .records
+            .iter()
+            .find(|r| r.symbol == "load")
+            .expect("load record must be present");
+        let x_ref_no_cfg = load_rec_no_cfg
+            .refs
+            .iter()
+            .find(|r| r.module.as_deref() == Some("@/util"))
+            .expect("load must have a ref with module='@/util'");
+        let edge_no_cfg = resolve_ref_precise(x_ref_no_cfg, &idx_no_cfg, &load_rec_no_cfg.path);
+        let is_opaque = matches!(edge_no_cfg, Some(Edge::Opaque(_)));
+        assert!(
+            is_opaque,
+            "without tsconfig, @/util ref must be Edge::Opaque (got resolved or None)"
         );
     }
 

@@ -1135,6 +1135,19 @@ pub fn analyze_unit(
 
 // ─── build_record ─────────────────────────────────────────────────────────────
 
+/// Path-meaningful segments for a Python symbol. Synthetic `<module>`/`<lambda@…>`
+/// symbols (identified by leading `<`) are not importable → `None`. Real names
+/// return `Some(vec![symbol])` (a single segment; Python symbols carry no dots).
+/// Module-level-vs-method filtering is done by `is_module_level` at the call
+/// site in `build_record`; this only guards the synthetic forms.
+fn symbol_segments(symbol: &str) -> Option<Vec<String>> {
+    if symbol.starts_with('<') {
+        None
+    } else {
+        Some(vec![symbol.to_string()])
+    }
+}
+
 /// Build a language-neutral [`fxrank_core::record::UnitRecord`] for `unit`.
 ///
 /// Calls the shared [`gather`] helper (same as [`analyze_unit`]) so the record's
@@ -1153,6 +1166,7 @@ pub fn build_record(
     imports: &Imports,
     module_bindings: &HashSet<String>,
     span: &SpanIndex,
+    module_map: &crate::module_map::PyModuleMap,
 ) -> fxrank_core::record::UnitRecord {
     // ── gather ─────────────────────────────────────────────────────────────
     // `unknown_decorator` is a confidence-only signal; records carry no
@@ -1160,8 +1174,34 @@ pub fn build_record(
     let (effects, risks, await_count, async_boundary, _unknown_decorator) =
         gather(unit, path, imports, module_bindings, span);
 
+    // ── canonical_path ─────────────────────────────────────────────────────
+    // Only a module-level def is importable as `module.<name>`. Methods/nested
+    // defs/lambdas/<module> get an empty canonical_path so they cannot be a
+    // false-resolve target (Python symbols are bare — a method `write` would
+    // otherwise collide with module-level `write`). (P2-1)
+    let canonical_path = if !unit.is_module_level {
+        vec![]
+    } else {
+        match (module_map.module_of(path), symbol_segments(&unit.symbol)) {
+            (Some(mut m), Some(seg)) => {
+                m.extend(seg);
+                m
+            }
+            _ => vec![], // no module in scope, OR a synthetic symbol
+        }
+    };
+
     // ── refs ───────────────────────────────────────────────────────────────
-    let call_refs = refs::extract(unit, imports, span);
+    let referencing_module = module_map.module_of(path).unwrap_or_default();
+    let referencing_is_package = module_map.is_package(path);
+    let call_refs = refs::extract(
+        unit,
+        imports,
+        span,
+        &referencing_module,
+        referencing_is_package,
+        module_map,
+    );
 
     fxrank_core::record::UnitRecord {
         unit_id: format!("{}:{}:{}:{}", path, unit.line, unit.col, unit.symbol),
@@ -1170,7 +1210,7 @@ pub fn build_record(
         col: unit.col,
         symbol: unit.symbol.clone(),
         is_root: false,
-        canonical_path: vec![], // 025-3e: frontend not yet adopted → non-adopted partition
+        canonical_path,
         aliases: vec![],
         effects,
         risks,
@@ -1722,6 +1762,8 @@ mod tests {
     /// The frontend always emits `is_root: false`; the CLI sets the real value.
     #[test]
     fn build_record_emits_record_for_python_unit() {
+        use crate::module_map::PyModuleMap;
+        use fxrank_core::frontend::SourceFile;
         let src = "import os\ndef writer():\n    os.getcwd()\n";
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
@@ -1733,7 +1775,11 @@ mod tests {
             .iter()
             .find(|u| u.symbol == "writer")
             .expect("writer unit not found");
-        let rec = build_record(unit, "test.py", &imports, &module_bindings, &span);
+        let mmap = PyModuleMap::build(&[SourceFile {
+            path: "test.py".into(),
+            text: String::new(),
+        }]);
+        let rec = build_record(unit, "test.py", &imports, &module_bindings, &span, &mmap);
 
         assert_eq!(rec.symbol, "writer");
         assert!(
@@ -1944,6 +1990,98 @@ mod tests {
             net_count, 1,
             "method body open(\"z\") must NOT be double-counted on <module>; \
              expected exactly 1 net.fs.db effect, got {net_count}"
+        );
+    }
+
+    // ── Task 2 (Phase-3e): canonical_path in build_record ─────────────────────
+
+    /// A module-level `write` function in `pkg/util.py` gets canonical_path
+    /// `["pkg", "util", "write"]` (the module key + the function name).
+    #[test]
+    fn build_record_sets_canonical_path() {
+        use crate::module_map::PyModuleMap;
+        use fxrank_core::frontend::SourceFile;
+        // Module pkg.util with a top-level `write`.
+        let mmap = PyModuleMap::build(&[
+            SourceFile {
+                path: "pkg/__init__.py".into(),
+                text: String::new(),
+            },
+            SourceFile {
+                path: "pkg/util.py".into(),
+                text: String::new(),
+            },
+        ]);
+        let src = "def write():\n    pass\n";
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let imports = Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
+        let span = SpanIndex::new(src);
+        let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
+        let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
+        let unit = units
+            .iter()
+            .find(|u| u.symbol == "write")
+            .expect("write unit not found");
+        let rec = build_record(
+            unit,
+            "pkg/util.py",
+            &imports,
+            &module_bindings,
+            &span,
+            &mmap,
+        );
+        assert_eq!(
+            rec.canonical_path,
+            vec!["pkg".to_string(), "util".into(), "write".into()],
+            "module-level write in pkg/util.py must get canonical_path [pkg, util, write]"
+        );
+    }
+
+    /// A CLASS method `write` inside `pkg/util.py` is NOT module-level and must get
+    /// an empty canonical_path (so it can never false-resolve for
+    /// `from pkg.util import write`).
+    #[test]
+    fn method_unit_gets_empty_canonical_path() {
+        use crate::module_map::PyModuleMap;
+        use fxrank_core::frontend::SourceFile;
+        let mmap = PyModuleMap::build(&[
+            SourceFile {
+                path: "pkg/__init__.py".into(),
+                text: String::new(),
+            },
+            SourceFile {
+                path: "pkg/util.py".into(),
+                text: String::new(),
+            },
+        ]);
+        let src = "class C:\n    def write(self):\n        pass\n";
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let imports = Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
+        let span = SpanIndex::new(src);
+        let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
+        let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
+        let method_unit = units
+            .iter()
+            .find(|u| u.symbol == "write")
+            .expect("write method unit not found");
+        assert!(
+            !method_unit.is_module_level,
+            "a class method must have is_module_level=false, got true"
+        );
+        let rec = build_record(
+            method_unit,
+            "pkg/util.py",
+            &imports,
+            &module_bindings,
+            &span,
+            &mmap,
+        );
+        assert!(
+            rec.canonical_path.is_empty(),
+            "a method must not get an importable canonical_path; got: {:?}",
+            rec.canonical_path
         );
     }
 }

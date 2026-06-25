@@ -13,6 +13,7 @@ categories.workspace = true
 
 [dependencies]
 fxrank-core = { path = "../fxrank-core", version = "0.3.0" }
+serde_json = "1"
 swc_common = "23.0.2"
 swc_ecma_ast = "25.0.0"
 swc_ecma_parser = "41.1.1"
@@ -20,7 +21,6 @@ swc_ecma_visit = "25.0.0"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
-serde_json = "1"
 
 [lints]
 workspace = true

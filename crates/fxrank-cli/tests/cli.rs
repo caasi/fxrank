@@ -985,3 +985,238 @@ fn prunes_python_noise_by_default() {
         "app.py must be scanned and 'real' must appear in hotspots; got: {json}"
     );
 }
+
+// ── Task 3 (Plan 5): --project/-p flag wires tsconfig paths into the TS frontend ──
+
+/// With `--project <dir>`, an `@/`-imported callee's effect is inherited by the caller.
+/// Without `--project`, the same `@/` import is opaque (FirstPartyOutOfScope reach).
+#[test]
+#[cfg(feature = "ts")]
+fn project_flag_resolves_ts_alias_import() {
+    let tmp = TempDir::new().expect("tmp");
+    let root = tmp.path();
+
+    // src/helper.ts — does fetch() (net.fs.db, class 7)
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).expect("mkdir src");
+    std::fs::write(
+        src.join("helper.ts"),
+        "export function helper() { fetch('x'); }\n",
+    )
+    .expect("write helper.ts");
+
+    // src/caller.ts — imports helper via @/ alias
+    std::fs::write(
+        src.join("caller.ts"),
+        "import { helper } from '@/helper';\nexport function caller() { helper(); }\n",
+    )
+    .expect("write caller.ts");
+
+    // tsconfig.json at root: @/* → ./src/*
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+    )
+    .expect("write tsconfig.json");
+
+    // --- WITH --project: alias resolves → caller inherits helper's class-7 IO ---
+    let out_with = fxrank()
+        .arg("scan")
+        .arg(root)
+        .arg("--project")
+        .arg(root)
+        .output()
+        .expect("ran");
+    assert!(
+        out_with.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_with.stderr)
+    );
+    let j_with: serde_json::Value = serde_json::from_slice(&out_with.stdout).expect("valid JSON");
+
+    let caller_with = j_with["hotspots"]
+        .as_array()
+        .expect("hotspots array")
+        .iter()
+        .find(|h| h["symbol"].as_str() == Some("caller"))
+        .expect("caller hotspot present")
+        .clone();
+
+    // With --project, caller should inherit helper's class-7 IO via propagation.
+    // At minimum: no FirstPartyOutOfScope reach for @/helper (it resolved).
+    let reaches_with = caller_with["external_reaches"].as_array();
+    let opaque_alias = reaches_with.map(|rs| {
+        rs.iter().any(|r| {
+            r["specifier"]
+                .as_str()
+                .map(|s| s.starts_with('@'))
+                .unwrap_or(false)
+        })
+    });
+    assert!(
+        !opaque_alias.unwrap_or(false),
+        "with --project, @/helper must NOT appear as an opaque external reach; \
+         caller hotspot: {caller_with}"
+    );
+    // And caller.propagated_max_class should reflect helper's class 7.
+    assert_eq!(
+        caller_with["propagated_max_class"].as_u64(),
+        Some(7),
+        "with --project, caller must inherit helper's class-7 IO via propagation; \
+         caller hotspot: {caller_with}"
+    );
+
+    // --- WITHOUT --project: alias stays opaque → caller does NOT inherit class-7 IO ---
+    let out_no = fxrank().arg("scan").arg(root).output().expect("ran");
+    assert!(
+        out_no.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_no.stderr)
+    );
+    let j_no: serde_json::Value = serde_json::from_slice(&out_no.stdout).expect("valid JSON");
+
+    let caller_no = j_no["hotspots"]
+        .as_array()
+        .expect("hotspots array")
+        .iter()
+        .find(|h| h["symbol"].as_str() == Some("caller"))
+        .expect("caller hotspot present")
+        .clone();
+
+    // Without --project, @/helper stays unresolved → propagated_max_class stays at own (< 7).
+    assert!(
+        caller_no["propagated_max_class"].as_u64().unwrap_or(99) < 7,
+        "without --project, caller must NOT inherit helper's class-7 IO \
+         (alias unresolved); caller hotspot: {caller_no}"
+    );
+}
+
+/// --project accepts a file path (tsconfig.json) directly, not just a directory.
+#[test]
+#[cfg(feature = "ts")]
+fn project_flag_accepts_tsconfig_file_path() {
+    let tmp = TempDir::new().expect("tmp");
+    let root = tmp.path();
+
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).expect("mkdir src");
+    std::fs::write(
+        src.join("helper.ts"),
+        "export function helper() { fetch('x'); }\n",
+    )
+    .expect("write helper.ts");
+    std::fs::write(
+        src.join("caller.ts"),
+        "import { helper } from '@/helper';\nexport function caller() { helper(); }\n",
+    )
+    .expect("write caller.ts");
+
+    let tsconfig_path = root.join("tsconfig.json");
+    std::fs::write(
+        &tsconfig_path,
+        r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+    )
+    .expect("write tsconfig.json");
+
+    // Pass the FILE path to --project (not just the dir)
+    let out = fxrank()
+        .arg("scan")
+        .arg(root)
+        .arg("-p") // short form
+        .arg(&tsconfig_path)
+        .output()
+        .expect("ran");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let caller = j["hotspots"]
+        .as_array()
+        .expect("hotspots array")
+        .iter()
+        .find(|h| h["symbol"].as_str() == Some("caller"))
+        .expect("caller hotspot present")
+        .clone();
+    assert_eq!(
+        caller["propagated_max_class"].as_u64(),
+        Some(7),
+        "--project with explicit tsconfig.json file path must resolve aliases; \
+         caller hotspot: {caller}"
+    );
+}
+
+/// A bad tsconfig path → load error surfaces as a diagnostic (NOT a panic/exit failure).
+/// Also verifies Bug 2 fix: scope.parsed == scope.files (the tsconfig error must NOT
+/// decrement the parsed-source count; it is a config error, not a source parse failure).
+#[test]
+fn project_flag_bad_path_is_diagnostic_not_failure() {
+    let tmp = TempDir::new().expect("tmp");
+    let root = tmp.path();
+    // A real TS file so there's something to scan
+    std::fs::write(root.join("app.ts"), "export function app() { return 1; }\n")
+        .expect("write app.ts");
+
+    let out = fxrank()
+        .arg("scan")
+        .arg(root)
+        .arg("--project")
+        .arg("/nonexistent/tsconfig.json")
+        .output()
+        .expect("ran");
+    // Must not crash — exit 0 with a diagnostic surfaced in the JSON.
+    assert!(
+        out.status.success(),
+        "bad --project path must not cause non-zero exit; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    // A diagnostic (parsed=false) must be present mentioning the failed tsconfig load.
+    let diags = j["diagnostics"].as_array().expect("diagnostics array");
+    assert!(
+        !diags.is_empty(),
+        "bad --project must produce a diagnostic; got: {j}"
+    );
+    // Bug 2 fix: the tsconfig load error must NOT reduce scope.parsed.
+    // scope.parsed counts only scanned-source parse failures, never config-file errors.
+    let files = j["scope"]["files"].as_u64().expect("scope.files");
+    let parsed = j["scope"]["parsed"].as_u64().expect("scope.parsed");
+    assert_eq!(
+        parsed, files,
+        "scope.parsed must equal scope.files — the tsconfig error must not decrement \
+         the parsed-source count; files={files} parsed={parsed}; got: {j}"
+    );
+}
+
+/// Bug 1 fix: --project on a Python-only (or Rust-only) scan must NOT emit a
+/// tsconfig diagnostic even when the path is invalid.  The flag is documented
+/// TS/JS-only; tsconfig loading must be skipped when there are no TS sources.
+#[test]
+fn project_flag_no_ts_sources_emits_no_tsconfig_diagnostic() {
+    let tmp = TempDir::new().expect("tmp");
+    let root = tmp.path();
+    // Only a Python file — no TS sources
+    std::fs::write(root.join("app.py"), "def f():\n    pass\n").expect("write app.py");
+
+    let out = fxrank()
+        .arg("scan")
+        .arg(root)
+        .arg("--project")
+        .arg("/nonexistent/tsconfig.json")
+        .output()
+        .expect("ran");
+    assert!(
+        out.status.success(),
+        "Python-only scan with bad --project must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    // No tsconfig diagnostic must appear — there are no TS files, so the flag is a no-op.
+    let diags = j["diagnostics"].as_array().expect("diagnostics array");
+    assert!(
+        diags.is_empty(),
+        "Python-only scan must NOT emit a tsconfig diagnostic when --project is given \
+         but no TS files are present; got diagnostics: {diags:?}"
+    );
+}

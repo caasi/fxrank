@@ -300,6 +300,22 @@ This makes each per-frontend emitter independently shippable behind the gate.
   (`paths` aliases), `pyproject.toml`. Adding them requires threading config files into the batch (no
   ad-hoc disk I/O); deferred. Until then: workspace out-of-scope siblings stay `ThirdParty` (§7), TS
   alias imports without an in-batch tsconfig are opaque.
+  - **TS tsconfig `paths` is the highest-value TS follow-up (dogfood evidence).** Scanning a real
+    Next.js app (`omni/114-kg-frontend/src`, 244 files) found **969 of 978** first-party reaches are
+    `@/`-alias imports (`@/hooks/...`, `@/libs/...`) — correctly classified `FirstPartyOutOfScope` but
+    NOT folded (no tsconfig). Relative-import / React-composition calls resolve correctly (0 invariant
+    violations, no false-resolve), but alias-heavy codebases get little propagation coverage until
+    `tsconfig.json` `compilerOptions.paths` is read and threaded into `TsModuleMap::resolve_import`.
+    **DELIVERED** by Plan 5 (`--project`/`-p` flag, tsc-compatible): the omni `@/` reaches dropped
+    969→523 (−46%), inherited edges 19→34, 0 violations.
+  - **TS cross-dialect resolution (`.tsx`→`.ts`) — the next TS limit (found in the Plan 5 dogfood).**
+    `dispatch_ts` partitions TS sources by **dialect** (`Lang::Ts` vs `Lang::Tsx`) and builds a
+    `TsModuleMap` per group, so a `.tsx` caller's map omits `.ts` files — every `.tsx`→`.ts` import
+    (relative AND alias) goes opaque. This is the dominant React shape (omni: the residual 523 `@/`
+    reaches after Plan 5 are `.tsx`→`.ts`, led by `@/libs/utils` ×167). Degrades safely (opaque, never
+    misresolved — `.ts` and `.tsx` share the SAME TS module namespace, so the fix is to build ONE
+    TS-wide `module_map` across both dialects and share it; needs a small `dispatch_ts`/`analyze`
+    refactor). Tracked as a follow-up; not a #36 blocker.
 - **`cargo metadata` / full workspace model**, **namespace-complete `(path, namespace)` keying**
   (fxrank units are functions; modules/types are not scored, so leaf-namespace collisions are rare),
   **perfect cross-file multi-hop alias chains**, **type/borrow inference**. All deferred.

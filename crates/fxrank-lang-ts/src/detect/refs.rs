@@ -26,11 +26,23 @@ use crate::source::SpanLines;
 /// - `kind = RefKind::Method` if `base.contains('.')` AND `module.is_none()`
 ///   (member call on a non-imported receiver); else `RefKind::Free`.
 /// - `line`/`col` from the call span via `lines`.
+/// - `resolved_target` — `Some([module_key, export_name])` for provably-safe
+///   in-project calls; `None` for external/unresolvable/ambiguous shapes.
 /// - Recurse so nested calls (`f(g())`, `a.b().c()`) are all captured.
-pub fn extract(body: &FnBodyOwned, imports: &ImportTable, lines: &SpanLines) -> Vec<CallSiteRef> {
+pub fn extract(
+    body: &FnBodyOwned,
+    imports: &ImportTable,
+    lines: &SpanLines,
+    referencing_file: &str,
+    module_map: &crate::module_map::TsModuleMap,
+) -> Vec<CallSiteRef> {
+    let referencing_key = module_map.module_of(referencing_file);
     let mut walker = RefsWalker {
         imports,
         lines,
+        referencing_file,
+        referencing_key,
+        module_map,
         refs: Vec::new(),
     };
     body.walk_with(&mut walker);
@@ -40,6 +52,9 @@ pub fn extract(body: &FnBodyOwned, imports: &ImportTable, lines: &SpanLines) -> 
 struct RefsWalker<'a> {
     imports: &'a ImportTable,
     lines: &'a SpanLines,
+    referencing_file: &'a str,
+    referencing_key: String,
+    module_map: &'a crate::module_map::TsModuleMap,
     refs: Vec<CallSiteRef>,
 }
 
@@ -58,6 +73,37 @@ impl Visit for RefsWalker<'_> {
             };
             let (line, col) = self.lines.line_col(node.span);
             let first_party = module.as_deref().is_some_and(is_first_party_specifier);
+
+            use crate::imports::ImportTarget;
+            let has_member = base.contains('.');
+            let resolved_target = if matches!(kind, RefKind::Method) {
+                None
+            } else if let Some(spec) = &module {
+                // Resolve the relative module, then pick the export name ONLY for
+                // provably-safe shapes (never guess → never false-resolve).
+                match self.module_map.resolve_import(self.referencing_file, spec) {
+                    Some(key) => match (self.imports.import_target(root), has_member) {
+                        // bare `local()` from a named import → the original export name
+                        (Some(ImportTarget::Named(export)), false) => {
+                            Some(vec![key, export.clone()])
+                        }
+                        // `ns.member()` from a namespace import → the member is the export
+                        (Some(ImportTarget::Namespace), true) => {
+                            let member = base.split('.').nth(1).unwrap_or(root);
+                            Some(vec![key, member.to_string()])
+                        }
+                        // default()/default.member()/namespace() → ambiguous → opaque
+                        _ => None,
+                    },
+                    None => None, // non-relative / out-of-batch spec → opaque
+                }
+            } else if !has_member {
+                // bare same-module free call → own module
+                Some(vec![self.referencing_key.clone(), root.to_string()])
+            } else {
+                None
+            };
+
             self.refs.push(CallSiteRef {
                 kind,
                 base,
@@ -66,7 +112,7 @@ impl Visit for RefsWalker<'_> {
                 col,
                 qualified,
                 first_party,
-                resolved_target: None,
+                resolved_target,
             });
         }
         // Recurse so nested calls (f(g()), a.b().c()) are captured.
@@ -126,6 +172,8 @@ mod tests {
 
     /// Parse `src`, collect the unit named `fn_name`, and return its call refs.
     fn refs_of(src: &str, fn_name: &str) -> Vec<CallSiteRef> {
+        use crate::module_map::TsModuleMap;
+        use fxrank_core::frontend::SourceFile;
         let (module, cm) = functions::parse_module(src, "t.ts", Lang::Ts).expect("parse");
         let lines = SpanLines::new(cm);
         let imports = ImportTable::from_module(&module);
@@ -134,7 +182,11 @@ mod tests {
             .iter()
             .find(|u| u.symbol == fn_name)
             .expect("unit not found");
-        extract(&unit.body, &imports, &lines)
+        let mmap = TsModuleMap::build(&[SourceFile {
+            path: "t.ts".into(),
+            text: String::new(),
+        }]);
+        extract(&unit.body, &imports, &lines, "t.ts", &mmap)
     }
 
     #[test]
@@ -270,6 +322,98 @@ mod tests {
         let g_ref = refs.iter().find(|r| r.base == "g").expect("g not found");
         assert_eq!(g_ref.line, 2);
         assert!(g_ref.col >= 1);
+    }
+
+    fn refs_with_map(src: &str, file: &str, fn_name: &str, files: &[&str]) -> Vec<CallSiteRef> {
+        use crate::module_map::TsModuleMap;
+        let sfs: Vec<fxrank_core::frontend::SourceFile> = files
+            .iter()
+            .map(|p| fxrank_core::frontend::SourceFile {
+                path: (*p).into(),
+                text: String::new(),
+            })
+            .collect();
+        let mmap = TsModuleMap::build(&sfs);
+        let (module, cm) =
+            crate::functions::parse_module(src, file, crate::source::Lang::Ts).unwrap();
+        let lines = crate::source::SpanLines::new(cm); // SpanLines::new takes the Lrc<SourceMap> by value, 1 arg
+        let imports = crate::imports::ImportTable::from_module(&module);
+        let units = crate::functions::collect(&module, file, &lines);
+        let unit = units.iter().find(|u| u.symbol == fn_name).unwrap();
+        extract(&unit.body, &imports, &lines, file, &mmap)
+    }
+
+    #[test]
+    fn relative_import_call_resolves() {
+        let src = "import { fetchUser } from './util';\nexport function caller() { fetchUser(); }";
+        let refs = refs_with_map(src, "src/app.ts", "caller", &["src/app.ts", "src/util.ts"]);
+        let r = refs.iter().find(|r| r.base == "fetchUser").unwrap();
+        assert_eq!(
+            r.resolved_target,
+            Some(vec!["src/util".into(), "fetchUser".into()])
+        );
+    }
+
+    #[test]
+    fn node_import_call_stays_unresolved_for_opaque() {
+        // fs.readFile from node:fs must NOT resolve to a local readFile → None → opaque.
+        let src = "import fs from 'node:fs';\nexport function caller() { fs.readFile('x', cb); }";
+        let refs = refs_with_map(src, "src/app.ts", "caller", &["src/app.ts", "src/util.ts"]);
+        let r = refs.iter().find(|r| r.base.starts_with("fs")).unwrap();
+        assert_eq!(
+            r.resolved_target, None,
+            "node:fs call must be unresolved (→ opaque), never a local readFile"
+        );
+    }
+
+    #[test]
+    fn same_module_bare_call_resolves_to_own_module() {
+        let src = "function helper() {}\nexport function caller() { helper(); }";
+        let refs = refs_with_map(src, "src/app.ts", "caller", &["src/app.ts"]);
+        let r = refs.iter().find(|r| r.base == "helper").unwrap();
+        assert_eq!(
+            r.resolved_target,
+            Some(vec!["src/app".into(), "helper".into()])
+        );
+    }
+
+    #[test]
+    fn namespace_import_member_resolves_to_member_name() {
+        // import * as util from './util'; util.fetchUser() → ["src/util","fetchUser"]
+        // (the member, NOT the namespace binding "util").
+        let src = "import * as util from './util';\nexport function caller() { util.fetchUser(); }";
+        let refs = refs_with_map(src, "src/app.ts", "caller", &["src/app.ts", "src/util.ts"]);
+        let r = refs.iter().find(|r| r.base.starts_with("util")).unwrap();
+        assert_eq!(
+            r.resolved_target,
+            Some(vec!["src/util".into(), "fetchUser".into()])
+        );
+    }
+
+    #[test]
+    fn renamed_import_resolves_to_original_export_name() {
+        // import { readFile as rf } from './util'; rf() → ["src/util","readFile"]
+        // (the ORIGINAL export, not the local alias `rf`) — no false-resolve.
+        let src = "import { readFile as rf } from './util';\nexport function caller() { rf(); }";
+        let refs = refs_with_map(src, "src/app.ts", "caller", &["src/app.ts", "src/util.ts"]);
+        let r = refs.iter().find(|r| r.base == "rf").unwrap();
+        assert_eq!(
+            r.resolved_target,
+            Some(vec!["src/util".into(), "readFile".into()])
+        );
+    }
+
+    #[test]
+    fn default_import_member_call_is_unresolved() {
+        // import client from './util'; client.get() — `get` is a method on the default
+        // export VALUE, NOT a module export → must NOT resolve to a coincidental `get`.
+        let src = "import client from './util';\nexport function caller() { client.get(); }";
+        let refs = refs_with_map(src, "src/app.ts", "caller", &["src/app.ts", "src/util.ts"]);
+        let r = refs.iter().find(|r| r.base.starts_with("client")).unwrap();
+        assert_eq!(
+            r.resolved_target, None,
+            "default-import member call must be unresolved (→ opaque)"
+        );
     }
 
     #[test]
