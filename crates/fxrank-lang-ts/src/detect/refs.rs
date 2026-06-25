@@ -181,6 +181,14 @@ fn render_expr(expr: &Expr) -> Option<String> {
     }
 }
 
+/// Render a `MemberExpr` chain to a dotted base (`a.b.c`) for the function-value
+/// walker (`fnvalues`), so a member-expr handler (`onClick={ns.save}`) resolves
+/// through the SAME path as a member call (`ns.save()`). Returns `None` for
+/// shapes we don't model (computed indexing, `this.x`, calls-of-calls).
+pub(crate) fn render_member_base(m: &MemberExpr) -> Option<String> {
+    render_member(m)
+}
+
 /// Render a `MemberExpr` chain to `a.b.c`. Only `Ident` properties on
 /// renderable objects are kept; computed/private props yield `None`.
 fn render_member(m: &MemberExpr) -> Option<String> {

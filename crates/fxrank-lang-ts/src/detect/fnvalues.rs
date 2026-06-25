@@ -176,6 +176,41 @@ impl FnValueWalker<'_> {
         }
     }
 
+    /// Route a member-expression function VALUE (`ns.handler`, `obj.method`).
+    ///
+    /// A member-expr handler is resolvable ONLY when its base ident resolves
+    /// through the import table (a namespace/named import, e.g.
+    /// `import * as ns from './h'; onClick={ns.save}`): then it emits a graph
+    /// EDGE built by the SAME `refs::ref_for_base` helper the call walker uses, so
+    /// `ns.save()` and `onClick={ns.save}` agree on the resolved namespace member.
+    /// A member-expr whose base is a LOCAL object / received prop / unknown is NOT
+    /// resolvable without type info → we emit NO edge (never fabricate, §2.3 /
+    /// never-guess). It is also not OWNED (the function lives behind an object we
+    /// cannot follow).
+    fn handle_member_value(&mut self, m: &swc_ecma_ast::MemberExpr) {
+        // Render the chain to a dotted base (`ns.save`); bail on shapes we cannot
+        // model (computed indexing, `this.x`, calls-of-calls).
+        let Some(base) = super::refs::render_member_base(m) else {
+            return;
+        };
+        let root = base.split('.').next().unwrap_or(&base);
+        // Only an IMPORTED base is resolvable; otherwise skip (conservative).
+        if self.prov.get(root) != Provenance::Imported {
+            return;
+        }
+        let (line, col) = self.lines.line_col(m.span);
+        let r = super::refs::ref_for_base(
+            base,
+            line,
+            col,
+            self.imports,
+            self.module_map,
+            self.referencing_file,
+            &self.referencing_key,
+        );
+        self.out.edges.push(r);
+    }
+
     /// Route a JSX-prop expression value (`onX={value}`).
     ///
     /// JSX handlers run on interaction ⇒ **event phase** (spec 027 §2.4): their
@@ -191,6 +226,8 @@ impl FnValueWalker<'_> {
                 let (line, col) = self.lines.line_col(id.span);
                 self.handle_ident_value(id.sym.as_ref(), line, col, phase);
             }
+            // member-expr handler (`onClick={ns.save}`) — edge iff base imported.
+            Expr::Member(m) => self.handle_member_value(m),
             _ => {}
         }
     }
@@ -319,6 +356,12 @@ impl FnValueWalker<'_> {
                 let (line, col) = self.lines.line_col(id.span);
                 self.handle_ident_value(id.sym.as_ref(), line, col, phase);
             }
+            // A MEMBER function value (`useEffect(ns.handler, [])`) → edge iff its
+            // base resolves through the import table; otherwise skipped (same rule
+            // as the JSX-prop path). Built-in data-arg hooks (useRef, …) never
+            // reach `handle_call_arg`, so this cannot fabricate an edge for a DATA
+            // member arg.
+            Some(Expr::Member(m)) => self.handle_member_value(m),
             Some(Expr::Object(obj)) if !is_builtin => self.handle_options_object(obj, phase),
             _ => {}
         }
@@ -795,6 +838,95 @@ mod tests {
             "useRef named arg is DATA — the function is NOT adopted as a callback"
         );
         assert!(v.edges.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Finding (Copilot R8, #37): member-expression function values.
+    //
+    // `onClick={ns.save}` / `useEffect(ns.handler, [])` where `ns` is a namespace
+    // import must emit a propagation EDGE (so the imported handler's effects reach
+    // the component through the fold). A member-expr on a LOCAL object resolves to
+    // nothing in the import table → NO edge (conservative; never guessed).
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn namespace_member_jsx_handler_is_edge() {
+        // `import * as ns from './handlers'; onClick={ns.save}` → edge to the
+        // namespace member (base = "ns.save"; resolves via ref_for_base).
+        let v = fn_values(
+            "import * as ns from './handlers';\n\
+             function C(){ return <button onClick={ns.save}/>; }",
+            "C",
+        );
+        assert!(
+            v.owned_value_sites.is_empty(),
+            "namespace-member handler is NOT owned"
+        );
+        assert_eq!(
+            v.edges.len(),
+            1,
+            "namespace-member handler emits one edge; edges={:?}",
+            v.edges
+        );
+        assert_eq!(v.edges[0].base, "ns.save");
+        assert_eq!(v.edges[0].module.as_deref(), Some("./handlers"));
+    }
+
+    #[test]
+    fn namespace_member_hook_arg_is_edge() {
+        // `import * as ns from './h'; useEffect(ns.handler, [])` → edge.
+        let v = fn_values(
+            "import * as ns from './h';\n\
+             function C(){ useEffect(ns.handler, []); return <div/>; }",
+            "C",
+        );
+        assert!(
+            v.owned_value_sites.is_empty(),
+            "namespace-member hook arg is NOT owned"
+        );
+        assert_eq!(
+            v.edges.len(),
+            1,
+            "namespace-member hook arg emits one edge; edges={:?}",
+            v.edges
+        );
+        assert_eq!(v.edges[0].base, "ns.handler");
+        assert_eq!(v.edges[0].module.as_deref(), Some("./h"));
+    }
+
+    #[test]
+    fn local_object_member_value_emits_no_edge() {
+        // Guard: a member expr whose base is a LOCAL object (not an import) must
+        // NOT emit an edge — we cannot resolve it, so we skip (never fabricate).
+        let v = fn_values(
+            "function C(){ const handlers = { save: () => fetch('/x') }; return <button onClick={handlers.save}/>; }",
+            "C",
+        );
+        assert!(
+            v.owned_value_sites.is_empty(),
+            "local-object member handler is not owned"
+        );
+        assert!(
+            v.edges.is_empty(),
+            "local-object member handler emits NO edge (base is not an import); edges={:?}",
+            v.edges
+        );
+    }
+
+    #[test]
+    fn received_object_member_value_emits_no_edge() {
+        // Guard: a member expr whose base is a RECEIVED prop object must NOT emit
+        // an edge (we cannot resolve it across the prop boundary).
+        let v = fn_values(
+            "function C({handlers}){ return <button onClick={handlers.save}/>; }",
+            "C",
+        );
+        assert!(v.owned_value_sites.is_empty());
+        assert!(
+            v.edges.is_empty(),
+            "received-object member handler emits NO edge; edges={:?}",
+            v.edges
+        );
     }
 
     #[test]
