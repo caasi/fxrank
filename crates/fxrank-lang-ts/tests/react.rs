@@ -355,6 +355,17 @@ fn console_warn_in_render_is_not_effect_in_render() {
         .iter()
         .find(|h| h.symbol == "C")
         .expect("component C");
+    // Precondition: the test must genuinely exercise "logging present, but no
+    // EffectInRender" — assert the Logging effect IS detected, so the test would
+    // fail (not silently pass) if console.warn detection ever broke.
+    assert!(
+        c_body
+            .effects
+            .iter()
+            .any(|e| e.kind == fxrank_core::effect::EffectKind::Logging),
+        "precondition: console.warn must produce a Logging effect; effects={:?}",
+        c_body.effects.iter().map(|e| e.kind).collect::<Vec<_>>(),
+    );
     assert!(
         c_body
             .risk_features
@@ -371,6 +382,17 @@ fn console_warn_in_render_is_not_effect_in_render() {
         .iter()
         .find(|h| h.symbol == "C")
         .expect("component C");
+    // Precondition: the absorbed useMemo callback's console.warn must surface as
+    // a Logging effect on the component — otherwise the no-EffectInRender check
+    // below would pass vacuously (no logging detected at all).
+    assert!(
+        c_memo
+            .effects
+            .iter()
+            .any(|e| e.kind == fxrank_core::effect::EffectKind::Logging),
+        "precondition: console.warn in the absorbed useMemo callback must produce a Logging effect; effects={:?}",
+        c_memo.effects.iter().map(|e| e.kind).collect::<Vec<_>>(),
+    );
     assert!(
         c_memo
             .risk_features
