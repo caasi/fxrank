@@ -1421,8 +1421,8 @@ mod tests {
         let h = scan_fixture_hotspots("calls");
         let io = h.iter().find(|x| x.symbol == "io_boundary").unwrap();
         // open(…) + requests.get(…) → NetFsDb class 7, weight 21 each.
-        // logging.info(…)           → Logging class 4, weight 5.
-        // weights = [21, 21, 5] → own_score = 21 + 0.5*(21+5) = 34.0
+        // logging.info(…)           → Logging class 2, weight 2.
+        // weights = [21, 21, 2] → own_score = 21 + 0.5*(21+2) = 32.5
         assert_eq!(io.max_class, 7);
         assert!(
             io.own_score >= 21.0,

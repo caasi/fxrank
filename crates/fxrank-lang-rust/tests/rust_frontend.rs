@@ -158,7 +158,7 @@ fn pure_function_has_no_effects() {
 // ── Task 12: macro effect detection ─────────────────────────────────────────
 
 #[test]
-fn println_is_logging_class_4_exact() {
+fn println_is_logging_class_2_exact() {
     let out = analyze_fixture("macros.rs");
     // logging_exact uses println!, eprintln!, print!, eprint!, dbg! — all logging.
     let effects = effects_of(&out, "logging_exact");
@@ -171,7 +171,7 @@ fn println_is_logging_class_4_exact() {
         "expected at least one logging effect in logging_exact"
     );
     for e in &logging {
-        assert_eq!(e.class, 4, "logging class must be 4");
+        assert_eq!(e.class, 2, "logging class must be 2");
         assert_eq!(
             e.tier,
             Tier::Exact,
@@ -200,7 +200,7 @@ fn log_and_tracing_are_logging_path_tier_not_unknown() {
         "expected two logging effects (log::info + tracing::warn)"
     );
     for e in &logging {
-        assert_eq!(e.class, 4);
+        assert_eq!(e.class, 2);
         assert_eq!(
             e.tier,
             Tier::Path,

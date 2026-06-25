@@ -1645,7 +1645,7 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
     /// the CLI's `explicit_files` override; `apply_fold` surfaces it onto `hotspot.root`.
     ///
     /// Source: `import logging\nlogging.basicConfig()` — top-level call to
-    /// `logging.basicConfig` (root "logging" → Logging class 4) runs at import
+    /// `logging.basicConfig` (root "logging" → Logging class 2) runs at import
     /// time → `<module>` hotspot.
     #[test]
     #[cfg(feature = "python")]
@@ -1663,7 +1663,7 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let py_file = dir.join("mod.py");
         // `logging.basicConfig()` — top-level call with root "logging" → Logging
-        // class 4.  This runs at import time, so the Python detector emits a
+        // class 2.  This runs at import time, so the Python detector emits a
         // `<module>` hotspot with a logging effect.
         std::fs::write(
             &py_file,
