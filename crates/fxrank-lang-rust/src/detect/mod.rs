@@ -113,12 +113,15 @@ pub fn build_record(
     unit: &FnUnit,
     imports: &ImportTable,
     statics: &HashSet<String>,
+    module_tree: &crate::module_tree::ModuleTree,
 ) -> fxrank_core::record::UnitRecord {
     let effects = gather(unit, imports, statics);
     let risks = risk::detect_fn_risks(&unit.block, &unit.sig, &unit.path);
-    let call_refs = refs::extract(&unit.block, imports);
     let await_count = count_awaits(&unit.block);
     let async_boundary = unit.sig.asyncness.is_some() || await_count > 0;
+    let canonical_path = canonical_path_of(unit, module_tree);
+    let referencing_mod = module_of_unit(&canonical_path, &unit.symbol);
+    let call_refs = refs::extract(&unit.block, imports, &referencing_mod);
 
     fxrank_core::record::UnitRecord {
         unit_id: unit.id.clone(),
@@ -127,13 +130,83 @@ pub fn build_record(
         col: unit.col,
         symbol: unit.symbol.clone(),
         is_root: false,
-        export: None,
+        canonical_path,
+        aliases: vec![], // pub-use AliasFacts deferred (025-3e §9)
         effects,
         risks,
         refs: call_refs,
         async_boundary,
         await_count,
         language: fxrank_core::frontend::Language::Rust,
+    }
+}
+
+/// canonical_path = ["crate"] ++ file-module ++ inline-mod nesting ++ symbol segments.
+/// Returns empty when the file has no module path (no crate root in scope).
+fn canonical_path_of(unit: &FnUnit, module_tree: &crate::module_tree::ModuleTree) -> Vec<String> {
+    let Some(file_mod) = module_tree.module_of(&unit.path) else {
+        return vec![];
+    };
+    let mut segs = vec!["crate".to_string()];
+    segs.extend(file_mod);
+    segs.extend(unit.mod_path.iter().cloned());
+    segs.extend(symbol_segments(&unit.symbol));
+    segs
+}
+
+/// The module a unit lives in = its canonical_path minus the symbol segments.
+/// Returns an EMPTY vec for an empty canonical_path (a root-less file): callers
+/// pass it to `resolve_in_crate`, which returns `None` for self/super when the
+/// module is empty — so we never fabricate a `["crate"]` anchor that could
+/// false-resolve. (025-3e §6)
+fn module_of_unit(canonical: &[String], symbol: &str) -> Vec<String> {
+    if canonical.is_empty() {
+        return vec![];
+    }
+    let drop = symbol_segments(symbol).len();
+    canonical[..canonical.len().saturating_sub(drop)].to_vec()
+}
+
+/// Split a display symbol into path-meaningful segments:
+/// `"f"` → ["f"]; `"S::method"` → ["S","method"];
+/// `"<S as T>::method"` → ["S","method"] (trait qualifier dropped for identity).
+///
+/// Relies on `functions.rs` already normalizing generics out of the type name
+/// (`last_segment_ident` returns the bare ident), so the LHS is `S`, `<S as T>`,
+/// never `S<u32>`. The `<`/`>`/` as ` peeling below is robust to those forms.
+fn symbol_segments(symbol: &str) -> Vec<String> {
+    if let Some((lhs, method)) = symbol.rsplit_once("::") {
+        // lhs is "S" (inherent) or "<S as T>" (trait impl). Strip the angle
+        // brackets and the trait qualifier, leaving the self-type ident.
+        let ty = lhs
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .split(" as ")
+            .next()
+            .unwrap_or(lhs)
+            .trim();
+        vec![ty.to_string(), method.to_string()]
+    } else {
+        vec![symbol.to_string()]
+    }
+}
+
+#[cfg(test)]
+mod symbol_segments_tests {
+    use super::symbol_segments;
+
+    #[test]
+    fn segments_free_inherent_and_trait_impl() {
+        assert_eq!(symbol_segments("free_fn"), vec!["free_fn".to_string()]);
+        assert_eq!(
+            symbol_segments("S::method"),
+            vec!["S".to_string(), "method".into()]
+        );
+        // The trait-impl form: angle brackets + trait qualifier both stripped.
+        assert_eq!(
+            symbol_segments("<S as T>::method"),
+            vec!["S".to_string(), "method".into()]
+        );
     }
 }
 
@@ -147,8 +220,9 @@ mod tests {
             syn::parse_file("use std::fs; fn writer(p: &str) { fs::write(p, b\"x\"); }").unwrap();
         let imports = crate::imports::ImportTable::from_file(&f);
         let statics = std::collections::HashSet::new();
+        let mt = crate::module_tree::ModuleTree::build(&[]);
         let units = crate::functions::collect(&f, "a.rs");
-        let rec = build_record(&units[0], &imports, &statics);
+        let rec = build_record(&units[0], &imports, &statics, &mt);
         assert_eq!(rec.symbol, "writer");
         assert!(
             rec.refs.iter().any(|r| r.base.contains("fs::write")),
@@ -161,5 +235,49 @@ mod tests {
         );
         assert_eq!(rec.unit_id, units[0].id);
         assert!(!rec.is_root);
+    }
+
+    #[test]
+    fn build_record_sets_canonical_path_from_module_tree() {
+        use crate::module_tree::ModuleTree;
+        use fxrank_core::frontend::SourceFile;
+
+        let mt = ModuleTree::build(&[
+            SourceFile {
+                path: "src/lib.rs".into(),
+                text: String::new(),
+            },
+            SourceFile {
+                path: "src/helpers.rs".into(),
+                text: String::new(),
+            },
+        ]);
+        let src = "fn write() {}";
+        let file = syn::parse_file(src).unwrap();
+        let unit = &crate::functions::collect(&file, "src/helpers.rs")[0];
+        let imports = ImportTable::from_file(&file);
+        let statics = std::collections::HashSet::new();
+        let rec = build_record(unit, &imports, &statics, &mt);
+        assert_eq!(
+            rec.canonical_path,
+            vec!["crate".to_string(), "helpers".into(), "write".into()]
+        );
+    }
+
+    #[test]
+    fn build_record_empty_canonical_when_no_root() {
+        use crate::module_tree::ModuleTree;
+        use fxrank_core::frontend::SourceFile;
+        // No lib.rs/main.rs in the batch → no module path → empty canonical_path.
+        let mt = ModuleTree::build(&[SourceFile {
+            path: "src/helpers.rs".into(),
+            text: String::new(),
+        }]);
+        let file = syn::parse_file("fn write() {}").unwrap();
+        let unit = &crate::functions::collect(&file, "src/helpers.rs")[0];
+        let imports = ImportTable::from_file(&file);
+        let statics = std::collections::HashSet::new();
+        let rec = build_record(unit, &imports, &statics, &mt);
+        assert!(rec.canonical_path.is_empty());
     }
 }

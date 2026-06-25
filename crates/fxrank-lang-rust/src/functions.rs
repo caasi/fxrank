@@ -37,6 +37,10 @@ pub struct FnUnit {
     /// `#[cfg(test)]` module). Computed at collection time; test units are
     /// excluded from scoring by default.
     pub is_test: bool,
+    /// Inline-`mod` nesting within the file (`["a","b"]` for `mod a { mod b { fn } }`).
+    /// Empty for a top-level item. Combined with the file's module path to form
+    /// the canonical path. (025-3e)
+    pub mod_path: Vec<String>,
 }
 
 /// Returns `true` when `attrs` contains `#[test]` or `#[bench]`.
@@ -67,11 +71,17 @@ pub(crate) fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
 /// skipped — the caller is expected to feed each file separately.
 pub fn collect(file: &syn::File, path: &str) -> Vec<FnUnit> {
     let mut units = Vec::new();
-    collect_items(&file.items, path, false, &mut units);
+    collect_items(&file.items, path, false, &[], &mut units);
     units
 }
 
-fn collect_items(items: &[Item], path: &str, in_cfg_test: bool, out: &mut Vec<FnUnit>) {
+fn collect_items(
+    items: &[Item],
+    path: &str,
+    in_cfg_test: bool,
+    mod_path: &[String],
+    out: &mut Vec<FnUnit>,
+) {
     for item in items {
         match item {
             Item::Fn(f) => {
@@ -89,21 +99,24 @@ fn collect_items(items: &[Item], path: &str, in_cfg_test: bool, out: &mut Vec<Fn
                     sig: f.sig.clone(),
                     block: *f.block.clone(),
                     is_test,
+                    mod_path: mod_path.to_vec(),
                 });
             }
 
             Item::Impl(impl_block) => {
-                collect_from_impl(impl_block, path, in_cfg_test, out);
+                collect_from_impl(impl_block, path, in_cfg_test, mod_path, out);
             }
 
             Item::Trait(trait_item) => {
-                collect_from_trait(trait_item, path, in_cfg_test, out);
+                collect_from_trait(trait_item, path, in_cfg_test, mod_path, out);
             }
 
             Item::Mod(m) => {
                 if let Some((_, nested_items)) = &m.content {
                     let nested_in_cfg_test = in_cfg_test || is_cfg_test(&m.attrs);
-                    collect_items(nested_items, path, nested_in_cfg_test, out);
+                    let mut child = mod_path.to_vec();
+                    child.push(m.ident.to_string());
+                    collect_items(nested_items, path, nested_in_cfg_test, &child, out);
                 }
                 // `mod foo;` without a body is out-of-line — skip.
             }
@@ -113,7 +126,13 @@ fn collect_items(items: &[Item], path: &str, in_cfg_test: bool, out: &mut Vec<Fn
     }
 }
 
-fn collect_from_impl(impl_block: &ItemImpl, path: &str, in_cfg_test: bool, out: &mut Vec<FnUnit>) {
+fn collect_from_impl(
+    impl_block: &ItemImpl,
+    path: &str,
+    in_cfg_test: bool,
+    mod_path: &[String],
+    out: &mut Vec<FnUnit>,
+) {
     // Render the self type as the last path-segment ident (e.g. `S` for `impl S`).
     let type_name = last_path_ident(&impl_block.self_ty);
 
@@ -145,6 +164,7 @@ fn collect_from_impl(impl_block: &ItemImpl, path: &str, in_cfg_test: bool, out: 
                 sig: method.sig.clone(),
                 block: method.block.clone(),
                 is_test,
+                mod_path: mod_path.to_vec(),
             });
         }
     }
@@ -154,6 +174,7 @@ fn collect_from_trait(
     trait_item: &ItemTrait,
     path: &str,
     in_cfg_test: bool,
+    mod_path: &[String],
     out: &mut Vec<FnUnit>,
 ) {
     let trait_name = trait_item.ident.to_string();
@@ -178,6 +199,7 @@ fn collect_from_trait(
                     sig: method.sig.clone(),
                     block: block.clone(),
                     is_test,
+                    mod_path: mod_path.to_vec(),
                 });
             }
             // Bodyless `fn required(&self);` — skip.
@@ -215,5 +237,24 @@ mod tests {
         let units = collect(&file, "a.rs");
         assert_eq!(units[0].col, 4); // 1-based column of `foo`
         assert!(units[0].id.ends_with(":4:foo")); // col already in id
+    }
+
+    #[test]
+    fn inline_module_nesting_recorded_in_mod_path() {
+        let src = r#"
+            fn top() {}
+            mod a {
+                fn mid() {}
+                mod b {
+                    fn deep() {}
+                }
+            }
+        "#;
+        let file = syn::parse_file(src).unwrap();
+        let units = collect(&file, "x.rs");
+        let by = |name: &str| units.iter().find(|u| u.symbol == name).unwrap();
+        assert_eq!(by("top").mod_path, Vec::<String>::new());
+        assert_eq!(by("mid").mod_path, vec!["a".to_string()]);
+        assert_eq!(by("deep").mod_path, vec!["a".to_string(), "b".to_string()]);
     }
 }
