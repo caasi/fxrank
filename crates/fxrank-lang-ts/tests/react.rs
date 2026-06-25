@@ -936,6 +936,28 @@ fn phase_fixture_three_weightings_differ() {
     );
 }
 
+/// Finding 1 (Copilot, #37): a weakly-recognized component (PascalCase + `.tsx`
+/// alone, no JSX/hook strong signal) carries the recognition confidence (0.8)
+/// through to its emitted hotspot — `is_component`'s `confidence` field must be
+/// min-clamped into `hotspots[].confidence`, not discarded.
+#[test]
+fn weak_component_recognition_lowers_hotspot_confidence() {
+    // PascalCase name, `.tsx` file, but returns no JSX and uses no hooks: the only
+    // recognition signal is PascalCase + extension ⇒ ComponentSignal.confidence 0.8.
+    let hs = util::analyze_tsx("function Widget() { return 1; }");
+    let c = hs.iter().find(|h| h.symbol == "Widget").expect("Widget");
+    assert!(
+        c.confidence < 1.0,
+        "weak component recognition (0.8) must lower the hotspot confidence; got {}",
+        c.confidence
+    );
+    assert!(
+        (c.confidence - 0.8).abs() < f64::EPSILON,
+        "hotspot confidence must reflect the 0.8 recognition confidence; got {}",
+        c.confidence
+    );
+}
+
 /// Finding 2 (Copilot, #37): a built-in hook whose args[0] is DATA (not a
 /// callback) must NOT have that arg adopted as an owned deferred callback.
 /// `useRef(() => fetch())` stores the arrow as a mutable cell value — React
@@ -975,3 +997,4 @@ fn useinsertioneffect_callback_is_adopted_effect_phase() {
         fetch.discounted_to, None,
         "effect-phase callback is the honest baseline (no event discount)"
     );
+}

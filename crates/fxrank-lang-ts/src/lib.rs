@@ -245,6 +245,10 @@ fn analyze_units(
 
     // Pass 2: score each unit, re-parenting owned units into their component.
     let mut by_id: HashMap<String, Hotspot> = HashMap::new();
+    // id -> component-recognition confidence (< 1.0 for a weak PascalCase+.tsx
+    // recognition). Applied in the final recompute loop as a min-clamp so a
+    // re-recompute (adopt_effects) cannot overwrite it. Spec 027 §4.5.
+    let mut comp_recognition_conf: HashMap<String, f64> = HashMap::new();
     // id -> &FnUnit for every emitted (non-suppressed) unit, so the final loop
     // can recover the unit to build its record (path/col + own-body refs).
     // Suppressed (owned) units are never inserted here (they `continue` below),
@@ -287,8 +291,14 @@ fn analyze_units(
             continue;
         }
         let mut h = detect::analyze_unit(unit, imports, lines, module_bindings);
-        if react::is_component(unit, &unit.path).is {
+        let signal = react::is_component(unit, &unit.path);
+        if signal.is {
             detect::augment_component(&mut h, unit, lines);
+            // Spec 027 §4.5: a weak recognition (PascalCase + `.tsx` alone, no
+            // JSX/hook strong signal) carries confidence < 1.0. Min-clamp it into
+            // the hotspot so the heuristic uncertainty of "is this even a
+            // component?" surfaces (mirrors the unknown_count penalty below).
+            comp_recognition_conf.insert(unit.id.clone(), signal.confidence);
         }
         by_id.insert(unit.id.clone(), h);
         unit_by_id.insert(unit.id.as_str(), unit);
@@ -325,6 +335,15 @@ fn analyze_units(
         if let Some(&unknown_count) = comp_unknown.get(id.as_str()) {
             let penalty = 0.9_f64.powi(unknown_count as i32);
             h.confidence = h.confidence.min(penalty);
+        }
+
+        // Spec 027 §4.5 (Copilot finding #37): min-clamp by the component-
+        // recognition confidence. A weak recognition (PascalCase + `.tsx` alone,
+        // no JSX/hook strong signal) carries 0.8; this surfaces the heuristic
+        // uncertainty of the component-vs-plain-function call. Runs in the last
+        // recompute so `adopt_effects` cannot overwrite it (weakest-link min).
+        if let Some(&recog_conf) = comp_recognition_conf.get(id.as_str()) {
+            h.confidence = h.confidence.min(recog_conf);
         }
 
         let mut absorbed_refs = pending_refs.remove(id.as_str()).unwrap_or_default();
