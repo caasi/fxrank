@@ -54,8 +54,8 @@ pub struct OwnedValueSite {
     /// or the declaration span of a bare-ident handler (the same anchor
     /// `functions::collect` records, so it matches a `FnUnit`).
     pub anchor: (usize, usize),
-    /// React phase of the owning site (`Effect` for JSX handlers / effect-phase
-    /// hooks, `Render` for render-phase hooks).
+    /// React phase of the owning site (`Event` for JSX handlers, `Effect` for
+    /// effect-phase hooks, `Render` for render-phase hooks).
     pub phase: HookPhase,
 }
 
