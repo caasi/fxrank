@@ -199,7 +199,10 @@ impl Visit for FnValueWalker<'_> {
         // Recognized hooks: route the inline-arrow callback argument by phase.
         if let Some(name) = hook_callee_name(node) {
             match name {
-                "useEffect" | "useLayoutEffect" => {
+                "useEffect" | "useLayoutEffect" | "useInsertionEffect" => {
+                    // `useInsertionEffect`'s args[0] IS an effect callback, exactly
+                    // like `useEffect` (it runs before layout effects, but is still
+                    // an effect-phase callback) ⇒ adopt it as Effect phase.
                     self.handle_call_arg(node, 0, HookPhase::Effect, true);
                     return; // own-body only: do not descend into the callback scope
                 }
@@ -217,17 +220,32 @@ impl Visit for FnValueWalker<'_> {
                     self.handle_call_arg(node, 2, HookPhase::Render, true);
                     return;
                 }
-                // An unrecognized `use[A-Z]…` hook: ownership of an inline-arrow
-                // arg is certain (the component hands it over), but the invocation
-                // schedule is not ⇒ Unknown phase (event-like + confidence
-                // penalty applied in `adopt_effects`). Spec 027 §6/§4.3.
-                // `is_builtin_hook` = false for custom hooks: their object arg IS
-                // an options/callback bag and MUST be descended (e.g. useMutation).
-                _ if crate::react::is_hook_name(name) => {
-                    let is_builtin = crate::react::is_builtin_hook(name);
-                    self.handle_call_arg(node, 0, HookPhase::Unknown, is_builtin);
+                // A `use[A-Z]…` hook reaching the fallback. Split on built-in vs
+                // custom:
+                //
+                // - **Custom hooks** (`is_builtin = false`, e.g. `useMutation`):
+                //   ownership of an inline-arrow arg is certain (the component hands
+                //   it over), but the invocation schedule is not ⇒ Unknown phase
+                //   (event-like + confidence penalty applied in `adopt_effects`).
+                //   Their object arg IS an options/callback bag and MUST be
+                //   descended (spec 027 §6/§4.3). So adopt args[0] (arrow/fn or
+                //   options object).
+                //
+                // - **Built-in hooks** that reach here (`useRef`, `useId`,
+                //   `useDeferredValue`, `useContext`, `useTransition`, …) take
+                //   DATA or no callback at args[0] — `useRef(() => fetch())` stores
+                //   the arrow as a mutable cell value, React never invokes it. Do
+                //   NOT adopt args[0]; fall through to plain recursion. (The rarer
+                //   built-ins whose callback lives elsewhere — `useImperativeHandle`
+                //   args[1], `useActionState`/`useSyncExternalStore` args[0] — stay
+                //   conservatively un-adopted: under-attribute, never false-positive.
+                //   `useInsertionEffect` is handled by the effect arm above.)
+                _ if crate::react::is_hook_name(name) && !crate::react::is_builtin_hook(name) => {
+                    self.handle_call_arg(node, 0, HookPhase::Unknown, false);
                     return;
                 }
+                // A built-in hook reaching the fallback (useRef, useId, …): its
+                // args[0] is DATA, not a callback — do not adopt; recurse below.
                 _ => {}
             }
         }

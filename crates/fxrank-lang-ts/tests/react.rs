@@ -935,3 +935,43 @@ fn phase_fixture_three_weightings_differ() {
         "event-phase max_class must be 6 (conditionality discount)"
     );
 }
+
+/// Finding 2 (Copilot, #37): a built-in hook whose args[0] is DATA (not a
+/// callback) must NOT have that arg adopted as an owned deferred callback.
+/// `useRef(() => fetch())` stores the arrow as a mutable cell value — React
+/// never invokes it — so the component must NOT gain the `net.fs.db` effect.
+#[test]
+fn useref_data_arg_not_adopted_as_callback() {
+    let hs =
+        util::analyze_tsx("function C(){ const r = useRef(() => fetch('/x')); return <div/>; }");
+    let c = hs.iter().find(|h| h.symbol == "C").expect("C");
+    assert!(
+        !c.effects
+            .iter()
+            .any(|e| e.kind == fxrank_core::effect::EffectKind::NetFsDb),
+        "useRef args[0] is a stored data value, not a callback — component must \
+         NOT gain net.fs.db; effects={:?}",
+        c.effects.iter().map(|e| e.kind).collect::<Vec<_>>(),
+    );
+}
+
+/// Finding 2 (Copilot, #37): `useInsertionEffect` IS an effect-phase hook (its
+/// args[0] is an effect callback, exactly like `useEffect`) — the explicit arm
+/// must keep adopting it so the regression is avoided.
+#[test]
+fn useinsertioneffect_callback_is_adopted_effect_phase() {
+    let hs = util::analyze_tsx(
+        "function C(){ useInsertionEffect(() => fetch('/x'), []); return <div/>; }",
+    );
+    let c = hs.iter().find(|h| h.symbol == "C").expect("C");
+    let fetch = c
+        .effects
+        .iter()
+        .find(|e| e.kind == fxrank_core::effect::EffectKind::NetFsDb)
+        .expect("useInsertionEffect callback is owned (net.fs.db)");
+    // Effect-phase: full weight, no conditionality discount.
+    assert_eq!(fetch.class, 7, "base class unchanged");
+    assert_eq!(
+        fetch.discounted_to, None,
+        "effect-phase callback is the honest baseline (no event discount)"
+    );
