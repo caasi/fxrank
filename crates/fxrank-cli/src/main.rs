@@ -45,6 +45,10 @@ enum Cmd {
         /// Skip cross-file resolution + propagation; emit per-file own scores only.
         #[arg(long)]
         no_resolve: bool,
+        /// Path to a tsconfig.json (or a directory containing one) for resolving TS
+        /// `paths`/`baseUrl` aliases (tsc-compatible `-p`). TS/JS only; ignored for Rust/Python.
+        #[arg(long, short = 'p')]
+        project: Option<PathBuf>,
     },
 }
 
@@ -78,9 +82,18 @@ fn main() -> ExitCode {
         lang,
         exclude,
         no_resolve,
+        project,
     } = cli.cmd;
 
-    match run_scan(path, limit, include_tests, lang, exclude, no_resolve) {
+    match run_scan(
+        path,
+        limit,
+        include_tests,
+        lang,
+        exclude,
+        no_resolve,
+        project,
+    ) {
         Ok(report) => {
             // Compact JSON: no trailing newline issues — println! adds exactly one.
             println!(
@@ -115,6 +128,7 @@ fn run_scan(
     lang: Option<String>,
     exclude: Option<Vec<String>>,
     no_resolve: bool,
+    project: Option<PathBuf>,
 ) -> Result<Report, String> {
     // Accumulated read-error diagnostics (files that exist but couldn't be read).
     let mut read_errors: Vec<Diagnostic> = Vec::new();
@@ -214,7 +228,9 @@ fn run_scan(
     let source_count = routed.len();
 
     // Dispatch to the appropriate frontend(s) and merge outputs.
-    let mut output = dispatch(routed, include_tests);
+    // `config_errors` carries diagnostics that are NOT scanned-source parse failures
+    // (e.g. a tsconfig load error) and must be excluded from the parse-failure count.
+    let (mut output, config_errors) = dispatch(routed, include_tests, project);
 
     // Override `is_root` / `root` using CLI-level explicit-file membership.
     // A unit is a root iff its file was passed as an explicit FILE argument (or
@@ -272,11 +288,15 @@ fn run_scan(
         }
     }
 
-    // Count parse diagnostics from the frontend (not read errors).
+    // Count parse diagnostics from the frontend (not read errors, not config errors).
+    // Config errors (e.g. tsconfig load failures) are kept in `config_errors` and
+    // excluded here so that `scope.parsed` reflects only scanned-source parse failures.
     let parse_diag_count = output.diagnostics.iter().filter(|d| !d.parsed).count();
 
-    // Merge frontend diagnostics with file-read diagnostics.
+    // Merge frontend diagnostics with file-read diagnostics and config-level errors.
+    // Both read_errors and config_errors are added AFTER the parse count is taken.
     let mut all_diagnostics = output.diagnostics;
+    all_diagnostics.extend(config_errors);
     all_diagnostics.extend(read_errors);
 
     let scope = Scope {
@@ -513,7 +533,19 @@ fn merge_output(acc: &mut FrontendOutput, mut other: FrontendOutput) {
 /// Rust sources need the `rust` feature; TS sources need the `ts` feature. When
 /// a source's frontend feature is not compiled in, a "no frontend available"
 /// diagnostic is emitted per file (mirroring the slim-build behavior).
-fn dispatch(routed: Vec<RoutedSource>, include_tests: bool) -> FrontendOutput {
+///
+/// `project` is forwarded to the TS frontend for tsconfig paths/baseUrl alias
+/// resolution. For non-TS frontends it is ignored.
+///
+/// Returns `(output, config_errors)` where `config_errors` carries diagnostics
+/// that are NOT scanned-source parse failures (e.g. a tsconfig load error).
+/// The caller adds these to the report AFTER computing `scope.parsed` so they
+/// do not incorrectly decrement the parsed-source count.
+fn dispatch(
+    routed: Vec<RoutedSource>,
+    include_tests: bool,
+    project: Option<PathBuf>,
+) -> (FrontendOutput, Vec<Diagnostic>) {
     // Partition by route.
     let mut rust_sources: Vec<SourceFile> = Vec::new();
     // TS sources keyed by extension so each `Lang` dialect group runs separately.
@@ -530,9 +562,10 @@ fn dispatch(routed: Vec<RoutedSource>, include_tests: bool) -> FrontendOutput {
 
     let mut output = FrontendOutput::default();
     merge_output(&mut output, dispatch_rust(rust_sources, include_tests));
-    merge_output(&mut output, dispatch_ts(ts_sources, include_tests));
+    let (ts_output, ts_config_errors) = dispatch_ts(ts_sources, include_tests, project);
+    merge_output(&mut output, ts_output);
     merge_output(&mut output, dispatch_python(python_sources, include_tests));
-    output
+    (output, ts_config_errors)
 }
 
 #[cfg(feature = "rust")]
@@ -559,11 +592,43 @@ fn dispatch_rust(sources: Vec<SourceFile>, _include_tests: bool) -> FrontendOutp
 }
 
 #[cfg(feature = "ts")]
-fn dispatch_ts(sources: Vec<(String, SourceFile)>, include_tests: bool) -> FrontendOutput {
+fn dispatch_ts(
+    sources: Vec<(String, SourceFile)>,
+    include_tests: bool,
+    project: Option<PathBuf>,
+) -> (FrontendOutput, Vec<Diagnostic>) {
     use fxrank_core::frontend::Frontend;
     use fxrank_lang_ts::TsFrontend;
     use fxrank_lang_ts::source::Lang;
+    use fxrank_lang_ts::tsconfig;
     use std::collections::HashMap;
+
+    // Bug 1 fix: if there are no TS sources to scan, skip tsconfig loading entirely.
+    // --project is documented as TS/JS-only; loading on a Rust/Python-only scan would
+    // emit a spurious tsconfig error diagnostic even though no TS files are involved.
+    if sources.is_empty() {
+        return (FrontendOutput::default(), Vec::new());
+    }
+
+    // Load tsconfig once for the whole TS batch. A load error is returned as a
+    // config-level diagnostic (scanning continues with aliases unresolved — never panics).
+    // Bug 2 fix: the tsconfig diagnostic is returned separately (not in output.diagnostics)
+    // so the caller can add it AFTER computing scope.parsed, keeping the parsed-source
+    // count accurate (a config file error is NOT a scanned-source parse failure).
+    let (ts_cfg, config_errors) = match project {
+        Some(ref p) => match tsconfig::load(p) {
+            Ok(cfg) => (Some(cfg), Vec::new()),
+            Err(msg) => (
+                None,
+                vec![Diagnostic {
+                    path: p.to_string_lossy().into_owned(),
+                    parsed: false,
+                    error: msg,
+                }],
+            ),
+        },
+        None => (None, Vec::new()),
+    };
 
     // Group by resolved `Lang` so each dialect runs with its own syntax. The
     // grouping key is the `Lang` (a `.ts` and a `.tsx` in one dir differ).
@@ -581,14 +646,19 @@ fn dispatch_ts(sources: Vec<(String, SourceFile)>, include_tests: bool) -> Front
         let frontend = TsFrontend {
             lang,
             include_tests,
+            tsconfig: ts_cfg.clone(),
         };
         merge_output(&mut output, frontend.analyze(&group));
     }
-    output
+    (output, config_errors)
 }
 
 #[cfg(not(feature = "ts"))]
-fn dispatch_ts(sources: Vec<(String, SourceFile)>, _include_tests: bool) -> FrontendOutput {
+fn dispatch_ts(
+    sources: Vec<(String, SourceFile)>,
+    _include_tests: bool,
+    _project: Option<PathBuf>,
+) -> (FrontendOutput, Vec<Diagnostic>) {
     let mut output = FrontendOutput::default();
     for (ext, src) in sources {
         output.diagnostics.push(Diagnostic {
@@ -597,7 +667,7 @@ fn dispatch_ts(sources: Vec<(String, SourceFile)>, _include_tests: bool) -> Fron
             error: format!("no frontend available for .{ext} (built without 'ts' feature)"),
         });
     }
-    output
+    (output, Vec::new())
 }
 
 #[cfg(feature = "python")]
@@ -657,8 +727,8 @@ mod tests {
     #[cfg(feature = "rust")]
     fn run_scan_propagates_cross_file_io_to_caller() {
         let dir = write_cross_file_fixture();
-        let report =
-            run_scan(Some(dir.clone()), None, false, None, None, false).expect("scan succeeds");
+        let report = run_scan(Some(dir.clone()), None, false, None, None, false, None)
+            .expect("scan succeeds");
         std::fs::remove_dir_all(&dir).ok();
 
         let caller = report
@@ -693,8 +763,8 @@ mod tests {
     #[cfg(feature = "rust")]
     fn run_scan_no_resolve_leaves_propagated_equal_to_own() {
         let dir = write_cross_file_fixture();
-        let report =
-            run_scan(Some(dir.clone()), None, false, None, None, true).expect("scan succeeds");
+        let report = run_scan(Some(dir.clone()), None, false, None, None, true, None)
+            .expect("scan succeeds");
         std::fs::remove_dir_all(&dir).ok();
 
         let caller = report
@@ -740,8 +810,8 @@ mod tests {
     #[cfg(feature = "rust")]
     fn run_scan_propagates_intra_file_io_to_outer() {
         let dir = write_intra_file_fixture();
-        let report =
-            run_scan(Some(dir.clone()), None, false, None, None, false).expect("scan succeeds");
+        let report = run_scan(Some(dir.clone()), None, false, None, None, false, None)
+            .expect("scan succeeds");
         std::fs::remove_dir_all(&dir).ok();
 
         let inner = report
@@ -791,8 +861,8 @@ mod tests {
     #[cfg(feature = "rust")]
     fn run_scan_no_resolve_intra_file_propagated_equals_own() {
         let dir = write_intra_file_fixture();
-        let report =
-            run_scan(Some(dir.clone()), None, false, None, None, true).expect("scan succeeds");
+        let report = run_scan(Some(dir.clone()), None, false, None, None, true, None)
+            .expect("scan succeeds");
         std::fs::remove_dir_all(&dir).ok();
 
         let outer = report
@@ -842,8 +912,8 @@ mod tests {
     #[cfg(feature = "python")]
     fn run_scan_propagates_intra_file_io_to_outer_python() {
         let dir = write_python_intra_file_fixture();
-        let report =
-            run_scan(Some(dir.clone()), None, false, None, None, false).expect("scan succeeds");
+        let report = run_scan(Some(dir.clone()), None, false, None, None, false, None)
+            .expect("scan succeeds");
         std::fs::remove_dir_all(&dir).ok();
 
         let inner = report
@@ -897,8 +967,8 @@ mod tests {
     #[cfg(feature = "python")]
     fn run_scan_no_resolve_intra_file_python_propagated_equals_own() {
         let dir = write_python_intra_file_fixture();
-        let report =
-            run_scan(Some(dir.clone()), None, false, None, None, true).expect("scan succeeds");
+        let report = run_scan(Some(dir.clone()), None, false, None, None, true, None)
+            .expect("scan succeeds");
         std::fs::remove_dir_all(&dir).ok();
 
         let outer = report
@@ -1104,8 +1174,8 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
         .expect("write p.py");
 
         // --- scan ---
-        let report =
-            run_scan(Some(dir.clone()), None, false, None, None, false).expect("scan succeeds");
+        let report = run_scan(Some(dir.clone()), None, false, None, None, false, None)
+            .expect("scan succeeds");
         std::fs::remove_dir_all(&dir).ok();
 
         // --- locate the four hotspots ---
@@ -1208,8 +1278,8 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
     #[cfg(feature = "ts")]
     fn run_scan_propagates_intra_file_io_to_outer_ts() {
         let dir = write_ts_intra_file_fixture();
-        let report =
-            run_scan(Some(dir.clone()), None, false, None, None, false).expect("scan succeeds");
+        let report = run_scan(Some(dir.clone()), None, false, None, None, false, None)
+            .expect("scan succeeds");
         std::fs::remove_dir_all(&dir).ok();
 
         let inner = report
@@ -1263,8 +1333,8 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
     #[cfg(feature = "ts")]
     fn run_scan_no_resolve_intra_file_ts_propagated_equals_own() {
         let dir = write_ts_intra_file_fixture();
-        let report =
-            run_scan(Some(dir.clone()), None, false, None, None, true).expect("scan succeeds");
+        let report = run_scan(Some(dir.clone()), None, false, None, None, true, None)
+            .expect("scan succeeds");
         std::fs::remove_dir_all(&dir).ok();
 
         let outer = report
@@ -1307,8 +1377,8 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
         )
         .expect("write method.ts");
 
-        let report =
-            run_scan(Some(dir.clone()), None, false, None, None, false).expect("scan succeeds");
+        let report = run_scan(Some(dir.clone()), None, false, None, None, false, None)
+            .expect("scan succeeds");
         std::fs::remove_dir_all(&dir).ok();
 
         let push_hs = report
@@ -1399,8 +1469,8 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
     fn run_scan_dir_arg_no_roots() {
         let (dir, _a, _b) = write_root_fixture();
         // with resolve
-        let report =
-            run_scan(Some(dir.clone()), None, false, None, None, false).expect("scan succeeds");
+        let report = run_scan(Some(dir.clone()), None, false, None, None, false, None)
+            .expect("scan succeeds");
         assert!(
             report.hotspots.iter().all(|h| !h.root),
             "directory scan must produce zero root hotspots (resolve=true), got roots: {:?}",
@@ -1412,8 +1482,8 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
                 .collect::<Vec<_>>()
         );
         // without resolve
-        let report2 =
-            run_scan(Some(dir.clone()), None, false, None, None, true).expect("scan succeeds");
+        let report2 = run_scan(Some(dir.clone()), None, false, None, None, true, None)
+            .expect("scan succeeds");
         assert!(
             report2.hotspots.iter().all(|h| !h.root),
             "directory scan must produce zero root hotspots (resolve=false), got roots: {:?}",
@@ -1435,7 +1505,7 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
         let (dir, a, _b) = write_root_fixture();
         // with resolve
         let report =
-            run_scan(Some(a.clone()), None, false, None, None, false).expect("scan succeeds");
+            run_scan(Some(a.clone()), None, false, None, None, false, None).expect("scan succeeds");
         assert!(
             !report.hotspots.is_empty(),
             "explicit file scan must yield at least one hotspot"
@@ -1452,7 +1522,7 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
         );
         // without resolve
         let report2 =
-            run_scan(Some(a.clone()), None, false, None, None, true).expect("scan succeeds");
+            run_scan(Some(a.clone()), None, false, None, None, true, None).expect("scan succeeds");
         assert!(
             report2.hotspots.iter().all(|h| h.root),
             "all hotspots from an explicit file must be roots (resolve=false), non-roots: {:?}",
@@ -1501,8 +1571,8 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
         std::fs::write(&tmp, ts_src).expect("write temp ts file");
 
         // Explicit file scan: root must be true (same code path as stdin explicit_files insert)
-        let report =
-            run_scan(Some(tmp.clone()), None, false, None, None, false).expect("scan succeeds");
+        let report = run_scan(Some(tmp.clone()), None, false, None, None, false, None)
+            .expect("scan succeeds");
         assert!(
             !report.hotspots.is_empty(),
             "stdin proxy scan must yield at least one hotspot"
@@ -1512,8 +1582,8 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
             "stdin (proxied via explicit TS file) units must all be roots (resolve=true)"
         );
         // without resolve
-        let report2 =
-            run_scan(Some(tmp.clone()), None, false, None, None, true).expect("scan succeeds");
+        let report2 = run_scan(Some(tmp.clone()), None, false, None, None, true, None)
+            .expect("scan succeeds");
         assert!(
             report2.hotspots.iter().all(|h| h.root),
             "stdin (proxied via explicit TS file) units must all be roots (resolve=false)"
@@ -1554,7 +1624,7 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
 
         // Pass as explicit FILE arg so the CLI marks this file's units as roots.
         let report =
-            run_scan(Some(ts_file), None, false, None, None, false).expect("scan succeeds");
+            run_scan(Some(ts_file), None, false, None, None, false, None).expect("scan succeeds");
         std::fs::remove_dir_all(&dir).ok();
 
         let module_hs = report
@@ -1605,7 +1675,7 @@ __pycache__,.eggs,build,dist,.mypy_cache,.pytest_cache,.ruff_cache,site-packages
 
         // Pass as explicit FILE arg so the CLI marks this file's units as roots.
         let report =
-            run_scan(Some(py_file), None, false, None, None, false).expect("scan succeeds");
+            run_scan(Some(py_file), None, false, None, None, false, None).expect("scan succeeds");
         std::fs::remove_dir_all(&dir).ok();
 
         let module_hs = report
