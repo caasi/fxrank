@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FxRank — an effect-cost profiler for coding agents</title>
+<meta name="description" content="FxRank is an effect-cost profiler for coding agents: it ranks each function by its effect cost so an agent can find refactor hotspots. A measuring instrument — reports facts, gives no advice, signal not gospel. This page holds only the durable why; install and usage live in the tool and the crate.">
+<link rel="canonical" href="https://caasi.github.io/fxrank/">
+
+<!-- Durable facts only: what it is and why it exists. Install/usage/flags/schema are
+     deliberately NOT here — they drift, and live in the crate and the binary's --help. -->
+<meta name="fxrank:what" content="effect-cost profiler for coding agents; ranks each function by its own-body effect cost (IO, mutation, panic, risk)">
+<meta name="fxrank:thesis" content="anti-Goodhart: a declared, visible effect scores lower than the same effect hidden behind a pure-looking signature">
+<meta name="fxrank:nature" content="measuring instrument; reports facts not refactoring advice; signal not gospel; verify before you trust">
+<meta name="fxrank:correctness" content="primarily syntactic and imperfect by design; useful as triage, not as a verdict">
+<meta name="fxrank:usage-lives-in" content="the binary's --help and the crate page; not duplicated here so it cannot drift">
+<meta name="fxrank:known-risks" content="https://github.com/caasi/fxrank/issues">
+<meta name="fxrank:repository" content="https://github.com/caasi/fxrank">
+<meta name="fxrank:crate" content="https://crates.io/crates/fxrank">
+<meta name="fxrank:license" content="MIT OR Apache-2.0">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "FxRank",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Cross-platform",
+  "description": "An effect-cost profiler for coding agents. It ranks each function by its own-body effect cost (IO, mutation, panic, risk) so an agent can find the hotspots worth refactoring toward a purer core. A measuring instrument: it reports facts and gives no refactoring advice.",
+  "url": "https://caasi.github.io/fxrank/",
+  "codeRepository": "https://github.com/caasi/fxrank",
+  "installUrl": "https://crates.io/crates/fxrank",
+  "programmingLanguage": ["Rust", "TypeScript", "JavaScript", "Python"],
+  "license": "MIT OR Apache-2.0",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+}
+</script>
+
+<script type="application/json" id="fxrank-concept">
+{
+  "name": "FxRank",
+  "what": "An effect-cost profiler for coding agents. It ranks each function by its own-body effect cost (IO, mutation, panic, risk) so an agent can find the hotspots worth refactoring toward a purer core.",
+  "thesis": "It gives a gradient, not a pure/impure label, and it knows a type system makes some effects safer than others. A declared, visible effect is bounded and scores lower; the same effect hidden behind a pure-looking signature scores higher. The honest cost ranking below the sneaky one is the whole point.",
+  "nature": [
+    "a measuring instrument, not a linter",
+    "reports facts (effect kind, severity class, evidence, confidence); gives no refactoring advice",
+    "the decision stays with the agent"
+  ],
+  "epistemic_stance": [
+    "primarily syntactic: no type checker, no borrow checker, so it is wrong sometimes",
+    "triage, not a verdict: it only has to be directionally right to float real hotspots to the top",
+    "cost is asymmetric: a false positive costs one look, a good ranking saves reading the whole repo",
+    "signal, not gospel: verify the top hotspots against source, then decide"
+  ],
+  "usage_lives_in": "Install and usage are intentionally not on this page; they live in the crate and the binary's own --help, so they cannot drift out of sync with the tool.",
+  "known_risks": "The specific, evolving limitations are not listed here because they change; they live in the issue tracker: https://github.com/caasi/fxrank/issues",
+  "repository": "https://github.com/caasi/fxrank",
+  "crate": "https://crates.io/crates/fxrank",
+  "license": "MIT OR Apache-2.0"
+}
+</script>
+</head>
+<body>
+<main>
+
+<h1>FxRank — an effect-cost profiler for coding agents</h1>
+
+<p>FxRank ranks each function by its <strong>effect cost</strong> — how much IO, mutation, panic, and risk it carries in its own body — so a coding agent can find the hotspots worth refactoring toward a purer core. It is a <strong>measuring instrument</strong>: it reports facts and gives <strong>no refactoring advice</strong>. The decision stays with the agent.</p>
+
+<h2>The thesis</h2>
+<p>FxRank gives a <strong>gradient</strong>, not a pure/impure label, and it knows a language's type system makes some effects safer than others. A declared, visible effect is bounded and scores <em>lower</em>; the same effect hidden behind a pure-looking signature scores <em>higher</em>. That inversion — the honest cost ranking below the sneaky one — is the whole point.</p>
+
+<h2>Imperfect by design, useful anyway</h2>
+<p>FxRank is primarily <strong>syntactic</strong> — it runs no type checker and no borrow checker — so it is wrong sometimes. That is acceptable, because it is <strong>triage, not a verdict</strong>. It only has to be directionally right to float the real hotspots toward the top of a ranking; it need not be precise on every function to save you from reading the whole repo.</p>
+<p>The cost is asymmetric: a false positive costs you one look, while a good ranking saves you reading forty files. Treat the output as a <strong>signal, not gospel</strong> — verify the top hotspots against the source, then decide.</p>
+<p>The specific, evolving limitations are not listed here, because they change. They live in the issue tracker: <a href="https://github.com/caasi/fxrank/issues">https://github.com/caasi/fxrank/issues</a>.</p>
+
+<h2>Where install and usage live</h2>
+<p>This page holds only the durable <em>why</em>. Install instructions, the exact invocation, flags, and the output schema are deliberately <strong>not duplicated here</strong> — they would drift. They live where they stay current: the crate page, and the binary's own <code>--help</code>. Ask the tool.</p>
+
+<h2>Source</h2>
+<ul>
+<li>Repository: <a href="https://github.com/caasi/fxrank">https://github.com/caasi/fxrank</a></li>
+<li>Crate (install &amp; usage): <a href="https://crates.io/crates/fxrank">https://crates.io/crates/fxrank</a></li>
+<li>License: MIT OR Apache-2.0</li>
+</ul>
+
+</main>
+</body>
+</html>
