@@ -4,6 +4,7 @@ pub mod coverage;
 pub mod detect;
 pub mod functions;
 pub mod imports;
+pub mod module_map;
 pub mod source;
 
 use fxrank_core::CorpusProfile;
@@ -62,6 +63,10 @@ impl Frontend for PythonFrontend {
     }
 
     fn analyze(&self, files: &[SourceFile]) -> FrontendOutput {
+        // Build PyModuleMap once over ALL files so every per-file build_record call
+        // can compute canonical_path without rebuilding the package tree each time.
+        let module_map = module_map::PyModuleMap::build(files);
+
         let mut output = FrontendOutput::default();
         for file in files {
             let src = source::strip_bom(&file.text);
@@ -162,6 +167,7 @@ impl Frontend for PythonFrontend {
                                     &imports,
                                     &module_bindings,
                                     &span,
+                                    &module_map,
                                 ));
                             }
                         }
@@ -194,6 +200,7 @@ impl Frontend for PythonFrontend {
                                     &imports,
                                     &module_bindings,
                                     &span,
+                                    &module_map,
                                 );
                                 output.records.push(rec);
                                 output.functions.push(h);
@@ -373,5 +380,97 @@ mod tests {
         ] {
             assert!(!is_test_file(p), "expected NON-test file: {p}");
         }
+    }
+
+    /// End-to-end false-resolve guard (spec 025-3e §8).
+    ///
+    /// A file imports `subprocess.run` as the local name `run` AND defines a
+    /// local `def run(): ...` at module level. When `caller()` calls `run()`,
+    /// the frontend must NOT resolve the call to the local `def run` — the import
+    /// table wins: `run` is `subprocess.run` (stdlib, not in the scan batch), so
+    /// `resolved_target` is `None` and `qualified` is `true`. `resolve_ref_precise`
+    /// must therefore return `Edge::Opaque` (ThirdParty), never `Edge::Resolved`.
+    ///
+    /// This is the headline false-resolve the 025-3e adoption closes for Python:
+    /// the same-named local cannot hijack a stdlib-qualified import in the adopted
+    /// CanonicalIndex path.
+    #[test]
+    fn false_resolve_killed() {
+        use fxrank_core::record::CallSiteRef;
+        use fxrank_core::resolve::{CanonicalIndex, resolve_ref_precise};
+
+        // The collision source: `from subprocess import run` + `def run(): ...` + `caller`.
+        // The same-named local is the essential ingredient: without it the test cannot
+        // catch an erroneous Resolved-to-local edge.
+        let src = "\
+from subprocess import run
+
+def run():
+    pass
+
+def caller():
+    run(['ls'])
+";
+        let file_path = "app.py";
+        // Single-file batch (no __init__.py) — subprocess is NOT in-batch.
+        let files = vec![SourceFile {
+            path: file_path.to_string(),
+            text: src.to_string(),
+        }];
+        let out = PythonFrontend {
+            include_tests: false,
+        }
+        .analyze(&files);
+        assert!(
+            out.diagnostics.is_empty(),
+            "unexpected parse error: {:?}",
+            out.diagnostics
+        );
+
+        // Build the CanonicalIndex — must be adopted (local `def run` has a canonical_path).
+        let idx = CanonicalIndex::from_records(&out.records);
+        assert!(
+            idx.adopted(),
+            "index must be adopted: the local `def run` must carry a canonical_path"
+        );
+
+        // Find the caller's record and locate the `run` ref.
+        let caller_rec = out
+            .records
+            .iter()
+            .find(|r| r.symbol == "caller")
+            .expect("caller record not found");
+        let run_ref: &CallSiteRef = caller_rec
+            .refs
+            .iter()
+            .find(|r| r.base == "run")
+            .expect("expected a ref with base 'run' in caller");
+
+        // The ref must be qualified (run is imported from subprocess).
+        assert!(
+            run_ref.qualified,
+            "run ref must be qualified=true (imported from subprocess)"
+        );
+        // resolved_target must be None (subprocess is not in-batch → out-of-corpus).
+        assert_eq!(
+            run_ref.resolved_target, None,
+            "subprocess.run is not in-batch → resolved_target must be None"
+        );
+
+        // The headline assertion: resolve_ref_precise must yield Opaque, NEVER Resolved.
+        let edge = resolve_ref_precise(run_ref, &idx, file_path);
+        let is_opaque = matches!(edge, Some(fxrank_core::graph::Edge::Opaque(_)));
+        assert!(
+            is_opaque,
+            "subprocess.run must resolve to Edge::Opaque (stdlib), \
+             not Edge::Resolved to the local `def run`; got: {edge:?}",
+            edge = if matches!(edge, Some(fxrank_core::graph::Edge::Resolved(_))) {
+                "Edge::Resolved (FALSE RESOLVE — BUG)"
+            } else if edge.is_none() {
+                "None"
+            } else {
+                "Edge::Opaque (correct)"
+            }
+        );
     }
 }

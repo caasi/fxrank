@@ -69,6 +69,16 @@ pub struct FnUnit<'a> {
     /// Lambdas are never test units. This flag is set at collection time when
     /// the class context is available; `PythonFrontend::analyze` checks it.
     pub is_test_unit: bool,
+    /// `true` ONLY for a `def`/`async def` directly at the module top level.
+    /// `false` for methods (inside a `ClassDef`), nested defs (inside another `def`),
+    /// lambdas, and the synthetic `<module>` unit.
+    ///
+    /// This is the *never-false-resolve guard* for `canonical_path`: Python
+    /// `FnUnit.symbol` is the BARE name (a method `def write` has symbol `"write"`),
+    /// so without this flag a method `write` would get `canonical_path = [pkg,util,write]`
+    /// and a `from pkg.util import write` call could false-resolve to the method.
+    /// Only module-level defs are importable as `module.<name>`.
+    pub is_module_level: bool,
     /// The function body (suite or lambda expression) to walk for own-body effects.
     pub body: FnBody<'a>,
     /// The unit's own parameters — their **default** expressions are charged to it.
@@ -113,6 +123,7 @@ pub fn collect<'a>(
         anchors,
         lambda_idx: 0,
         class_stack: Vec::new(),
+        def_depth: 0,
         out: Vec::new(),
     };
 
@@ -205,6 +216,8 @@ pub fn module_init_unit<'a>(module: &'a Module<'a>) -> Option<FnUnit<'a>> {
         col: 1,
         is_async: false,
         is_test_unit: false,
+        // The synthetic `<module>` unit is not a real importable function.
+        is_module_level: false,
         body: FnBody::Module(&module.body),
         params: &EMPTY_PARAMS,
         decorators: &[],
@@ -249,6 +262,10 @@ struct Ctx<'a, 'b> {
     /// Stack of enclosing class contexts (outermost first).
     /// Empty when not inside any class body.
     class_stack: Vec<ClassCtx>,
+    /// Number of enclosing `def`/`async def` scopes. A `def` at the module top
+    /// level has `def_depth == 0` at the point it is emitted; nested defs and
+    /// methods have `def_depth >= 1`. Used to set `FnUnit.is_module_level`.
+    def_depth: usize,
     out: Vec<FnUnit<'a>>,
 }
 
@@ -365,12 +382,19 @@ fn collect_funcdef<'a>(f: &'a FunctionDef<'a>, ctx: &mut Ctx<'a, '_>) {
     let in_test_class = ctx.class_stack.last().is_some_and(|c| c.is_test_class);
     let is_test_unit = f.name.value.starts_with("test_") || in_test_class;
 
+    // Module-level guard: a def is module-level only when it is directly in the
+    // top-level statement list (def_depth == 0, class_stack empty). A method
+    // (class_stack non-empty) and a nested def (def_depth >= 1) are NOT
+    // module-level and thus not importable as `module.<name>`. (P2-1)
+    let is_module_level = ctx.def_depth == 0 && ctx.class_stack.is_empty();
+
     ctx.out.push(FnUnit {
         symbol: f.name.value.to_owned(),
         line,
         col,
         is_async: f.asynchronous.is_some(),
         is_test_unit,
+        is_module_level,
         body: FnBody::Suite(&f.body),
         params: &f.params,
         decorators: &f.decorators,
@@ -384,8 +408,11 @@ fn collect_funcdef<'a>(f: &'a FunctionDef<'a>, ctx: &mut Ctx<'a, '_>) {
         collect_in_expr(&dec.decorator, ctx);
     }
     collect_in_params(&f.params, ctx);
-    // Recurse into body for nested defs and lambdas.
+    // Recurse into body for nested defs and lambdas. Increment def_depth so
+    // any nested defs are NOT treated as module-level.
+    ctx.def_depth += 1;
     collect_in_suite(&f.body, ctx);
+    ctx.def_depth -= 1;
 }
 
 /// Collect lambdas in parameter-default expressions (`def f(cb=lambda: 0)`).
@@ -538,7 +565,8 @@ fn collect_in_expr<'a>(expr: &'a Expression<'a>, ctx: &mut Ctx<'a, '_>) {
     match expr {
         Expression::Lambda(l) => {
             // Pre-order: emit this lambda BEFORE descending into its body.
-            // Lambdas are never considered test units or roots.
+            // Lambdas are never considered test units or roots, and are never
+            // module-level (not importable as `module.<name>`).
             if let Some(&(line, col)) = ctx.anchors.get(ctx.lambda_idx) {
                 ctx.out.push(FnUnit {
                     symbol: format!("<lambda@L{line}C{col}>"),
@@ -546,6 +574,7 @@ fn collect_in_expr<'a>(expr: &'a Expression<'a>, ctx: &mut Ctx<'a, '_>) {
                     col,
                     is_async: false,
                     is_test_unit: false,
+                    is_module_level: false,
                     body: FnBody::Expr(&l.body),
                     params: &l.params,
                     decorators: &[],

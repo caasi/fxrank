@@ -32,10 +32,28 @@ use crate::source::{SpanIndex, anchor_of_subslice};
 /// - `kind = RefKind::Method` if `base.contains('.')` AND `module.is_none()`
 ///   (a receiver attribute/method like `self.foo`/`x.bar`); else `RefKind::Free`.
 /// - `line`/`col` from the `leftmost_name` anchor via the span.
-pub fn extract(unit: &FnUnit, imports: &Imports, span: &SpanIndex) -> Vec<CallSiteRef> {
+/// - `resolved_target` via the unified expand-split-resolve rule (see brief §5.3):
+///   Step A: expand `base` to a full dotted path using `imports.resolve(root)`,
+///   distinguishing the `import a.b.c` form (R is a segment-boundary prefix of
+///   base → use base as-is) from the `from m import n` form (R is not a prefix
+///   → replace root with R, keep trailing members). Step B: split full into
+///   `target_module` + `name`. Step C: resolve `target_module` via the map
+///   (relative if `imports.relative_level(root)` is Some, else absolute) and
+///   emit `[..key, name]` on a hit; else `None`.
+pub fn extract(
+    unit: &FnUnit,
+    imports: &Imports,
+    span: &SpanIndex,
+    referencing_module: &[String],
+    referencing_is_package: bool,
+    module_map: &crate::module_map::PyModuleMap,
+) -> Vec<CallSiteRef> {
     let mut sink = RefSink {
         imports,
         span,
+        referencing_module,
+        referencing_is_package,
+        module_map,
         refs: Vec::new(),
     };
     walk_own_body(unit, &mut sink);
@@ -45,6 +63,9 @@ pub fn extract(unit: &FnUnit, imports: &Imports, span: &SpanIndex) -> Vec<CallSi
 struct RefSink<'a> {
     imports: &'a Imports,
     span: &'a SpanIndex<'a>,
+    referencing_module: &'a [String],
+    referencing_is_package: bool,
+    module_map: &'a crate::module_map::PyModuleMap,
     refs: Vec<CallSiteRef>,
 }
 
@@ -78,6 +99,16 @@ impl EffectSink for RefSink<'_> {
 
         let first_party = self.imports.is_relative(root);
 
+        let resolved_target = resolve_in_project(
+            &rendered,
+            root,
+            &module,
+            self.imports,
+            self.referencing_module,
+            self.referencing_is_package,
+            self.module_map,
+        );
+
         self.refs.push(CallSiteRef {
             kind,
             base: rendered,
@@ -86,7 +117,7 @@ impl EffectSink for RefSink<'_> {
             col,
             qualified,
             first_party,
-            resolved_target: None,
+            resolved_target,
         });
     }
 
@@ -96,10 +127,97 @@ impl EffectSink for RefSink<'_> {
     }
 }
 
+/// The unified expand-split-resolve rule for `resolved_target` (spec 025-3e §5.3).
+///
+/// `base` is the full rendered callee (e.g. `"os.getcwd"`, `"run"`, `"pkg.util.write"`).
+/// `root` is `base.split('.').next()`.
+/// `module` is `imports.resolve(root)` (already computed by the caller).
+///
+/// Step A — expand to a full dotted callee path:
+/// - `RefKind::Method` (`base.contains('.')` AND `module.is_none()`) → `None` (unresolvable
+///   receiver call; `module` being `None` is exactly the `kind == Method` condition).
+/// - If `module` (= R) is `Some`:
+///   - If R is a segment-boundary prefix of `base` (the `import a.b.c` form, where the code
+///     already spells the full path) → `full = base` (use as-is).
+///   - Else (the `from m import n` form) → `full = R + base[root.len()..]` (replace root
+///     with its resolved dotted path, keep any trailing `.member` suffix).
+/// - If `module` is `None` AND `base` has no `.` (bare free call) → same-module candidate:
+///   `[..referencing_module, root]`.
+/// - Else → `None`.
+///
+/// Step B — split: `name = last segment of full`, `target_module = all-but-last joined`.
+///
+/// Step C — resolve `target_module` against the map; emit `[..key, name]` on hit, else `None`.
+fn resolve_in_project(
+    base: &str,
+    root: &str,
+    module: &Option<String>,
+    imports: &Imports,
+    referencing_module: &[String],
+    referencing_is_package: bool,
+    module_map: &crate::module_map::PyModuleMap,
+) -> Option<Vec<String>> {
+    // Step A — expand base to full dotted callee path.
+    let full: String = match module {
+        Some(r) => {
+            // Is R a segment-boundary prefix of base?
+            // A segment-boundary prefix means `base` starts with `r` followed by either
+            // end-of-string or a `.` (so we don't match `os` as a prefix of `osx`).
+            let r_is_segment_prefix = base == r.as_str() || base.starts_with(&format!("{r}."));
+            if r_is_segment_prefix {
+                // `import a.b.c` form — base already spells the full path.
+                base.to_string()
+            } else {
+                // `from m import n` form — replace root with R, keep trailing suffix.
+                // base[root.len()..] is either "" (bare `n()`) or ".member..." (`n.method()`).
+                format!("{r}{}", &base[root.len()..])
+            }
+        }
+        None => {
+            if !base.contains('.') {
+                // Bare free call, no import → same-module candidate.
+                let mut target: Vec<String> = referencing_module.to_vec();
+                target.push(root.to_string());
+                return Some(target);
+            } else {
+                // Method call on a non-imported receiver → unresolvable.
+                return None;
+            }
+        }
+    };
+
+    // Step B — split: name = last segment, target_module = all-but-last.
+    // A bare relative from-import like `from . import write` expands to a dot-free
+    // `full` (e.g. `"write"`). In that case target_module is empty and the anchor
+    // package is resolved by `resolve_relative("", level)` below (Step C).
+    let (target_module, name): (&str, &str) = match full.rfind('.') {
+        Some(p) => (&full[..p], &full[p + 1..]),
+        None => ("", full.as_str()), // relative bare from-import: name = full, pkg via resolve_relative("")
+    };
+
+    // Step C — resolve target_module; emit [..key, name] on hit.
+    let key = if let Some(level) = imports.relative_level(root) {
+        module_map.resolve_relative(
+            referencing_module,
+            referencing_is_package,
+            level,
+            target_module,
+        )?
+    } else {
+        module_map.resolve_absolute(target_module)?
+    };
+
+    let mut result = key;
+    result.push(name.to_string());
+    Some(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::functions;
+    use crate::module_map::PyModuleMap;
+    use fxrank_core::frontend::SourceFile;
     use fxrank_core::record::RefKind;
 
     /// Parse inline source and return refs for the function named `sym`.
@@ -113,7 +231,41 @@ mod tests {
             .iter()
             .find(|u| u.symbol == sym)
             .unwrap_or_else(|| panic!("symbol {sym} not found"));
-        extract(unit, &imports, &span)
+        let empty_map = PyModuleMap::build(&[]);
+        extract(unit, &imports, &span, &[], false, &empty_map)
+    }
+
+    /// Parse `src` as if it lives at `file`, build a `PyModuleMap` from `batch_files`,
+    /// and return refs for the function named `sym`. The referencing module is derived
+    /// from `file` via the map.
+    fn refs_with_map(src: &str, file: &str, sym: &str, batch_files: &[&str]) -> Vec<CallSiteRef> {
+        let files: Vec<SourceFile> = batch_files
+            .iter()
+            .map(|p| SourceFile {
+                path: p.to_string(),
+                text: String::new(),
+            })
+            .collect();
+        let module_map = PyModuleMap::build(&files);
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let imports = Imports::build(&module);
+        let span = SpanIndex::new(src);
+        let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
+        let (units, _) = functions::collect(&module, src, &span, &anchors);
+        let unit = units
+            .iter()
+            .find(|u| u.symbol == sym)
+            .unwrap_or_else(|| panic!("symbol {sym} not found"));
+        let referencing_module = module_map.module_of(file).unwrap_or_default();
+        let referencing_is_package = module_map.is_package(file);
+        extract(
+            unit,
+            &imports,
+            &span,
+            &referencing_module,
+            referencing_is_package,
+            &module_map,
+        )
     }
 
     #[test]
@@ -203,5 +355,139 @@ mod tests {
             .expect("os.getcwd not found");
         assert_eq!(r.line, 3, "os.getcwd is on line 3");
         assert!(r.col >= 1);
+    }
+
+    #[test]
+    fn absolute_in_batch_import_resolves() {
+        // from pkg.util import write; write()  → ["pkg","util","write"]
+        let src = "from pkg.util import write\ndef caller():\n    write()\n";
+        let refs = refs_with_map(
+            src,
+            "pkg/app.py",
+            "caller",
+            &["pkg/__init__.py", "pkg/app.py", "pkg/util.py"],
+        );
+        let r = refs.iter().find(|r| r.base == "write").unwrap();
+        assert_eq!(
+            r.resolved_target,
+            Some(vec!["pkg".into(), "util".into(), "write".into()])
+        );
+    }
+
+    #[test]
+    fn stdlib_import_stays_unresolved_for_opaque() {
+        // from subprocess import run; run()  → None (not in batch → opaque, the false-resolve fix)
+        let src = "from subprocess import run\ndef caller():\n    run(['ls'])\n";
+        let refs = refs_with_map(
+            src,
+            "pkg/app.py",
+            "caller",
+            &["pkg/__init__.py", "pkg/app.py"],
+        );
+        let r = refs.iter().find(|r| r.base == "run").unwrap();
+        assert_eq!(
+            r.resolved_target, None,
+            "subprocess.run must be unresolved (→ opaque), never a local run"
+        );
+    }
+
+    #[test]
+    fn relative_import_resolves_with_level() {
+        // in pkg.sub.mod: from ..util import write
+        let src = "from ..util import write\ndef caller():\n    write()\n";
+        let refs = refs_with_map(
+            src,
+            "pkg/sub/mod.py",
+            "caller",
+            &[
+                "pkg/__init__.py",
+                "pkg/sub/__init__.py",
+                "pkg/sub/mod.py",
+                "pkg/util.py",
+            ],
+        );
+        let r = refs.iter().find(|r| r.base == "write").unwrap();
+        assert_eq!(
+            r.resolved_target,
+            Some(vec!["pkg".into(), "util".into(), "write".into()])
+        );
+    }
+
+    #[test]
+    fn dotted_module_member_call_resolves() {
+        // import pkg.util; pkg.util.write()  → ["pkg","util","write"] (unified expand-split rule)
+        let src = "import pkg.util\ndef caller():\n    pkg.util.write()\n";
+        let refs = refs_with_map(
+            src,
+            "pkg/app.py",
+            "caller",
+            &["pkg/__init__.py", "pkg/app.py", "pkg/util.py"],
+        );
+        let r = refs.iter().find(|r| r.base == "pkg.util.write").unwrap();
+        assert_eq!(
+            r.resolved_target,
+            Some(vec!["pkg".into(), "util".into(), "write".into()])
+        );
+    }
+
+    #[test]
+    fn method_call_on_from_imported_value_is_unresolved() {
+        // from pkg import Client; Client.get()  — Client is a CLASS (pkg.Client is NOT an in-batch
+        // module), so the expand→ "pkg.Client.get" → module "pkg.Client" → resolve_absolute miss →
+        // None. Must NOT resolve `get` to a coincidental module member (never-guess).
+        let src = "from pkg import Client\ndef caller():\n    Client.get()\n";
+        let refs = refs_with_map(
+            src,
+            "pkg/app.py",
+            "caller",
+            &["pkg/__init__.py", "pkg/app.py"],
+        );
+        let r = refs.iter().find(|r| r.base.starts_with("Client")).unwrap();
+        assert_eq!(
+            r.resolved_target, None,
+            "method call on a from-imported value must be opaque"
+        );
+    }
+
+    #[test]
+    fn same_module_bare_call_resolves_to_own_module() {
+        let src = "def helper():\n    pass\ndef caller():\n    helper()\n";
+        let refs = refs_with_map(
+            src,
+            "pkg/app.py",
+            "caller",
+            &["pkg/__init__.py", "pkg/app.py"],
+        );
+        let r = refs.iter().find(|r| r.base == "helper").unwrap();
+        assert_eq!(
+            r.resolved_target,
+            Some(vec!["pkg".into(), "app".into(), "helper".into()])
+        );
+    }
+
+    #[test]
+    fn relative_bare_from_import_resolves_to_package_member() {
+        // pkg/sub/mod.py: `from . import write; write()`
+        // `from . import write` → level=1, full="write" (no module_path), so rfind('.') was
+        // returning None before the fix (the call went opaque). With the fix, target_module=""
+        // and resolve_relative("pkg.sub.mod", is_package=false, level=1, suffix="") →
+        // anchor=pkg.sub, up=0 → pkg.sub (= pkg/sub/__init__.py key) → [pkg,sub,write].
+        let src = "from . import write\ndef caller():\n    write()\n";
+        let refs = refs_with_map(
+            src,
+            "pkg/sub/mod.py",
+            "caller",
+            &[
+                "pkg/__init__.py",
+                "pkg/sub/__init__.py",
+                "pkg/sub/mod.py",
+                "pkg/sub/write.py",
+            ],
+        );
+        let r = refs.iter().find(|r| r.base == "write").unwrap();
+        assert_eq!(
+            r.resolved_target,
+            Some(vec!["pkg".into(), "sub".into(), "write".into()])
+        );
     }
 }

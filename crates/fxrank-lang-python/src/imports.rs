@@ -40,10 +40,11 @@ use libcst_native::{
 pub struct Imports {
     /// local name → fully-qualified path string.
     table: HashMap<String, String>,
-    /// Local names that came from a **relative** (leading-dot) `from`-import.
-    /// e.g. `from . import sibling` and `from .utils import helper` both add to
-    /// this set.  Plain `import` and absolute `from m import n` do not.
-    relative_locals: HashSet<String>,
+    /// Local names that came from a **relative** (leading-dot) `from`-import,
+    /// mapped to their dot-level (`from.relative.len()`).
+    /// e.g. `from . import sibling` → level 1, `from .. import x` → level 2.
+    /// Plain `import` and absolute `from m import n` do not appear here.
+    relative_levels: HashMap<String, usize>,
     /// `true` when `importlib` or `__import__` appears as an imported name.
     dynamic: bool,
 }
@@ -59,14 +60,14 @@ impl Imports {
     /// for a syntactic heuristic (see spec *Deferred / Future work*).
     pub fn build(module: &Module) -> Self {
         let mut table: HashMap<String, String> = HashMap::new();
-        let mut relative_locals: HashSet<String> = HashSet::new();
+        let mut relative_levels: HashMap<String, usize> = HashMap::new();
         let mut dynamic = false;
         for stmt in &module.body {
-            collect_stmt(stmt, &mut table, &mut relative_locals, &mut dynamic);
+            collect_stmt(stmt, &mut table, &mut relative_levels, &mut dynamic);
         }
         Self {
             table,
-            relative_locals,
+            relative_levels,
             dynamic,
         }
     }
@@ -82,7 +83,14 @@ impl Imports {
     /// `from`-import (`from . import x`, `from .mod import y`, etc.).
     /// Returns `false` for absolute imports and unknown names.
     pub fn is_relative(&self, local: &str) -> bool {
-        self.relative_locals.contains(local)
+        self.relative_levels.contains_key(local)
+    }
+
+    /// The dot-level of a relative import's local name (`from.relative.len()`).
+    /// `from . import x` → `Some(1)`, `from .. import x` → `Some(2)`.
+    /// Returns `None` for absolute imports and unknown names.
+    pub fn relative_level(&self, local: &str) -> Option<usize> {
+        self.relative_levels.get(local).copied()
     }
 
     /// `true` when `importlib` or `__import__` appears as an imported name,
@@ -100,34 +108,34 @@ impl Imports {
 fn collect_stmt(
     stmt: &Statement,
     table: &mut HashMap<String, String>,
-    relative_locals: &mut HashSet<String>,
+    relative_levels: &mut HashMap<String, usize>,
     dynamic: &mut bool,
 ) {
     match stmt {
         Statement::Simple(line) => {
             for small in &line.body {
-                collect_small(small, table, relative_locals, dynamic);
+                collect_small(small, table, relative_levels, dynamic);
             }
         }
-        Statement::Compound(c) => collect_compound(c, table, relative_locals, dynamic),
+        Statement::Compound(c) => collect_compound(c, table, relative_levels, dynamic),
     }
 }
 
 fn collect_suite(
     suite: &Suite,
     table: &mut HashMap<String, String>,
-    relative_locals: &mut HashSet<String>,
+    relative_levels: &mut HashMap<String, usize>,
     dynamic: &mut bool,
 ) {
     match suite {
         Suite::IndentedBlock(b) => {
             for stmt in &b.body {
-                collect_stmt(stmt, table, relative_locals, dynamic);
+                collect_stmt(stmt, table, relative_levels, dynamic);
             }
         }
         Suite::SimpleStatementSuite(s) => {
             for small in &s.body {
-                collect_small(small, table, relative_locals, dynamic);
+                collect_small(small, table, relative_levels, dynamic);
             }
         }
     }
@@ -136,60 +144,60 @@ fn collect_suite(
 fn collect_compound(
     c: &CompoundStatement,
     table: &mut HashMap<String, String>,
-    relative_locals: &mut HashSet<String>,
+    relative_levels: &mut HashMap<String, usize>,
     dynamic: &mut bool,
 ) {
     match c {
         CompoundStatement::FunctionDef(d) => {
-            collect_suite(&d.body, table, relative_locals, dynamic)
+            collect_suite(&d.body, table, relative_levels, dynamic)
         }
-        CompoundStatement::ClassDef(d) => collect_suite(&d.body, table, relative_locals, dynamic),
+        CompoundStatement::ClassDef(d) => collect_suite(&d.body, table, relative_levels, dynamic),
         CompoundStatement::If(i) => {
-            collect_suite(&i.body, table, relative_locals, dynamic);
+            collect_suite(&i.body, table, relative_levels, dynamic);
             if let Some(orelse) = &i.orelse {
-                collect_orelse(orelse, table, relative_locals, dynamic);
+                collect_orelse(orelse, table, relative_levels, dynamic);
             }
         }
         CompoundStatement::For(f) => {
-            collect_suite(&f.body, table, relative_locals, dynamic);
+            collect_suite(&f.body, table, relative_levels, dynamic);
             if let Some(e) = &f.orelse {
-                collect_suite(&e.body, table, relative_locals, dynamic);
+                collect_suite(&e.body, table, relative_levels, dynamic);
             }
         }
         CompoundStatement::While(w) => {
-            collect_suite(&w.body, table, relative_locals, dynamic);
+            collect_suite(&w.body, table, relative_levels, dynamic);
             if let Some(e) = &w.orelse {
-                collect_suite(&e.body, table, relative_locals, dynamic);
+                collect_suite(&e.body, table, relative_levels, dynamic);
             }
         }
         CompoundStatement::Try(t) => {
-            collect_suite(&t.body, table, relative_locals, dynamic);
+            collect_suite(&t.body, table, relative_levels, dynamic);
             for h in &t.handlers {
-                collect_suite(&h.body, table, relative_locals, dynamic);
+                collect_suite(&h.body, table, relative_levels, dynamic);
             }
             if let Some(e) = &t.orelse {
-                collect_suite(&e.body, table, relative_locals, dynamic);
+                collect_suite(&e.body, table, relative_levels, dynamic);
             }
             if let Some(e) = &t.finalbody {
-                collect_suite(&e.body, table, relative_locals, dynamic);
+                collect_suite(&e.body, table, relative_levels, dynamic);
             }
         }
         CompoundStatement::TryStar(t) => {
-            collect_suite(&t.body, table, relative_locals, dynamic);
+            collect_suite(&t.body, table, relative_levels, dynamic);
             for h in &t.handlers {
-                collect_suite(&h.body, table, relative_locals, dynamic);
+                collect_suite(&h.body, table, relative_levels, dynamic);
             }
             if let Some(e) = &t.orelse {
-                collect_suite(&e.body, table, relative_locals, dynamic);
+                collect_suite(&e.body, table, relative_levels, dynamic);
             }
             if let Some(e) = &t.finalbody {
-                collect_suite(&e.body, table, relative_locals, dynamic);
+                collect_suite(&e.body, table, relative_levels, dynamic);
             }
         }
-        CompoundStatement::With(w) => collect_suite(&w.body, table, relative_locals, dynamic),
+        CompoundStatement::With(w) => collect_suite(&w.body, table, relative_levels, dynamic),
         CompoundStatement::Match(m) => {
             for case in &m.cases {
-                collect_suite(&case.body, table, relative_locals, dynamic);
+                collect_suite(&case.body, table, relative_levels, dynamic);
             }
         }
     }
@@ -198,25 +206,25 @@ fn collect_compound(
 fn collect_orelse(
     orelse: &OrElse,
     table: &mut HashMap<String, String>,
-    relative_locals: &mut HashSet<String>,
+    relative_levels: &mut HashMap<String, usize>,
     dynamic: &mut bool,
 ) {
     match orelse {
         OrElse::Elif(elif) => {
-            collect_suite(&elif.body, table, relative_locals, dynamic);
+            collect_suite(&elif.body, table, relative_levels, dynamic);
             if let Some(inner) = &elif.orelse {
-                collect_orelse(inner, table, relative_locals, dynamic);
+                collect_orelse(inner, table, relative_levels, dynamic);
             }
         }
-        OrElse::Else(e) => collect_suite(&e.body, table, relative_locals, dynamic),
+        OrElse::Else(e) => collect_suite(&e.body, table, relative_levels, dynamic),
     }
 }
 
-/// Record imports from a single small statement into `table` / `relative_locals` / `dynamic`.
+/// Record imports from a single small statement into `table` / `relative_levels` / `dynamic`.
 fn collect_small(
     small: &SmallStatement,
     table: &mut HashMap<String, String>,
-    relative_locals: &mut HashSet<String>,
+    relative_levels: &mut HashMap<String, usize>,
     dynamic: &mut bool,
 ) {
     match small {
@@ -242,7 +250,7 @@ fn collect_small(
         // `from m import n`, `from m import n as p`,
         // `from . import x`, `from .mod import y` (leading dots = relative)
         SmallStatement::ImportFrom(from) => {
-            let is_relative = !from.relative.is_empty();
+            let level = from.relative.len();
             let module_path = from
                 .module
                 .as_ref()
@@ -270,8 +278,8 @@ fn collect_small(
                 } else {
                     name
                 };
-                if is_relative {
-                    relative_locals.insert(local.clone());
+                if level > 0 {
+                    relative_levels.insert(local.clone(), level);
                 }
                 table.insert(local, full);
             }
