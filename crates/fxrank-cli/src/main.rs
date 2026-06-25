@@ -601,7 +601,6 @@ fn dispatch_ts(
     use fxrank_lang_ts::TsFrontend;
     use fxrank_lang_ts::source::Lang;
     use fxrank_lang_ts::tsconfig;
-    use std::collections::HashMap;
 
     // Bug 1 fix: if there are no TS sources to scan, skip tsconfig loading entirely.
     // --project is documented as TS/JS-only; loading on a Rust/Python-only scan would
@@ -630,26 +629,25 @@ fn dispatch_ts(
         None => (None, Vec::new()),
     };
 
-    // Group by resolved `Lang` so each dialect runs with its own syntax. The
-    // grouping key is the `Lang` (a `.ts` and a `.tsx` in one dir differ).
-    let mut groups: HashMap<Lang, Vec<SourceFile>> = HashMap::new();
-    for (ext, source) in sources {
-        // Every collected extension is one `Lang::from_extension` recognizes.
-        let lang = Lang::from_extension(&ext).unwrap_or_else(|| {
-            unreachable!("route_for_path only routes extensions from_extension recognizes")
-        });
-        groups.entry(lang).or_default().push(source);
-    }
+    // #41: one TsModuleMap must span both dialects, so run ALL TS files through a
+    // single analyze. The parse dialect is chosen per-file (from each path's
+    // extension) inside analyze. `fallback_lang` covers a stdin source (path
+    // "stdin", no extension) whose dialect comes from the routed extension; for a
+    // directory scan every file carries its own extension so the fallback is never
+    // consulted.
+    let fallback_lang = sources
+        .first()
+        .and_then(|(ext, _)| Lang::from_extension(ext))
+        .unwrap_or_default();
+    let files: Vec<SourceFile> = sources.into_iter().map(|(_, source)| source).collect();
 
     let mut output = FrontendOutput::default();
-    for (lang, group) in groups {
-        let frontend = TsFrontend {
-            lang,
-            include_tests,
-            tsconfig: ts_cfg.clone(),
-        };
-        merge_output(&mut output, frontend.analyze(&group));
-    }
+    let frontend = TsFrontend {
+        lang: fallback_lang,
+        include_tests,
+        tsconfig: ts_cfg,
+    };
+    merge_output(&mut output, frontend.analyze(&files));
     (output, config_errors)
 }
 
