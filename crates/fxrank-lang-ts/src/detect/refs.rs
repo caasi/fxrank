@@ -63,57 +63,17 @@ impl Visit for RefsWalker<'_> {
         if let Callee::Expr(callee) = &node.callee
             && let Some(base) = render_expr(callee)
         {
-            let root = base.split('.').next().unwrap_or(&base);
-            let module = self.imports.resolve(root).map(str::to_string);
-            let qualified = module.is_some();
-            let kind = if base.contains('.') && module.is_none() {
-                RefKind::Method
-            } else {
-                RefKind::Free
-            };
             let (line, col) = self.lines.line_col(node.span);
-            let first_party = module.as_deref().is_some_and(is_first_party_specifier);
-
-            use crate::imports::ImportTarget;
-            let has_member = base.contains('.');
-            let resolved_target = if matches!(kind, RefKind::Method) {
-                None
-            } else if let Some(spec) = &module {
-                // Resolve the relative module, then pick the export name ONLY for
-                // provably-safe shapes (never guess → never false-resolve).
-                match self.module_map.resolve_import(self.referencing_file, spec) {
-                    Some(key) => match (self.imports.import_target(root), has_member) {
-                        // bare `local()` from a named import → the original export name
-                        (Some(ImportTarget::Named(export)), false) => {
-                            Some(vec![key, export.clone()])
-                        }
-                        // `ns.member()` from a namespace import → the member is the export
-                        (Some(ImportTarget::Namespace), true) => {
-                            let member = base.split('.').nth(1).unwrap_or(root);
-                            Some(vec![key, member.to_string()])
-                        }
-                        // default()/default.member()/namespace() → ambiguous → opaque
-                        _ => None,
-                    },
-                    None => None, // non-relative / out-of-batch spec → opaque
-                }
-            } else if !has_member {
-                // bare same-module free call → own module
-                Some(vec![self.referencing_key.clone(), root.to_string()])
-            } else {
-                None
-            };
-
-            self.refs.push(CallSiteRef {
-                kind,
+            let r = ref_for_base(
                 base,
-                module,
                 line,
                 col,
-                qualified,
-                first_party,
-                resolved_target,
-            });
+                self.imports,
+                self.module_map,
+                self.referencing_file,
+                &self.referencing_key,
+            );
+            self.refs.push(r);
         }
         // Recurse so nested calls (f(g()), a.b().c()) are captured.
         node.visit_children_with(self);
@@ -123,6 +83,74 @@ impl Visit for RefsWalker<'_> {
     fn visit_arrow_expr(&mut self, _n: &swc_ecma_ast::ArrowExpr) {}
     fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
     fn visit_constructor(&mut self, _n: &swc_ecma_ast::Constructor) {}
+}
+
+/// Build a [`CallSiteRef`] for a dotted `base` (`fetch`, `fs.readFile`,
+/// `util.fetchUser`) referenced at `(line, col)`.
+///
+/// This is the **single source of truth** for the `module` / `qualified` /
+/// `kind` / `first_party` / `resolved_target` classification used by BOTH the
+/// call walker (`refs::extract`) and the function-value walker
+/// (`fnvalues::extract_fn_values`) — so a call `handle()` and a JSX prop
+/// `onClick={handle}` produce the same edge for the same imported `handle`.
+/// Keeping one helper guarantees the two never drift (spec 027 §4.5).
+pub(crate) fn ref_for_base(
+    base: String,
+    line: usize,
+    col: usize,
+    imports: &ImportTable,
+    module_map: &crate::module_map::TsModuleMap,
+    referencing_file: &str,
+    referencing_key: &str,
+) -> CallSiteRef {
+    use crate::imports::ImportTarget;
+    let root = base.split('.').next().unwrap_or(&base);
+    let module = imports.resolve(root).map(str::to_string);
+    let qualified = module.is_some();
+    let has_member = base.contains('.');
+    let kind = if has_member && module.is_none() {
+        RefKind::Method
+    } else {
+        RefKind::Free
+    };
+    let first_party = module.as_deref().is_some_and(is_first_party_specifier);
+
+    let resolved_target = if matches!(kind, RefKind::Method) {
+        None
+    } else if let Some(spec) = &module {
+        // Resolve the relative module, then pick the export name ONLY for
+        // provably-safe shapes (never guess → never false-resolve).
+        match module_map.resolve_import(referencing_file, spec) {
+            Some(key) => match (imports.import_target(root), has_member) {
+                // bare `local()` from a named import → the original export name
+                (Some(ImportTarget::Named(export)), false) => Some(vec![key, export.clone()]),
+                // `ns.member()` from a namespace import → the member is the export
+                (Some(ImportTarget::Namespace), true) => {
+                    let member = base.split('.').nth(1).unwrap_or(root);
+                    Some(vec![key, member.to_string()])
+                }
+                // default()/default.member()/namespace() → ambiguous → opaque
+                _ => None,
+            },
+            None => None, // non-relative / out-of-batch spec → opaque
+        }
+    } else if !has_member {
+        // bare same-module free reference → own module
+        Some(vec![referencing_key.to_string(), root.to_string()])
+    } else {
+        None
+    };
+
+    CallSiteRef {
+        kind,
+        base,
+        module,
+        line,
+        col,
+        qualified,
+        first_party,
+        resolved_target,
+    }
 }
 
 /// Check if a module specifier should be classified as first-party.

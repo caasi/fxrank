@@ -3,7 +3,7 @@
 use fxrank_core::confidence::detection_confidence;
 use fxrank_core::effect::{Effect, EffectKind, Tier};
 use fxrank_core::score::weight_for_class;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use swc_ecma_ast::{ArrowExpr, Expr, Pat, ReturnStmt, VarDeclarator};
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -209,137 +209,192 @@ impl Visit for RefBindingWalker {
     fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
 }
 
-/// The React lifecycle phase of an inline hook callback.
+/// The React lifecycle phase of an inline hook callback or handler.
 ///
-/// `Effect` — the callback runs after rendering and (for `useLayoutEffect`)
-/// synchronously after DOM mutation. `Render` — the callback runs during the
-/// render phase and must be side-effect-free.
+/// Phase never decides *whether* an effect counts — only *how much* (spec 027
+/// §2.4). It is an orthogonal axis to spec-003 containment.
+///
+/// - `Render` — the callback runs during render (`useMemo`, `useState`/
+///   `useReducer` lazy initializers) and must be side-effect-free; world effects
+///   here keep full weight AND earn an `EffectInRender` risk.
+/// - `Effect` — runs after render, outside the render phase (`useEffect`,
+///   `useLayoutEffect`). The honest baseline: ≈ full weight, no conditionality
+///   discount, no `EffectInRender`.
+/// - `Event` — runs only on interaction (`useCallback` bodies; JSX `onX={…}`
+///   handlers). Effects here are *conditional on interaction*, so an escaping
+///   world effect earns the 1-class conditionality discount (capped 1, floored 1).
+/// - `Unknown` — a callback passed to an unrecognized `use[A-Z]…` hook. Ownership
+///   is certain (the component hands it over), but the invocation schedule is
+///   unknown: treated as event-phase `OwnedDeferred` with a lowered confidence.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HookPhase {
     Effect,
     Render,
+    Event,
+    Unknown,
 }
 
-/// Build a map from inline arrow `(line, col)` → [`HookPhase`] for every arrow
-/// passed **directly** as a recognized hook argument in `body`.
-///
-/// "Directly" means single-hop: only arrows that are the immediate argument to
-/// the hook call are recorded. Arrows nested inside those callbacks, or inside
-/// any other nested function scope, are not mapped.
-///
-/// # Phase rules
-/// - `useEffect`, `useLayoutEffect` → `HookPhase::Effect` for `args[0]`.
-/// - `useCallback` → `HookPhase::Effect` for `args[0]`. React only *memoizes*
-///   the function reference; its body executes on invocation (event-time), not
-///   during render.
-/// - `useMemo` → `HookPhase::Render` for `args[0]`. React calls the factory
-///   during render to produce the memoized value, so effects inside DO run at
-///   render time.
-/// - `useState` → `HookPhase::Render` for `args[0]` only when it is an arrow
-///   (the lazy-initializer form; skipped for non-arrow initial values).
-/// - `useReducer` → `HookPhase::Render` for `args[2]` only (the optional `init`
-///   function; `args[0]` / reducer and `args[1]` / initial state are NOT mapped).
-///
-/// The `(line, col)` key is computed via `lines.line_col(arrow.span)` — the same
-/// call that `functions::collect` makes in `visit_arrow_expr` — so it matches
-/// the `FnUnit`'s `(line, col)` that Task 9 uses to look up the arrow.
-pub fn inherited_callbacks(
-    body: &FnBodyOwned,
-    lines: &SpanLines,
-) -> HashMap<(usize, usize), HookPhase> {
-    let mut walker = HookCallbackWalker {
-        lines,
-        map: HashMap::new(),
-    };
-    body.walk_with(&mut walker);
-    walker.map
+/// True if `name` matches the React hook naming convention `/^use[A-Z]/`.
+pub(crate) fn is_hook_name(name: &str) -> bool {
+    name.starts_with("use")
+        && name.len() > 3
+        && name.chars().nth(3).map(char::is_uppercase).unwrap_or(false)
 }
 
-struct HookCallbackWalker<'a> {
-    lines: &'a SpanLines,
-    map: HashMap<(usize, usize), HookPhase>,
+/// True if `name` is a React built-in hook with a **known signature**.
+///
+/// Built-in hooks have fixed, documented parameter layouts (callbacks are direct
+/// positional args, never wrapped in an options object). An object arg to a
+/// built-in hook is therefore **state data / config data**, NOT a callback bag —
+/// it must NOT be descended for function-valued properties.
+///
+/// Custom / library hooks (`useMutation`, `useQuery`, `useForm`, …) are NOT in
+/// this set; their object arg IS an opaque options/callback bag and should be
+/// descended. Use this predicate to gate `handle_options_object` descent.
+pub(crate) fn is_builtin_hook(name: &str) -> bool {
+    // Complete set of React built-in hooks, grouped by release. Built-in hooks
+    // have KNOWN, fixed parameter signatures: their object args are state data or
+    // config, NOT callback bags, so they must NOT have object args descended.
+    // Only genuinely-custom / library hooks (useMutation, useQuery, useForm, …)
+    // get object-descent (they take opaque options/callback bags).
+    matches!(
+        name,
+        // React 16.8 — core hooks
+        "useState"
+            | "useEffect"
+            | "useContext"
+            | "useReducer"
+            | "useCallback"
+            | "useMemo"
+            | "useRef"
+            | "useImperativeHandle"
+            | "useLayoutEffect"
+            | "useDebugValue"
+            // React 18 — concurrent + utility hooks
+            | "useDeferredValue"
+            | "useTransition"
+            | "useId"
+            | "useSyncExternalStore"
+            | "useInsertionEffect"
+            // React 19 / react-dom — action + form hooks
+            | "useOptimistic"
+            | "useActionState"
+            | "useFormStatus"
+    )
 }
 
-/// Return the hook name from a `CallExpr` callee, if it is a bare identifier.
-fn hook_callee_name(node: &swc_ecma_ast::CallExpr) -> Option<&str> {
-    match &node.callee {
-        swc_ecma_ast::Callee::Expr(e) => match e.as_ref() {
-            Expr::Ident(i) => Some(i.sym.as_ref()),
-            _ => None,
-        },
-        _ => None,
+/// Component-recognition outcome. `is` gates React treatment; `confidence`
+/// lowers the component's function-level confidence when only one weak signal
+/// fired (e.g. PascalCase alone, no JSX, no hooks).
+pub struct ComponentSignal {
+    pub is: bool,
+    pub confidence: f64,
+}
+
+/// Decide whether `unit` in file `path` is a React component.
+///
+/// Recognition rule:
+/// 1. The `symbol` must be **PascalCase** (first char `char::is_uppercase`). A
+///    lowercase name (`helper`, `useThing`, etc.) is **never** a component
+///    regardless of hook calls or JSX.
+/// 2. At least one of:
+///    - (a) `returns_jsx(&unit.body)` — strong signal.
+///    - (b) `path` ends in `.tsx` or `.jsx` — medium signal.
+///    - (c) the body calls at least one React hook (bare-ident callee matching
+///      `/^use[A-Z]/`) — medium, corroborating only, never sufficient alone.
+///
+/// Confidence: `1.0` when `returns_jsx` holds or ≥2 weak signals fire;
+/// `0.8` when exactly one medium signal fires alone. `is = false` ⇒
+/// `confidence` is irrelevant (callers ignore it).
+pub fn is_component(unit: &crate::functions::FnUnit, path: &str) -> ComponentSignal {
+    // Gate 1: PascalCase symbol (first char uppercase).
+    let first_is_upper = unit
+        .symbol
+        .chars()
+        .next()
+        .map(char::is_uppercase)
+        .unwrap_or(false);
+    if !first_is_upper {
+        return ComponentSignal {
+            is: false,
+            confidence: 0.0,
+        };
     }
-}
 
-/// Record `arrow` in the walker's map with the given phase.
-fn record_arrow(walker: &mut HookCallbackWalker<'_>, arrow: &ArrowExpr, phase: HookPhase) {
-    let key = walker.lines.line_col(arrow.span);
-    walker.map.insert(key, phase);
-}
+    // Evaluate signals.
+    let has_jsx = returns_jsx(&unit.body);
+    let tsx_jsx_file = path.ends_with(".tsx") || path.ends_with(".jsx");
+    let has_hooks = calls_a_hook(&unit.body);
 
-impl Visit for HookCallbackWalker<'_> {
-    fn visit_call_expr(&mut self, node: &swc_ecma_ast::CallExpr) {
-        match hook_callee_name(node) {
-            Some("useEffect") | Some("useLayoutEffect") => {
-                // args[0] is the effect callback.
-                if let Some(arg0) = node.args.first() {
-                    if let Expr::Arrow(arrow) = arg0.expr.as_ref() {
-                        record_arrow(self, arrow, HookPhase::Effect);
-                    }
-                }
-            }
-            Some("useMemo") => {
-                // args[0] is the memoized computation: React calls this factory
-                // during render, so effects inside run at render time.
-                if let Some(arg0) = node.args.first() {
-                    if let Expr::Arrow(arrow) = arg0.expr.as_ref() {
-                        record_arrow(self, arrow, HookPhase::Render);
-                    }
-                }
-            }
-            Some("useCallback") => {
-                // args[0] is a memoized *handler*: React only stores the
-                // function reference; the body executes on invocation (event),
-                // NOT during render. Treat it as effect-phase (honest baseline,
-                // no EffectInRender) — same as useEffect/useLayoutEffect.
-                if let Some(arg0) = node.args.first() {
-                    if let Expr::Arrow(arrow) = arg0.expr.as_ref() {
-                        record_arrow(self, arrow, HookPhase::Effect);
-                    }
-                }
-            }
-            Some("useState") => {
-                // args[0] is the lazy initializer ONLY when it is an arrow.
-                // A plain value (`useState(0)`) is not a callback.
-                if let Some(arg0) = node.args.first() {
-                    if let Expr::Arrow(arrow) = arg0.expr.as_ref() {
-                        record_arrow(self, arrow, HookPhase::Render);
-                    }
-                }
-            }
-            Some("useReducer") => {
-                // args[2] is the optional `init` function (lazy initializer).
-                // args[0] = reducer, args[1] = initial state — not mapped.
-                if let Some(arg2) = node.args.get(2) {
-                    if let Expr::Arrow(arrow) = arg2.expr.as_ref() {
-                        record_arrow(self, arrow, HookPhase::Render);
-                    }
-                }
-            }
-            _ => {
-                // Not a recognized hook: recurse into the call so nested hook
-                // calls inside non-hook calls are still found. Nested fn/arrow
-                // scopes are stopped by the overrides below.
-                node.visit_children_with(self);
-            }
+    // Strong signal: returns JSX.
+    if has_jsx {
+        return ComponentSignal {
+            is: true,
+            confidence: 1.0,
+        };
+    }
+
+    // Weak signals (medium): .tsx/.jsx file, or hook calls.
+    let weak_count = usize::from(tsx_jsx_file) + usize::from(has_hooks);
+
+    if weak_count >= 2 {
+        // Two or more weak signals together → confident.
+        ComponentSignal {
+            is: true,
+            confidence: 1.0,
         }
-        // Recognized hooks do not recurse further: hook arguments are arrow
-        // scopes which are stopped by visit_arrow_expr below anyway, and we
-        // don't want to accidentally pick up hook calls nested inside them.
+    } else if weak_count == 1 {
+        // Exactly one weak signal → component, but lower confidence.
+        ComponentSignal {
+            is: true,
+            confidence: 0.8,
+        }
+    } else {
+        // PascalCase alone is insufficient.
+        ComponentSignal {
+            is: false,
+            confidence: 0.0,
+        }
+    }
+}
+
+/// Return `true` if the function body calls at least one React hook — a
+/// bare-ident callee matching `/^use[A-Z]/` — in the function's own body.
+///
+/// Descent stops at nested `visit_arrow_expr`/`visit_function` so only
+/// direct (own-body) hook calls are counted. Namespace forms
+/// (`React.useEffect(…)`) are an accepted miss (only bare idents match).
+fn calls_a_hook(body: &FnBodyOwned) -> bool {
+    let mut walker = HookCallFinder { found: false };
+    body.walk_with(&mut walker);
+    walker.found
+}
+
+struct HookCallFinder {
+    found: bool,
+}
+
+impl Visit for HookCallFinder {
+    fn visit_call_expr(&mut self, node: &swc_ecma_ast::CallExpr) {
+        if self.found {
+            return;
+        }
+        let is_hook = match &node.callee {
+            swc_ecma_ast::Callee::Expr(e) => match e.as_ref() {
+                Expr::Ident(i) => is_hook_name(i.sym.as_ref()),
+                _ => false,
+            },
+            _ => false,
+        };
+        if is_hook {
+            self.found = true;
+            return;
+        }
+        node.visit_children_with(self);
     }
 
-    // Stop descent at nested function scopes (single-hop only).
-    fn visit_arrow_expr(&mut self, _n: &ArrowExpr) {}
+    // Stop descent at nested function scopes (own-body only).
+    fn visit_arrow_expr(&mut self, _n: &swc_ecma_ast::ArrowExpr) {}
     fn visit_function(&mut self, _n: &swc_ecma_ast::Function) {}
 }
 
@@ -429,54 +484,39 @@ mod tests {
     }
 
     #[test]
-    fn maps_inline_hook_callbacks_by_phase() {
-        let (u, lines) = unit_with_lines(
-            "function C(){ useEffect(() => { fetch('/a'); }, []); \
-             const m = useMemo(() => fetch('/b'), []); return <i/>; }",
-            "C",
+    fn recognizes_return_null_component() {
+        let u = unit("function Widget(){ useState(0); return null; }", "Widget");
+        let s = super::is_component(&u, "src/Widget.tsx");
+        assert!(
+            s.is,
+            "PascalCase + hook call ⇒ component even when it returns null"
         );
-        let map = inherited_callbacks(&u.body, &lines);
-        let phases: Vec<_> = map.values().copied().collect();
-        assert!(phases.contains(&HookPhase::Effect));
-        assert!(phases.contains(&HookPhase::Render));
-        assert_eq!(map.len(), 2);
     }
 
     #[test]
-    fn usereducer_lazy_init_maps_render_at_arg2() {
-        // With a 3rd arg (the init function): args[2] arrow → HookPhase::Render.
-        let (u, lines) = unit_with_lines(
-            "function C(){ const [s,d]=useReducer(reducer, initial, () => fetch('/a')); return <i/>; }",
-            "C",
-        );
-        let map = inherited_callbacks(&u.body, &lines);
-        assert_eq!(map.len(), 1, "exactly one callback mapped");
+    fn pascalcase_tsx_alone_is_lower_confidence_component() {
+        let u = unit("function Box(){ return null; }", "Box");
+        let s = super::is_component(&u, "src/Box.tsx");
         assert!(
-            map.values().all(|&p| p == HookPhase::Render),
-            "lazy init arg maps to Render phase"
+            s.is && s.confidence < 1.0,
+            "single weak signal ⇒ lower confidence"
         );
-
-        // Without a 3rd arg: no lazy init → 0 entries.
-        let (u2, lines2) = unit_with_lines(
-            "function C(){ const [s,d]=useReducer(reducer, initial); return <i/>; }",
-            "C",
-        );
-        let map2 = inherited_callbacks(&u2.body, &lines2);
-        assert_eq!(map2.len(), 0, "no 3rd arg means no callback mapped");
     }
 
     #[test]
-    fn usestate_lazy_init_maps_render() {
-        let (u, lines) = unit_with_lines(
-            "function C(){ const [v,setV]=useState(() => fetch('/b')); return <i/>; }",
-            "C",
-        );
-        let map = inherited_callbacks(&u.body, &lines);
-        assert_eq!(map.len(), 1, "exactly one callback mapped");
+    fn lowercase_helper_is_not_component() {
+        let u = unit("function helper(){ useThing(); return null; }", "helper");
         assert!(
-            map.values().all(|&p| p == HookPhase::Render),
-            "useState lazy init maps to Render phase"
+            !super::is_component(&u, "src/h.tsx").is,
+            "lowercase name ⇒ not a component"
         );
+    }
+
+    #[test]
+    fn jsx_returning_component_is_full_confidence() {
+        let u = unit("function C(){ return <div/>; }", "C");
+        let s = super::is_component(&u, "src/C.tsx");
+        assert!(s.is && (s.confidence - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
