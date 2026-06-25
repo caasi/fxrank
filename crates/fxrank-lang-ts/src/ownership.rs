@@ -288,9 +288,11 @@ impl Visit for NestedDefWalker<'_> {
             }
             _ => {}
         }
-        // Own-body only: do not recurse into nested blocks/scopes — but DO descend
-        // into the call/expr machinery via the default visit so a `foo(run)` arg
-        // escape is recorded (handled by visit_call_expr below).
+        // Recurse into nested blocks/scopes via the default visit so inner
+        // statements (including `foo(run)` escape arguments) are reached —
+        // see visit_call_expr below.  Descent stops at nested function/arrow
+        // scopes via the visit_arrow_expr / visit_function overrides, which
+        // prevents crossing into a child function's own body.
         n.visit_children_with(self);
     }
 
