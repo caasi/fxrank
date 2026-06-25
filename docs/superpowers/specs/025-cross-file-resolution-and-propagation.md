@@ -109,7 +109,7 @@ record-filling, invisible to core), or **centralized** (defined once in core, no
 | `ExportIndex` collisions | centralized | one collision policy (§5) |
 | `Report::build` aggregates | centralized | over assembled hotspots (§9) |
 | roots | centralized | CLI sets `root` from explicit-file membership (§6/§13c); frontends are root-agnostic |
-| Rust module-tree | deferred (#36) | out-of-line `mod foo;` → module paths; not built |
+| Rust module-tree | designed → phase 3e (#36) | out-of-line `mod foo;` → module paths; name-based until then. See spec `025-3e` |
 | first/third-party classifier | contained (pass 1) | frontend resolver reads config |
 | method/member resolution | contained (pass 1) | syntactic only; a `RefKind::Method` ref never name-resolves (no receiver type) and is not a reach — its real IO is already an `Effect` |
 
@@ -389,11 +389,16 @@ tags `CallSiteRef.first_party`: Rust `crate::`/`super::`/`self::`, Python relati
 `@/`/`~/` aliases; core `resolve_ref` picks `ReachKind`); 3d module-init units (synthetic `<module>` scoring
 top-level/import-time effects, emitted only if ≥1 effect, own-body-isolated from nested defs).
 
-**Deferred by decision (land the foundation; revisit when they bite):**
-- **3e module-tree / precise resolution** (tracked in **#36**) — fixes the false-resolve above + enables Rust
-  pub-visibility-chain roots + crate-type (bin/lib) gate + workspace-member `first_party`. A large subsystem
-  (Rust module reconstruction from a flat `SourceFile` batch + Cargo metadata). Not yet built; the false-resolve
-  has not visibly misfired in extensive dogfooding, so the marginal value is currently low.
+**Phase status:**
+- **3e module-tree / precise resolution** (tracked in **#36**) — **designed; see spec `025-3e-precise-module-resolution.md`.**
+  Replaces the name-based resolver with **path-precise resolution** (Shape A / SCIP-Kythe string identity):
+  frontends emit a canonical fully-qualified path per unit + import-resolved target per ref; core resolves by
+  path equality over a neutral index, with a re-export **alias** index. Fixes the false-resolve across all three
+  frontends (Rust module-tree reconstruction is the bulk — filesystem-convention, **no `cargo` shell-out**). The
+  **workspace-member `first_party`** bonus survives (mostly free: in-scope siblings now resolve). The other two
+  #36 bonuses — **pub-visibility-chain roots and the crate-type (bin/lib) root gate — are DROPPED**: both compute
+  *program-entry* roots, which §13c deliberately removed in favour of `root` = CLI explicit file. Program-entry
+  detection, if ever wanted, is a **distinct concept** from `root` (guideline *Roots — History*), not a #36 bonus.
 - **3f React-inheritance retrofit** (tracked in **#37**) — route the within-file React absorption through the
   shared fold (§11.9, #28 step 4 "retrofit last"). Low value: pure internal consolidation, no new signal; the
   bespoke React two-pass and the shared fold coexist today with NO double-count (suppressed arrows are not graph
