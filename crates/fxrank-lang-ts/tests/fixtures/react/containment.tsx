@@ -12,7 +12,9 @@
 // Expected signals:
 //   - StateOnly: max_class ≤ 3 (state.transition class 1 + ref-cell class 3);
 //     no net.fs.db effect; own_score low.
-//   - FetchingComponent: max_class 7; net.fs.db present; own_score >> StateOnly.
+//   - FetchingComponent: max_class 6; net.fs.db present (escaping), event-phase
+//     conditionality-discounted from 7 (the fetch is in a JSX onClick handler);
+//     own_score >> StateOnly.
 
 import React, { useState, useRef } from "react";
 
