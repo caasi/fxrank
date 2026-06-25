@@ -399,9 +399,11 @@ fn react_contained(effect: &Effect, raw_contained: bool) -> bool {
 /// class — but it is **capped at 1 class and floored at class 1**: a world effect
 /// is nudged one notch, NEVER erased to 0. It never touches `contained`.
 ///
-/// For a class-1 effect the formula is a no-op: `1.saturating_sub(1) = 0`,
-/// `0.max(1) = 1`, and `1 < 1` is false ⇒ no discount written (correct — a
-/// class-1 effect cannot be nudged below the floor).
+/// For a class-1 effect the class formula is a no-op: `1.saturating_sub(1) = 0`,
+/// `0.max(1) = 1`, and `1 < 1` is false ⇒ `discounted_to` stays `None` (correct
+/// — a class-1 effect cannot be nudged below the floor). The phase RATIONALE
+/// (`discount`, and `subreason` if unset) is still recorded even at the floor so
+/// users see why it is event-phase (spec §2.4); only the class change is skipped.
 ///
 /// An `Unknown` phase additionally lowers `confidence` (the invocation schedule
 /// is not known) and records the unknown-schedule rationale.
@@ -409,20 +411,27 @@ fn apply_conditionality_discount(e: &mut Effect, phase: HookPhase) {
     let base = e.effective_class();
     let down = base.saturating_sub(1).max(1); // cap 1 class, floor 1
     if down < base {
+        // A real class change: write the downshift target.
         e.discounted_to = Some(down);
-        // `subreason` is the CLASSIFICATION axis (e.g. "ref-cell-write",
-        // "captured-binding"). Only set it if no prior classification exists; the
-        // phase rationale always goes into `discount` (the DISCOUNT axis).
-        if e.subreason.is_none() {
-            e.subreason = Some("phase:event".to_string());
-        }
-        e.discount = Some(match phase {
-            HookPhase::Unknown => {
-                "phase:event — conditional on interaction (unknown callback schedule)".to_string()
-            }
-            _ => "phase:event — conditional on interaction".to_string(),
-        });
     }
+    // Record the phase rationale REGARDLESS of whether a class change occurred
+    // (spec §2.4): even an event-phase effect already at the class-1 floor — where
+    // there is no notch left to drop — should carry the recorded reason so users
+    // see *why* it is treated as event-phase. At the floor `discounted_to` stays
+    // `None` (no class change, just the recorded rationale).
+    //
+    // `subreason` is the CLASSIFICATION axis (e.g. "ref-cell-write",
+    // "captured-binding"). Only set it if no prior classification exists; the
+    // phase rationale always goes into `discount` (the DISCOUNT axis).
+    if e.subreason.is_none() {
+        e.subreason = Some("phase:event".to_string());
+    }
+    e.discount = Some(match phase {
+        HookPhase::Unknown => {
+            "phase:event — conditional on interaction (unknown callback schedule)".to_string()
+        }
+        _ => "phase:event — conditional on interaction".to_string(),
+    });
     if phase == HookPhase::Unknown {
         // Unknown invocation schedule ⇒ lower confidence (applies whether or not
         // a class downshift was written, e.g. for a class-1 effect).
@@ -881,6 +890,44 @@ mod tests {
             rc.discounted_to,
             Some(2),
             "class-3 ref-cell-write in event phase: down to 2"
+        );
+    }
+
+    /// Finding 3 (Copilot round-4): for an event-phase effect already at the
+    /// class-1 floor (no downshift possible), the phase rationale must STILL be
+    /// recorded (spec §2.4 — the conditionality treatment is recorded so users
+    /// see why it is event-phase), with `discounted_to` left `None` (no class
+    /// change).
+    #[test]
+    fn conditionality_discount_records_rationale_at_class_1_floor() {
+        let mut e = Effect {
+            kind: EffectKind::LocalMutation,
+            class: 1,
+            discounted_to: None,
+            weight: weight_for_class(1),
+            line: 1,
+            col: 1,
+            tier: Tier::Heuristic,
+            hidden: false,
+            contained: false, // escaping
+            evidence: "x = 1".into(),
+            discount: None,
+            subreason: None,
+            confidence: 1.0,
+        };
+        apply_conditionality_discount(&mut e, HookPhase::Event);
+        assert_eq!(
+            e.discounted_to, None,
+            "class-1 floor: no class change, discounted_to stays None"
+        );
+        assert!(
+            e.discount.as_deref().unwrap_or("").contains("phase:event"),
+            "phase rationale recorded in discount even at the class-1 floor"
+        );
+        assert_eq!(
+            e.subreason.as_deref(),
+            Some("phase:event"),
+            "no prior classification → phase subreason recorded"
         );
     }
 }
