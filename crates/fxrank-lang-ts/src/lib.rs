@@ -50,9 +50,11 @@ use crate::tsconfig::TsConfig;
 /// maps each `FnUnit` to a scored `Hotspot` via `detect::analyze_unit`.
 /// Un-parseable files become `Diagnostic`s, not panics.
 ///
-/// `lang` is the dialect used for *all* this frontend's sources; the CLI groups
-/// sources by resolved `Lang` so each group gets a `TsFrontend` with the right
-/// dialect. When `include_tests` is `false` (the default), whole files whose path
+/// `lang` is the per-instance **fallback** dialect, used only for an
+/// extension-less path (stdin); since #41 `analyze` derives each file's dialect
+/// from its own extension, so a single `TsFrontend` handles a mixed `.ts`/`.tsx`
+/// batch and the `module_map` spans both dialects. When `include_tests` is
+/// `false` (the default), whole files whose path
 /// contains `.test.` or `.spec.` (e.g. `foo.test.ts`, `bar.spec.tsx`) or any
 /// path segment equals `__tests__` are skipped; their unit count is tallied in
 /// `FrontendOutput::skipped_tests`. JS/TS convention keeps tests in separate
@@ -86,7 +88,17 @@ impl Frontend for TsFrontend {
         };
 
         for source in files {
-            match functions::parse_module(&source.text, &source.path, self.lang) {
+            // Per-file dialect (#41): a file's own extension decides its parse
+            // dialect, so a single analyze call handles a mixed .ts/.tsx batch and
+            // the module_map (built over `files`) spans both dialects. `self.lang`
+            // is the fallback only for an extension-less path (stdin).
+            // `Lang::from_extension` takes the extension string (no dot).
+            let dialect = std::path::Path::new(&source.path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(Lang::from_extension)
+                .unwrap_or(self.lang);
+            match functions::parse_module(&source.text, &source.path, dialect) {
                 Err(e) => {
                     // FIXME(diagnostic-UX): swc Error has no Display; Debug output is
                     // verbose — extract just the message in a later pass.
@@ -603,6 +615,50 @@ mod tests {
         assert!(
             is_opaque,
             "without tsconfig, @/util ref must be Edge::Opaque (got resolved or None)"
+        );
+    }
+
+    #[test]
+    fn cross_dialect_tsx_imports_ts_resolves() {
+        use fxrank_core::frontend::SourceFile;
+        use fxrank_core::graph::Edge;
+        use fxrank_core::resolve::{CanonicalIndex, resolve_ref_precise};
+        // app.tsx contains JSX → it MUST parse as Tsx. TsFrontend::default() has
+        // lang = Ts, so only a PER-FILE dialect (from the .tsx extension) parses it.
+        // `load` is lowercase (not a PascalCase component) → no React absorption, so
+        // its call to `x` stays a plain outgoing ref.
+        let files = vec![
+            SourceFile {
+                path: "src/app.tsx".into(),
+                text: "import { x } from './util';\n\
+                       export function load() { x(); return (<div/>); }\n"
+                    .into(),
+            },
+            SourceFile {
+                path: "src/util.ts".into(),
+                text: "export function x() { return fetch('/u'); }\n".into(),
+            },
+        ];
+        // default lang = Ts; the .tsx file only parses via the per-file dialect.
+        let out = TsFrontend::default().analyze(&files);
+        let load_rec = out
+            .records
+            .iter()
+            .find(|r| r.symbol == "load")
+            .expect("app.tsx must parse as Tsx per-file and yield a `load` record");
+        let x_ref = load_rec
+            .refs
+            .iter()
+            .find(|r| r.module.as_deref() == Some("./util"))
+            .expect("load must have a ref with module='./util'");
+        let idx = CanonicalIndex::from_records(&out.records);
+        assert!(idx.adopted(), "TS partition must be adopted");
+        let edge = resolve_ref_precise(x_ref, &idx, &load_rec.path);
+        // `Edge` has no `Debug` — pre-bind the boolean.
+        let is_resolved = matches!(edge, Some(Edge::Resolved(_)));
+        assert!(
+            is_resolved,
+            ".tsx→.ts relative import must resolve cross-dialect (Edge::Resolved)"
         );
     }
 

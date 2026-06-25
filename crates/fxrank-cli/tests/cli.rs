@@ -1189,6 +1189,79 @@ fn project_flag_bad_path_is_diagnostic_not_failure() {
     );
 }
 
+// ── Task 2 (#41): cross-dialect resolution — .tsx imports .ts, one module_map ──
+
+/// A .tsx component importing a .ts util that does fetch. Before #41 the .tsx
+/// and .ts landed in separate dialect module_maps → the import was opaque.
+#[test]
+#[cfg(feature = "ts")]
+fn cross_dialect_tsx_imports_ts_resolves_via_cli() {
+    // A .tsx component importing a .ts util that does fetch. Before #41 the .tsx
+    // and .ts landed in separate dialect module_maps → the import was opaque.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("app.tsx"),
+        "import { load } from './util';\n\
+         export function App() { load(); return (<div/>); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("util.ts"),
+        "export function load() { return fetch('/u'); }\n",
+    )
+    .unwrap();
+
+    let out = assert_cmd::Command::cargo_bin("fxrank")
+        .unwrap()
+        .arg("scan")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // App (in app.tsx) must inherit util.ts's net effect across the dialect boundary:
+    // its propagated_max_class reaches the net/fs/db class (7), not its own-body class.
+    let app = report["hotspots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["symbol"] == "App")
+        .expect("App hotspot present");
+    assert_eq!(
+        app["propagated_max_class"].as_u64(),
+        Some(7),
+        ".tsx App must inherit .ts util's net effect across dialects"
+    );
+}
+
+/// Regression for the fallback dialect: stdin has path "stdin" (no extension),
+/// so its dialect must come from --lang via dispatch_ts's fallback_lang.
+#[test]
+#[cfg(feature = "ts")]
+fn stdin_lang_tsx_still_parses() {
+    // Regression for the fallback dialect: stdin has path "stdin" (no extension),
+    // so its dialect must come from --lang via dispatch_ts's fallback_lang.
+    let out = assert_cmd::Command::cargo_bin("fxrank")
+        .unwrap()
+        .args(["scan", "--lang", "tsx", "-"])
+        .write_stdin("export function load() { return (<div/>); }\n")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // No parse diagnostic for the stdin source → it parsed as Tsx.
+    let diags = report["diagnostics"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        diags
+            .iter()
+            .all(|d| d["parsed"] != serde_json::json!(false)),
+        "stdin --lang tsx must parse (no parse-failure diagnostic): {diags:?}"
+    );
+}
+
 /// Bug 1 fix: --project on a Python-only (or Rust-only) scan must NOT emit a
 /// tsconfig diagnostic even when the path is invalid.  The flag is documented
 /// TS/JS-only; tsconfig loading must be skipped when there are no TS sources.
