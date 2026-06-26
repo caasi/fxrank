@@ -212,7 +212,7 @@ impl<'a> MutationWalker<'a> {
             tier: c.tier,
             hidden: c.hidden,
             contained: false,
-            evidence: format!("{verb} {} {base}", c.role),
+            evidence: format!("{verb} {} {}", c.role, place_repr(place)),
             discount: None,
             subreason: c.subreason.map(String::from),
             confidence: detection_confidence(c.tier, false, false),
@@ -410,6 +410,33 @@ fn base_ident(expr: &Expr) -> Option<String> {
         Expr::TsTypeAssertion(e) => base_ident(&e.expr),
         Expr::TsSatisfies(e) => base_ident(&e.expr),
         _ => None,
+    }
+}
+
+/// Render a write's place expression as a readable path for evidence — `this.dirty`,
+/// `this.a.b`, `this.#priv`, `xs[…]`. Unlike `base_ident` (which collapses to the base binding for
+/// classification), this keeps the property chain, so the evidence names the field
+/// actually written rather than just the base `this`/binding (#56).
+fn place_repr(expr: &Expr) -> String {
+    match expr {
+        Expr::Ident(id) => id.sym.to_string(),
+        Expr::This(_) => "this".to_string(),
+        Expr::Paren(p) => place_repr(&p.expr),
+        Expr::Member(m) => {
+            let obj = place_repr(&m.obj);
+            match &m.prop {
+                MemberProp::Ident(p) => format!("{obj}.{}", p.sym),
+                MemberProp::Computed(_) => format!("{obj}[…]"),
+                MemberProp::PrivateName(p) => format!("{obj}.#{}", p.name),
+            }
+        }
+        // See through the same TS-only wrappers as `base_ident`.
+        Expr::TsAs(e) => place_repr(&e.expr),
+        Expr::TsNonNull(e) => place_repr(&e.expr),
+        Expr::TsTypeAssertion(e) => place_repr(&e.expr),
+        Expr::TsSatisfies(e) => place_repr(&e.expr),
+        // Fall back to the base ident for shapes we don't render specially.
+        _ => base_ident(expr).unwrap_or_else(|| "?".to_string()),
     }
 }
 
@@ -820,6 +847,36 @@ mod tests {
             .expect("this[i] = 1 must escape to this.mutation");
         assert_eq!(e.0.effective_class(), 3);
         assert!(!e.1, "subscript write on this must be contained == false");
+    }
+
+    #[test]
+    fn this_field_write_evidence_names_the_property() {
+        // #56: the evidence must name the field actually written (`this.dirty`), not
+        // collapse to the bare base `this` — a method `this.<field> = …` is this.mutation.
+        let effects = detect_in_fn("class K { m(){ this.dirty = true; } }", "K.m");
+        let e = effects
+            .iter()
+            .map(|(e, _)| e)
+            .find(|e| e.kind == EffectKind::ThisMutation)
+            .expect("this.dirty = true in a method must be this.mutation");
+        assert!(
+            e.evidence.contains("this.dirty"),
+            "evidence must name the field, got: {:?}",
+            e.evidence
+        );
+
+        // Private fields render their name too (review): `this.#d`, not `this.#`.
+        let pe = detect_in_fn("class K { #d = 0; m(){ this.#d = 1; } }", "K.m");
+        let p = pe
+            .iter()
+            .map(|(e, _)| e)
+            .find(|e| e.kind == EffectKind::ThisMutation)
+            .expect("this.#d = 1 must be this.mutation");
+        assert!(
+            p.evidence.contains("this.#d"),
+            "private-field evidence must name the field, got: {:?}",
+            p.evidence
+        );
     }
 
     #[test]

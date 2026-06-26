@@ -43,11 +43,17 @@ pub struct FnUnit {
     pub mod_path: Vec<String>,
 }
 
-/// Returns `true` when `attrs` contains `#[test]` or `#[bench]`.
+/// Returns `true` when `attrs` contains a `#[test]`/`#[bench]` attribute, in
+/// either the bare form or a multi-segment runner form (`#[tokio::test]`,
+/// `#[actix_rt::test]`, `#[async_std::test]`, …). Matched on the LAST path
+/// segment so qualified test-runner attrs are recognised, not just `#[test]`.
 fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
-    attrs
-        .iter()
-        .any(|a| a.path().is_ident("test") || a.path().is_ident("bench"))
+    attrs.iter().any(|a| {
+        a.path()
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "test" || s.ident == "bench")
+    })
 }
 
 /// Returns `true` when `attrs` contains the literal `#[cfg(test)]`.
@@ -256,5 +262,24 @@ mod tests {
         assert_eq!(by("top").mod_path, Vec::<String>::new());
         assert_eq!(by("mid").mod_path, vec!["a".to_string()]);
         assert_eq!(by("deep").mod_path, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn qualified_test_runner_attrs_mark_unit_as_test() {
+        // #53: multi-segment test-runner attrs (#[tokio::test], #[actix_rt::test])
+        // count as test code, not just the bare #[test]/#[bench].
+        let src = "#[test] fn a() {}\n\
+                   #[bench] fn b() {}\n\
+                   #[tokio::test] async fn c() {}\n\
+                   #[actix_rt::test] async fn d() {}\n\
+                   fn prod() {}\n";
+        let file = syn::parse_file(src).unwrap();
+        let units = collect(&file, "x.rs");
+        let is_test = |name: &str| units.iter().find(|u| u.symbol == name).unwrap().is_test;
+        assert!(is_test("a"), "#[test] must be test");
+        assert!(is_test("b"), "#[bench] must be test");
+        assert!(is_test("c"), "#[tokio::test] must be test");
+        assert!(is_test("d"), "#[actix_rt::test] must be test");
+        assert!(!is_test("prod"), "a plain fn must not be test");
     }
 }

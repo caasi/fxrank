@@ -28,6 +28,22 @@ did in 0.1.1).
   inherited by `(kind, class, from, via)`). Ordering only — no scoring or set-membership
   change. The per-hotspot sort runs after `--limit` truncation, so only the retained
   top-N pay for it.
+- **Rust: pure value / compile-time macros no longer flagged `unknown.macro`** ([#54]) —
+  `serde_json::json!`, `env!`, and `option_env!` are whitelisted (matched on the last path
+  segment, so qualified forms classify the same), removing a large class of false
+  `unknown.macro` (class 2) noise. Dogfood: `unknown.macro` effects on `agent-browser/cli`
+  dropped 1445 → 20.
+- **Rust: multi-segment test-runner attributes are now recognised as test code** ([#53],
+  partial) — `has_test_attr` matches the **last** path segment, so `#[tokio::test]`,
+  `#[actix_rt::test]`, `#[async_std::test]`, etc. are skipped by default like bare
+  `#[test]`/`#[bench]`, instead of leaking into the production ranking. Dogfood
+  (agent-browser/cli): 88 more functions correctly skipped as tests. (The out-of-line
+  `#[cfg(test)] mod foo;` half of #53 still needs module-tree resolution — deferred.)
+- **TS: `this.mutation` evidence now names the field written** ([#56], partial) — the
+  evidence string used the write's *base* ident, which collapses `this.dirty` to `this`,
+  so every `this.mutation` read "… this". It now renders the full place path
+  (`this.dirty`, `this.a.b`, `xs[…]`). Reporting only — no class or score change. (The
+  function-decl `displayName` symmetry half of #56 is deferred.)
 
 ## [0.4.0] - 2026-06-26
 
@@ -84,6 +100,9 @@ fields are added.
 [#40]: https://github.com/caasi/fxrank/issues/40
 [#41]: https://github.com/caasi/fxrank/issues/41
 [#46]: https://github.com/caasi/fxrank/issues/46
+[#53]: https://github.com/caasi/fxrank/issues/53
+[#54]: https://github.com/caasi/fxrank/issues/54
+[#56]: https://github.com/caasi/fxrank/issues/56
 
 ## [0.3.0] - 2026-06-23
 
