@@ -28,6 +28,11 @@ did in 0.1.1).
   inherited by `(kind, class, from, via)`). Ordering only — no scoring or set-membership
   change. The per-hotspot sort runs after `--limit` truncation, so only the retained
   top-N pay for it.
+- **Rust: pure value / compile-time macros no longer flagged `unknown.macro`** ([#54]) —
+  `serde_json::json!`, `env!`, and `option_env!` are whitelisted (matched on the last path
+  segment, so qualified forms classify the same), removing a large class of false
+  `unknown.macro` (class 2) noise. Dogfood: `unknown.macro` effects on `agent-browser/cli`
+  dropped 1445 → 20.
 
 ## [0.4.0] - 2026-06-26
 
@@ -84,6 +89,7 @@ fields are added.
 [#40]: https://github.com/caasi/fxrank/issues/40
 [#41]: https://github.com/caasi/fxrank/issues/41
 [#46]: https://github.com/caasi/fxrank/issues/46
+[#54]: https://github.com/caasi/fxrank/issues/54
 
 ## [0.3.0] - 2026-06-23
 

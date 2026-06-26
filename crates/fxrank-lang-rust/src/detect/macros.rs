@@ -118,8 +118,10 @@ fn classify_macro(first: &str, last: &str, _segment_count: usize) -> Option<(Eff
             return Some((NetFsDb, Tier::Heuristic));
         }
         // ── Whitelist ────────────────────────────────────────────────────────
+        // `json` covers `serde_json::json!` (matched on the last segment); `env`/
+        // `option_env` read compile-time env vars, so they carry no runtime effect.
         "vec" | "format" | "matches" | "concat" | "stringify" | "cfg" | "line" | "column"
-        | "file" => {
+        | "file" | "json" | "env" | "option_env" => {
             return None; // no effect
         }
         _ => {}
@@ -167,5 +169,18 @@ mod tests {
             classify_macro("mycrate", "my_macro", 2),
             Some((EffectKind::UnknownMacro, Tier::Heuristic))
         );
+    }
+
+    #[test]
+    fn pure_value_macros_are_whitelisted() {
+        // #54: `serde_json::json!` (last segment `json`) builds a value, and `env!`/
+        // `option_env!` read compile-time env vars — none carry a runtime effect, so
+        // they must be whitelisted (None), not flagged as `unknown.macro`.
+        assert_eq!(classify_macro("serde_json", "json", 2), None);
+        assert_eq!(classify_macro("std", "env", 2), None);
+        assert_eq!(classify_macro("core", "option_env", 2), None);
+        // bare forms too
+        assert_eq!(classify_macro("env", "env", 1), None);
+        assert_eq!(classify_macro("json", "json", 1), None);
     }
 }
