@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-fxrank-core = { path = "../fxrank-core", version = "0.4.0" }
+fxrank-core = { path = "../fxrank-core", version = "0.4.1" }
 libcst = { version = "1.8.6", default-features = false }
 
 [dev-dependencies]
