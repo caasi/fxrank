@@ -17,6 +17,18 @@ did in 0.1.1).
   `debug_assert` test guards against duplicates as flags are added. Long forms remain the
   convention for scripts and docs; the shorts are purely an interactive convenience.
 
+### Fixed
+
+- **Deterministic scan output** ([#46]) — `scope.external_reaches[]`, each
+  `hotspots[].inherited[]`, and the summary/per-hotspot external-reach lists were
+  serialized in hash-container iteration order, so output varied run-to-run on identical
+  input (the *sets* were identical; only the order differed) — defeating before/after
+  diffs, CLI golden tests, and reproducible CI artifacts. `Report::build` now sorts each
+  by a stable key before serialization (external reaches by `(specifier, kind, site)`,
+  inherited by `(kind, class, from, via)`). Ordering only — no scoring or set-membership
+  change. The per-hotspot sort runs after `--limit` truncation, so only the retained
+  top-N pay for it.
+
 ## [0.4.0] - 2026-06-26
 
 A large release: effects now propagate **across files**, module resolution is
@@ -71,6 +83,7 @@ fields are added.
 [#37]: https://github.com/caasi/fxrank/issues/37
 [#40]: https://github.com/caasi/fxrank/issues/40
 [#41]: https://github.com/caasi/fxrank/issues/41
+[#46]: https://github.com/caasi/fxrank/issues/46
 
 ## [0.3.0] - 2026-06-23
 
