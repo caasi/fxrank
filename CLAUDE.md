@@ -37,6 +37,32 @@ followed. `--no-resolve` disables the whole pass (per-file own scores only). **O
 byte-identical to pre-025** — propagation only *adds* fields. Deferred: module-tree precise
 resolution (#36), React-inheritance fold retrofit (#37); see spec 025 §13a.
 
+## Public docs strategy (README & homepage) — keep them slim
+
+The `README.md` and the GitHub Pages homepage are **public PR / marketing surfaces for fast
+comprehension** (by both humans and coding agents), **not manuals**. They carry **durable facts
+only**; everything that drifts is deferred to where it stays current. This is deliberate (issues
+#12, #58) — the rationale is *cadence separation*: anything that restates the CLI surface (flags,
+the output schema, exact invocations) goes stale by the next flag we add, so it must come from the
+tool, not a hand-maintained page.
+
+- **README keeps:** the one-line what, the thesis (the `&mut`/`&self` containment-discount
+  inversion), a *minimal* install + a 3–4 line quick-start, the scoring model briefly, and a short
+  status. Target ~90 lines.
+- **README defers (do NOT re-add):** the exhaustive `--exclude` matcher rules + default list, the
+  full output-JSON example / field-by-field schema, the per-language test-skip rules, and the
+  install-variant matrix → **`fxrank scan --help`**; the step-by-step lab protocol → the planned
+  **`lower-effect-score` skill**; cross-language mutation detail → the **mutation guideline**; full
+  scoring/schema → **spec 001**; known-limitations + roadmap churn → the **issue tracker**.
+- **Homepage** (orphan `gh-pages` branch, served at `https://caasi.github.io/fxrank/`; PRs target
+  `gh-pages`) is the *more radical* version: durable *why* only, zero styling, pure semantic HTML
+  that is machine-readable (a `<meta name="fxrank:*">` contract + JSON-LD + an embedded
+  `fxrank-concept` JSON block). It defers **even install/usage** to the crate and `--help`.
+
+**Future agents:** when updating these surfaces, resist re-bloating them. If you're tempted to
+paste a flag table, a schema dump, or a roadmap section into the README, that detail belongs in
+`--help` / the spec / the issue tracker — add a pointer, not the content.
+
 ## Workspace layout
 
 A Cargo workspace, one shipped binary, language frontends feature-gated:
