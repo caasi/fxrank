@@ -27,23 +27,23 @@ enum Cmd {
         /// File or directory to scan. Omit (or pass `-`) to read from stdin.
         path: Option<PathBuf>,
         /// Limit output to the top-N hotspots (summary still covers all).
-        #[arg(long)]
+        #[arg(long, short = 'n')]
         limit: Option<usize>,
         /// Include test functions and modules in the analysis (skipped by default).
-        #[arg(long)]
+        #[arg(long, short = 't')]
         include_tests: bool,
         /// Language dialect for stdin (`ts`, `tsx`, `js`, `jsx`, `python`). Only meaningful
         /// for stdin; for files/directories the extension decides the frontend.
-        #[arg(long)]
+        #[arg(long, short = 'L')]
         lang: Option<String>,
         /// Patterns to skip during directory scans (comma-separated; REPLACES the
         /// default union of the enabled frontends' corpus profiles when provided).
         /// Classified by `/` (spec 004): no-`/` literal prunes a dir + excludes a file;
         /// no-`/` glob excludes files only; `/`-bearing glob filters files by path.
-        #[arg(long, value_delimiter = ',')]
+        #[arg(long, short = 'e', value_delimiter = ',')]
         exclude: Option<Vec<String>>,
         /// Skip cross-file resolution + propagation; emit per-file own scores only.
-        #[arg(long)]
+        #[arg(long, short = 'R')]
         no_resolve: bool,
         /// Path to a tsconfig.json (or a directory containing one) for resolving TS
         /// `paths`/`baseUrl` aliases (tsc-compatible `-p`). TS/JS only; ignored for Rust/Python.
@@ -694,6 +694,15 @@ fn dispatch_python(sources: Vec<SourceFile>, _include_tests: bool) -> FrontendOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// clap panics at startup on a duplicate short flag; `debug_assert` asserts the
+    /// CLI definition is well-formed (no conflicting shorts), guarding #40's `scan`
+    /// aliases (`-n`/`-t`/`-L`/`-e`/`-R`/`-p`) as future flags are added.
+    #[test]
+    fn cli_has_no_conflicting_short_flags() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
 
     /// Write two Rust files into a fresh temp dir under the OS temp root:
     /// `caller()` calls `helper()`, and `helper()` does `std::fs::write(...)`.
