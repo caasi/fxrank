@@ -7,7 +7,9 @@ use serde::Serialize;
 /// carrying bounded (exemplar) provenance. The `kind`/`class` describe the
 /// signal; `from`/`via` describe where it came from and one representative
 /// discovery path. Compact wire form — see the fold's `Inherited` for the source.
-#[derive(Debug, Clone, Serialize)]
+// Field-declaration order is `(kind, class, from, via)`, so the derived `Ord` is
+// exactly #46's stable sort key for each hotspot's `inherited[]`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct InheritedSignal {
     /// Effect or risk wire string (e.g. `"net.fs.db"`, `"ffi.call"`).
     pub kind: String,
@@ -139,8 +141,9 @@ pub struct Report {
 }
 
 /// Deduped union of the external reaches carried by `scope` and every hotspot,
-/// keyed by `(specifier, site)`. First occurrence wins; order is insertion order
-/// (scope first, then hotspots) so output is deterministic.
+/// keyed by `(specifier, site)`. First occurrence wins. The caller (`Report::build`)
+/// sorts the result before serialization: insertion order here follows hash-container
+/// iteration upstream and is NOT stable across runs (#46).
 fn dedup_reaches(scope: &Scope, hotspots: &[Hotspot]) -> Vec<ExternalReach> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -162,7 +165,7 @@ fn dedup_reaches(scope: &Scope, hotspots: &[Hotspot]) -> Vec<ExternalReach> {
 
 impl Report {
     pub fn build(
-        scope: Scope,
+        mut scope: Scope,
         mut hotspots: Vec<Hotspot>,
         diagnostics: Vec<Diagnostic>,
         limit: Option<usize>,
@@ -230,8 +233,11 @@ impl Report {
             .unwrap_or(0)
             .max(max_class_scope);
 
-        // Deduped union of external reaches across all hotspots + scope.
-        let external_reaches = dedup_reaches(&scope, &hotspots);
+        // Deduped union of external reaches across all hotspots + scope. Sort by the
+        // derived `Ord` (specifier, kind, site) so the serialized list is stable
+        // run-to-run (#46) — the union itself came from hash iteration upstream.
+        let mut external_reaches = dedup_reaches(&scope, &hotspots);
+        external_reaches.sort();
 
         let summary = Summary {
             own_score,
@@ -246,6 +252,17 @@ impl Report {
         // Truncate AFTER computing summary
         if let Some(n) = limit {
             hotspots.truncate(n);
+        }
+
+        // Determinism (#46): the list fields below are accumulated in hash containers
+        // upstream, so their order varies run-to-run even on identical input. Sort
+        // each by its type's derived `Ord` (the #46 stable keys) right before
+        // serialization. The per-hotspot sort runs AFTER truncation, so only the
+        // retained top-N pay for it.
+        scope.external_reaches.sort();
+        for h in &mut hotspots {
+            h.inherited.sort();
+            h.external_reaches.sort();
         }
 
         Report {
@@ -506,7 +523,72 @@ mod tests {
             .iter()
             .map(|r| r.specifier.as_str())
             .collect();
-        assert_eq!(specs, vec!["axios", "fs", "lodash"]); // deduped, insertion order
+        // Deduped, then sorted by (specifier, kind, site) per #46 — here the sorted
+        // order happens to coincide with insertion order (axios < fs < lodash).
+        assert_eq!(specs, vec!["axios", "fs", "lodash"]);
+    }
+
+    #[test]
+    fn report_build_sorts_list_fields_for_determinism() {
+        use crate::record::{ExternalReach, ReachKind};
+        let reach = |spec: &str, kind: ReachKind, site: &str| ExternalReach {
+            specifier: spec.into(),
+            kind,
+            site: site.into(),
+        };
+        let inh = |kind: &str, class: u8, from: &str, via: &str| InheritedSignal {
+            kind: kind.into(),
+            class,
+            from: from.into(),
+            via: via.into(),
+        };
+        // A hotspot whose inherited[] and external_reaches[] are deliberately out of
+        // order (as hash-container iteration upstream would deliver them).
+        let h = Hotspot {
+            id: "h".into(),
+            inherited: vec![
+                inh("net.fs.db", 7, "z.rs:1:1:z", "h->z"),
+                inh("env.read", 4, "a.rs:1:1:a", "h->a"),
+                inh("net.fs.db", 7, "a.rs:1:1:a", "h->a"),
+            ],
+            external_reaches: vec![
+                reach("lodash", ReachKind::ThirdParty, "b.ts:2"),
+                reach("axios", ReachKind::FirstPartyOutOfScope, "a.ts:1"),
+                reach("axios", ReachKind::ThirdParty, "a.ts:1"),
+            ],
+            ..Hotspot::own_seed(10.0, 7)
+        };
+        let scope = Scope {
+            external_reaches: vec![
+                reach("react", ReachKind::ThirdParty, "c.ts:3"),
+                reach("@app/x", ReachKind::FirstPartyOutOfScope, "c.ts:9"),
+            ],
+            ..Scope::empty("f")
+        };
+
+        let report = Report::build(scope, vec![h], vec![], None);
+
+        // Every serialized list field comes out sorted by its type's derived `Ord`
+        // (#46's stable keys), regardless of the input order above.
+        let sorted_reaches = |v: &[ExternalReach]| v.windows(2).all(|w| w[0] <= w[1]);
+        let hs = &report.hotspots[0];
+        assert!(
+            hs.inherited.windows(2).all(|w| w[0] <= w[1]),
+            "hotspot.inherited must be sorted: {:?}",
+            hs.inherited
+        );
+        assert!(
+            sorted_reaches(&hs.external_reaches),
+            "hotspot.external_reaches must be sorted"
+        );
+        assert!(
+            sorted_reaches(&report.scope.external_reaches),
+            "scope.external_reaches must be sorted"
+        );
+        assert!(
+            sorted_reaches(&report.summary.external_reaches),
+            "summary.external_reaches must be sorted"
+        );
     }
 
     #[test]

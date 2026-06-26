@@ -97,7 +97,8 @@ pub struct UnitRecord {
 }
 
 /// How an external call site (one that cannot be resolved locally) is reached.
-#[derive(Debug, Clone, serde::Serialize)]
+// `Ord` (variant-declaration order) lets `external_reaches` sort deterministically.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum ReachKind {
     ThirdParty,
     FirstPartyOutOfScope,
@@ -107,7 +108,9 @@ pub enum ReachKind {
 
 /// A call site that crosses the corpus boundary — emitted as part of the
 /// wire-format `Report` so consumers can see what fell outside the scan.
-#[derive(Debug, Clone, serde::Serialize)]
+// Field-declaration order is `(specifier, kind, site)`, so the derived `Ord` is
+// exactly #46's stable sort key for `external_reaches`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub struct ExternalReach {
     pub specifier: String,
     pub kind: ReachKind,
