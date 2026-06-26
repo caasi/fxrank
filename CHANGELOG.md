@@ -8,6 +8,15 @@ did in 0.1.1).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-26
+
+A maintenance release: **deterministic scan output**, dogfooding-driven detector
+accuracy fixes (macro noise, test-code skipping, mutation evidence), and **short CLI
+flag aliases**. *Pre-1.0 output note:* scores and rankings shift slightly (functions
+that were `unknown.macro` or unskipped test code now score differently) and some
+`this.mutation` evidence strings change, but the report **schema is unchanged** and
+output is now byte-stable run-to-run.
+
 ### Added
 
 - **Short aliases for every `fxrank scan` flag** ([#40]) — `-n` (`--limit`), `-t`
@@ -211,7 +220,8 @@ rankings shift for affected code.
   skipped by default (`--include-tests` to score it).
 - Slim, feature-gated builds (`--features rust`, `--features ts`).
 
-[Unreleased]: https://github.com/caasi/fxrank/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/caasi/fxrank/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/caasi/fxrank/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/caasi/fxrank/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/caasi/fxrank/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/caasi/fxrank/compare/v0.1.1...v0.2.0

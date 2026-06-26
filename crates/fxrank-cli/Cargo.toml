@@ -15,10 +15,10 @@ readme = "README.md"
 name = "fxrank"
 path = "src/main.rs"
 [dependencies]
-fxrank-core = { path = "../fxrank-core", version = "0.4.0" }
-fxrank-lang-rust = { path = "../fxrank-lang-rust", version = "0.4.0", optional = true }
-fxrank-lang-ts = { path = "../fxrank-lang-ts", version = "0.4.0", optional = true }
-fxrank-lang-python = { path = "../fxrank-lang-python", version = "0.4.0", optional = true }
+fxrank-core = { path = "../fxrank-core", version = "0.4.1" }
+fxrank-lang-rust = { path = "../fxrank-lang-rust", version = "0.4.1", optional = true }
+fxrank-lang-ts = { path = "../fxrank-lang-ts", version = "0.4.1", optional = true }
+fxrank-lang-python = { path = "../fxrank-lang-python", version = "0.4.1", optional = true }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 [features]
