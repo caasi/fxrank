@@ -6,6 +6,17 @@ All notable changes to FxRank are documented here. The format follows
 schema may still change between releases, including patch releases — as the `id` format
 did in 0.1.1).
 
+## [Unreleased]
+
+### Added
+
+- **Short aliases for every `fxrank scan` flag** ([#40]) — `-n` (`--limit`), `-t`
+  (`--include-tests`), `-L` (`--lang`), `-e` (`--exclude`), and `-R` (`--no-resolve`),
+  joining the existing `-p` (`--project`). Letters were chosen collision-free (`-L`/`-R`
+  uppercase to avoid the `--limit`/`--lang` ambiguity of `-l`), and a startup
+  `debug_assert` test guards against duplicates as flags are added. Long forms remain the
+  convention for scripts and docs; the shorts are purely an interactive convenience.
+
 ## [0.4.0] - 2026-06-26
 
 A large release: effects now propagate **across files**, module resolution is
@@ -58,6 +69,7 @@ fields are added.
 [#28]: https://github.com/caasi/fxrank/issues/28
 [#36]: https://github.com/caasi/fxrank/issues/36
 [#37]: https://github.com/caasi/fxrank/issues/37
+[#40]: https://github.com/caasi/fxrank/issues/40
 [#41]: https://github.com/caasi/fxrank/issues/41
 
 ## [0.3.0] - 2026-06-23
@@ -167,6 +179,7 @@ rankings shift for affected code.
   skipped by default (`--include-tests` to score it).
 - Slim, feature-gated builds (`--features rust`, `--features ts`).
 
+[Unreleased]: https://github.com/caasi/fxrank/compare/v0.4.0...HEAD
 [0.4.0]: https://github.com/caasi/fxrank/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/caasi/fxrank/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/caasi/fxrank/compare/v0.1.1...v0.2.0
