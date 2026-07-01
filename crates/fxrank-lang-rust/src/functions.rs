@@ -33,9 +33,9 @@ pub struct FnUnit {
     pub sig: syn::Signature,
     /// The function body (for detectors to walk expressions in T11–T15).
     pub block: syn::Block,
-    /// Whether this function is test code (`#[test]`/`#[bench]`, or inside a
-    /// `#[cfg(test)]` module). Computed at collection time; test units are
-    /// excluded from scoring by default.
+    /// Whether this function is test code: `#[test]`/`#[bench]`, or carrying a bare
+    /// `#[cfg(test)]` (on the fn, its `impl`/`trait` block, or an enclosing module).
+    /// Computed at collection time; test units are excluded from scoring by default.
     pub is_test: bool,
     /// Inline-`mod` nesting within the file (`["a","b"]` for `mod a { mod b { fn } }`).
     /// Empty for a top-level item. Combined with the file's module path to form
@@ -95,7 +95,7 @@ fn collect_items(
                 let start = f.sig.ident.span().start();
                 let line = start.line;
                 let col = start.column + 1; // proc-macro2 column is 0-based
-                let is_test = in_cfg_test || has_test_attr(&f.attrs);
+                let is_test = in_cfg_test || has_test_attr(&f.attrs) || is_cfg_test(&f.attrs);
                 out.push(FnUnit {
                     id: format!("{path}:{line}:{col}:{symbol}"),
                     symbol,
@@ -110,10 +110,14 @@ fn collect_items(
             }
 
             Item::Impl(impl_block) => {
+                // A `#[cfg(test)] impl …` block makes all its methods test-only.
+                let in_cfg_test = in_cfg_test || is_cfg_test(&impl_block.attrs);
                 collect_from_impl(impl_block, path, in_cfg_test, mod_path, out);
             }
 
             Item::Trait(trait_item) => {
+                // A `#[cfg(test)] trait …` makes its default-bodied methods test-only.
+                let in_cfg_test = in_cfg_test || is_cfg_test(&trait_item.attrs);
                 collect_from_trait(trait_item, path, in_cfg_test, mod_path, out);
             }
 
@@ -160,7 +164,7 @@ fn collect_from_impl(
                 None => format!("{type_name}::{method_name}"),
             };
 
-            let is_test = in_cfg_test || has_test_attr(&method.attrs);
+            let is_test = in_cfg_test || has_test_attr(&method.attrs) || is_cfg_test(&method.attrs);
             out.push(FnUnit {
                 id: format!("{path}:{line}:{col}:{symbol}"),
                 symbol,
@@ -195,7 +199,8 @@ fn collect_from_trait(
                 let col = start.column + 1; // proc-macro2 column is 0-based
                 let symbol = format!("{trait_name}::{method_name}");
 
-                let is_test = in_cfg_test || has_test_attr(&method.attrs);
+                let is_test =
+                    in_cfg_test || has_test_attr(&method.attrs) || is_cfg_test(&method.attrs);
                 out.push(FnUnit {
                     id: format!("{path}:{line}:{col}:{symbol}"),
                     symbol,

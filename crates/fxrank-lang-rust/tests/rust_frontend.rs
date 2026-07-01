@@ -1010,8 +1010,15 @@ fn collect_marks_test_code() {
     let by = |s: &str| units.iter().find(|u| u.symbol == s).map(|u| u.is_test);
     assert_eq!(by("prod"), Some(false));
     assert_eq!(by("free_test"), Some(true)); // #[test]
+    assert_eq!(by("bare_cfg_test_fn"), Some(true)); // bare #[cfg(test)] fn (refs #53)
     assert_eq!(by("helper"), Some(true)); // inside #[cfg(test)] mod
     assert_eq!(by("S::method"), Some(true)); // method inside #[cfg(test)] mod
+    assert_eq!(by("P::prod_method"), Some(false)); // production method — scored
+    assert_eq!(by("P::cfg_test_method"), Some(true)); // bare #[cfg(test)] method (refs #53)
+    assert_eq!(by("P::whole_impl_test"), Some(true)); // inside #[cfg(test)] impl block (refs #53)
+    assert_eq!(by("Tr::prod_default"), Some(false)); // production trait default — scored
+    assert_eq!(by("Tr::cfg_test_default"), Some(true)); // bare #[cfg(test)] trait method (refs #53)
+    assert_eq!(by("TrTest::whole_trait_test"), Some(true)); // inside #[cfg(test)] trait block (refs #53)
 }
 
 // ── Task 16: parse diagnostics ───────────────────────────────────────────────
@@ -1192,12 +1199,19 @@ fn default_skips_tests_and_counts_them() {
     let out = analyze_fixture("skip_tests.rs"); // default: include_tests = false
     let syms: Vec<_> = out.functions.iter().map(|f| f.symbol.clone()).collect();
     assert!(syms.contains(&"prod".to_string()));
-    assert!(
-        !syms
-            .iter()
-            .any(|s| s == "free_test" || s.contains("helper") || s == "S::method")
-    );
-    assert_eq!(out.skipped_tests, 3); // free_test + helper + S::method
+    assert!(syms.contains(&"P::prod_method".to_string())); // production method still scored
+    assert!(syms.contains(&"Tr::prod_default".to_string())); // production trait default still scored
+    assert!(!syms.iter().any(|s| s == "free_test"
+        || s == "bare_cfg_test_fn"
+        || s.contains("helper")
+        || s == "S::method"
+        || s == "P::cfg_test_method"
+        || s == "P::whole_impl_test"
+        || s == "Tr::cfg_test_default"
+        || s == "TrTest::whole_trait_test"));
+    // free_test + bare_cfg_test_fn + helper + S::method + P::cfg_test_method
+    // + P::whole_impl_test + Tr::cfg_test_default + TrTest::whole_trait_test
+    assert_eq!(out.skipped_tests, 8);
 }
 
 #[test]

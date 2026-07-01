@@ -174,9 +174,11 @@ never consult the matcher.
 
 ## Per-frontend realization
 
-- **Rust** — `CORPUS_PROFILE.test_file_globs` is empty; test detection is source-based
-  (`#[test]`/`#[bench]` attributes + `#[cfg(test)]` module items). The `target/`
-  build-artifact directory is the only prune entry. No prune markers.
+- **Rust** — `CORPUS_PROFILE.test_file_globs` is empty; test detection is source-based:
+  `#[test]`/`#[bench]` attributes (incl. multi-segment runners like `#[tokio::test]`)
+  plus a bare `#[cfg(test)]` on a `mod`, a free `fn`, an `impl`/`trait` block, or an
+  `impl`/`trait` method (#53). The `target/` build-artifact directory is the only prune
+  entry. No prune markers.
 
 - **TypeScript/JavaScript** — `test_file_globs` drives `is_test_file` via a lazily-built
   `CorpusMatcher` (segment matching enabled so `__tests__` matches any path segment).
