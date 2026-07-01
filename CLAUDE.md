@@ -274,9 +274,12 @@ boundaries) with accurate evidence, and the discount correctly keeps the pervasi
 `&mut self` visitor accumulation *low* (no false alarms). Test code is now **skipped by
 default** (`#[test]`/`#[bench]` functions and `#[cfg(test)]` modules; pass `--include-tests`
 to score it), so the old "`assert!`/`assert_eq!` register as `panic` and dominate raw
-rankings" noise is gone for normal scans. One gap remains: a bare top-level
-`#[cfg(test)] fn` (a helper *outside* a `#[cfg(test)] mod`) is still collected as a normal
-function — see the TS dogfooding caveat below.
+rankings" noise is gone for normal scans. Test-skip now also covers a **bare
+`#[cfg(test)]`** on a free `fn`, an `impl`/`trait` block, or an `impl`/`trait` method
+(not just `#[test]`/`#[bench]` and `#[cfg(test)] mod`) — #53. Remaining gap: an
+**out-of-line `#[cfg(test)] mod foo;`** (body in a separate file) still can't be resolved
+here (deferred — tracked by #53); and compound `#[cfg(all(test, …))]` is intentionally
+not matched.
 
 ## Dogfooding the TS frontend (running `fxrank scan crates/fxrank-lang-ts/src/`)
 
@@ -287,12 +290,13 @@ is correctly discounted — the pervasive visitor-accumulation pattern stays low
 false alarms. The real IO boundaries (`run_scan`, `walk_dir`) surface at class 7 as
 expected. Core scoring functions score near zero.
 
-**Caveat surfaced:** standalone module-level `#[cfg(test)] fn` helpers are *not* skipped
-by the Rust frontend's test detection — it skips `#[test]` functions and `#[cfg(test)]`
-*modules*, but not bare `#[cfg(test)] fn` items, so they appeared as hotspots in the scan
-output. Workaround: move test helpers inside the `#[cfg(test)] mod tests` block (done for
-`imports::table` and `source::test_file`). Extending test-skip to bare `#[cfg(test)] fn`
-is a Milestone-B candidate.
+**Caveat surfaced (now fixed, #53):** standalone module-level `#[cfg(test)] fn` helpers
+*were* not skipped by the Rust frontend's test detection — it skipped `#[test]` functions
+and `#[cfg(test)]` *modules*, but not bare `#[cfg(test)]` items, so they appeared as
+hotspots. `functions::collect` now propagates a bare `#[cfg(test)]` on a free `fn`, an
+`impl`/`trait` block, and an `impl`/`trait` method into `is_test`, so the workaround (moving
+helpers into a `#[cfg(test)] mod tests` block) is no longer required. Only the out-of-line
+`#[cfg(test)] mod foo;` case remains open (tracked by #53).
 
 ## Dogfooding the React signals (running `.tsx` fixtures through the two-pass)
 
