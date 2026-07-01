@@ -303,6 +303,27 @@ fn classify_resolved(full: &str) -> Option<(EffectKind, Tier)> {
 
     // ── concurrency (class 6) ──
     if matches!(root, "threading" | "multiprocessing" | "asyncio") {
+        // Not every member is a concurrency primitive. Type predicates are pure;
+        // ambient-state readers report only what they read (refs #52).
+        if matches!(leaf, "iscoroutine" | "iscoroutinefunction" | "isfuture") {
+            return None; // pure type check
+        }
+        // `get_event_loop` is intentionally NOT here: unlike the read-only
+        // `get_running_loop`, on some versions/policies it *creates and installs* a new
+        // loop when none is set — a real runtime-state side effect — so it stays
+        // `concurrency` (Codex review, PR #65).
+        if matches!(
+            leaf,
+            "current_thread"
+                | "main_thread"
+                | "active_count"
+                | "get_ident"
+                | "current_process"
+                | "current_task"
+                | "get_running_loop"
+        ) {
+            return Some((AmbientRead, Tier::Heuristic)); // ambient runtime state
+        }
         return Some((Concurrency, Tier::Heuristic));
     }
 
@@ -515,6 +536,61 @@ mod tests {
             Tier::Path,
             "dotenv.load_dotenv is import-resolved; must be Tier::Path, got {:?}",
             e2.tier
+        );
+    }
+
+    /// refs #52: not every `asyncio`/`threading` member is concurrency. Type
+    /// predicates are pure; ambient-state readers are `ambient.read`/2. Only the
+    /// genuine concurrency primitives stay `concurrency`/6.
+    #[test]
+    fn asyncio_threading_predicates_and_ambient_reads_are_not_concurrency() {
+        // Type predicate → pure (no effect at all).
+        let preds =
+            effects_for_src("import asyncio\ndef f(x):\n    return asyncio.iscoroutine(x)\n");
+        assert!(
+            !preds.iter().any(|e| e.kind == Concurrency),
+            "asyncio.iscoroutine is a pure predicate; must not emit Concurrency, got {:?}",
+            preds.iter().map(|e| e.kind).collect::<Vec<_>>()
+        );
+
+        // Ambient state read → AmbientRead/2.
+        let ambient =
+            effects_for_src("import threading\ndef g():\n    return threading.current_thread()\n");
+        assert!(
+            ambient.iter().any(|e| e.kind == AmbientRead),
+            "threading.current_thread is an ambient read; must emit AmbientRead, got {:?}",
+            ambient.iter().map(|e| e.kind).collect::<Vec<_>>()
+        );
+        assert!(
+            !ambient.iter().any(|e| e.kind == Concurrency),
+            "threading.current_thread must not emit Concurrency"
+        );
+
+        // Genuine concurrency primitive → still Concurrency/6.
+        let real = effects_for_src("import asyncio\ndef h(t):\n    return asyncio.gather(t)\n");
+        let c = real
+            .iter()
+            .find(|e| e.kind == Concurrency)
+            .expect("asyncio.gather must still emit Concurrency");
+        assert_eq!(c.class, 6, "concurrency stays class 6");
+
+        // `get_running_loop` is read-only → AmbientRead; but `get_event_loop` can
+        // create/install a loop → it must stay Concurrency (Codex review, PR #65).
+        let running =
+            effects_for_src("import asyncio\ndef r():\n    return asyncio.get_running_loop()\n");
+        assert!(
+            running.iter().any(|e| e.kind == AmbientRead)
+                && !running.iter().any(|e| e.kind == Concurrency),
+            "asyncio.get_running_loop must be AmbientRead, not Concurrency, got {:?}",
+            running.iter().map(|e| e.kind).collect::<Vec<_>>()
+        );
+        let get_loop =
+            effects_for_src("import asyncio\ndef gl():\n    return asyncio.get_event_loop()\n");
+        assert!(
+            get_loop.iter().any(|e| e.kind == Concurrency)
+                && !get_loop.iter().any(|e| e.kind == AmbientRead),
+            "asyncio.get_event_loop can install a loop → must stay Concurrency, got {:?}",
+            get_loop.iter().map(|e| e.kind).collect::<Vec<_>>()
         );
     }
 
