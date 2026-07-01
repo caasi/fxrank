@@ -1,5 +1,10 @@
 # Spec 008 — dogfood ranking deltas
 
+> **Historical log, not a live model.** This is a one-time before/after observation from
+> the spec-008 mutation-alignment work — kept for the record, not maintained. For the
+> current mutation model see [`mutation-classification-guideline.md`](mutation-classification-guideline.md).
+
+
 Observed by running `fxrank scan` on the workspace's own source (`crates/`) with the
 aligned build, cross-checked against the per-task RED/GREEN test evidence (the authoritative
 before/after). Every delta below is intentional behavioral parity (spec 008 §3 F1–F5),
