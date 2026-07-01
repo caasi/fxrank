@@ -70,7 +70,8 @@ A Cargo workspace, one shipped binary, language frontends feature-gated:
 - **`crates/fxrank-core`** — language-neutral scoring model. **Depends on no parser** (the
   compiler enforces this; `syn` must never leak here). Holds: `effect` (kind/risk
   vocabulary + the `Effect`/`RiskFeature` wire types), `score` (Fibonacci weights, the
-  containment discount, `own_score`, the integer `rank_key`), `confidence`, `model` (the
+  containment discount, `own_score`, the composite `rank_key` sort tuple `(u8, u64, u32,
+  u32)`), `confidence`, `model` (the
   JSON `Report`/`Scope`/`Hotspot`/`Summary` + `Report::build`), and the `Frontend` trait.
 - **`crates/fxrank-lang-rust`** — the `syn`-based Rust frontend (behind the `rust`
   feature). `functions` (function-unit collection), `imports` (a `use` table), and
@@ -393,3 +394,21 @@ govern — read §13/§13a for the current Known Limitations and the deferred 3e
 Limitations* section records the older deferrals; note **call-graph propagation / `inherited_score` is
 now DELIVERED by spec 025** (no longer deferred), while FFI call-site detection, `global.mutation` class-4
 downgrade, and a full semantic/type-resolution pass remain.
+
+The **specs are historical reference** — a contributor reads one only when the shared-knowledge
+docs contradict themselves or the code (the spec is the tie-breaker of record). Day-to-day work
+starts from `docs/README.md` (the shared-knowledge index) and the descriptive guidelines it maps;
+adding a new language frontend is fully driven by `docs/adding-a-language-frontend.md` (a
+prescriptive checklist that composes the mutation / corpus / cross-file guidelines + the core code).
+
+## Reviewing changes: use model-diverse reviewers
+
+When running the review gate on a change (the `review-loop` big loop), **do not review with only the
+same model as the author.** Run at least two *different* models as independent reviewers. Evidence
+from the docs work that produced `docs/adding-a-language-frontend.md`: an Opus-4.8 and a Sonnet-5
+reviewer, given the identical diff and prompt, shared only **1 of 8** findings — Opus caught
+semantic-precision bugs (a mis-stated discount class), Sonnet caught repo-wide completeness gaps
+(a missing per-language CI line that would have let the new frontend silently skip CI). Their blind
+spots barely overlap, so same-model review misses roughly half of what's findable. Default the local
+reviewer to a model other than the main loop's, and treat a final independent pass (+ Copilot on the
+PR) as the merge gate — not "one model went quiet."
