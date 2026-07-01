@@ -142,15 +142,21 @@ fn prescan_body(
     locals: &mut HashSet<String>,
 ) {
     match body {
-        FnBody::Suite(suite) => prescan_suite(suite, globals, nonlocals, locals),
+        // Function/lambda body: nested def/class names ARE local bindings of this
+        // function, so `seed_defs = true` (refs #55).
+        FnBody::Suite(suite) => prescan_suite(suite, globals, nonlocals, locals, true),
         FnBody::Expr(_) => {} // lambdas have no statements
         // The `<module>` unit: prescan each top-level statement. Module-level
         // names that appear in a `global` declaration inside a nested def are
         // handled by that nested def's own prescan; at module scope itself,
         // every bare name assignment IS a module-level binding (no `global` needed).
+        // `seed_defs = false`: a top-level def/class name is a MODULE binding
+        // (handled by `module_bindings` → global.mutation), not a local of the
+        // `<module>` unit — seeding it would wrongly downgrade module-scope
+        // `SomeClass.attr = …` from global to local (refs #55 regression guard).
         FnBody::Module(stmts) => {
             for stmt in *stmts {
-                prescan_stmt(stmt, globals, nonlocals, locals);
+                prescan_stmt(stmt, globals, nonlocals, locals, false);
             }
         }
     }
@@ -161,11 +167,12 @@ fn prescan_suite(
     globals: &mut HashSet<String>,
     nonlocals: &mut HashSet<String>,
     locals: &mut HashSet<String>,
+    seed_defs: bool,
 ) {
     match suite {
         Suite::IndentedBlock(b) => {
             for stmt in &b.body {
-                prescan_stmt(stmt, globals, nonlocals, locals);
+                prescan_stmt(stmt, globals, nonlocals, locals, seed_defs);
             }
         }
         Suite::SimpleStatementSuite(s) => {
@@ -181,6 +188,7 @@ fn prescan_stmt(
     globals: &mut HashSet<String>,
     nonlocals: &mut HashSet<String>,
     locals: &mut HashSet<String>,
+    seed_defs: bool,
 ) {
     match stmt {
         Statement::Simple(line) => {
@@ -188,7 +196,7 @@ fn prescan_stmt(
                 prescan_small(small, globals, nonlocals, locals);
             }
         }
-        Statement::Compound(c) => prescan_compound(c, globals, nonlocals, locals),
+        Statement::Compound(c) => prescan_compound(c, globals, nonlocals, locals, seed_defs),
     }
 }
 
@@ -197,15 +205,30 @@ fn prescan_compound(
     globals: &mut HashSet<String>,
     nonlocals: &mut HashSet<String>,
     locals: &mut HashSet<String>,
+    seed_defs: bool,
 ) {
     use libcst_native::CompoundStatement;
     match compound {
-        // Nested def/lambda: do NOT descend (own-body attribution).
-        CompoundStatement::FunctionDef(_) | CompoundStatement::ClassDef(_) => {}
+        // Nested def/class: do NOT descend (own-body attribution), but in a FUNCTION
+        // body the def/class *name* is a local binding of the enclosing function —
+        // seed it so a later write to it (e.g. `helper.alters_data = True`) resolves
+        // as local, not a captured opaque binding (refs #55). `seed_defs` is false for
+        // the `<module>` unit, where such a name is a module binding (→ global), so it
+        // must NOT be seeded there.
+        CompoundStatement::FunctionDef(f) => {
+            if seed_defs {
+                locals.insert(f.name.value.to_owned());
+            }
+        }
+        CompoundStatement::ClassDef(c) => {
+            if seed_defs {
+                locals.insert(c.name.value.to_owned());
+            }
+        }
         CompoundStatement::If(i) => {
-            prescan_suite(&i.body, globals, nonlocals, locals);
+            prescan_suite(&i.body, globals, nonlocals, locals, seed_defs);
             if let Some(orelse) = &i.orelse {
-                prescan_orelse(orelse, globals, nonlocals, locals);
+                prescan_orelse(orelse, globals, nonlocals, locals, seed_defs);
             }
         }
         CompoundStatement::For(f) => {
@@ -213,19 +236,19 @@ fn prescan_compound(
             // (PEP 3104), whether the loop is `for` or `async for` (same node, just an
             // `asynchronous` flag). Collect target names before recursing into the body.
             crate::imports::collect_target_names(&f.target, locals);
-            prescan_suite(&f.body, globals, nonlocals, locals);
+            prescan_suite(&f.body, globals, nonlocals, locals, seed_defs);
             if let Some(orelse) = &f.orelse {
-                prescan_suite(&orelse.body, globals, nonlocals, locals);
+                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
             }
         }
         CompoundStatement::While(w) => {
-            prescan_suite(&w.body, globals, nonlocals, locals);
+            prescan_suite(&w.body, globals, nonlocals, locals, seed_defs);
             if let Some(orelse) = &w.orelse {
-                prescan_suite(&orelse.body, globals, nonlocals, locals);
+                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
             }
         }
         CompoundStatement::Try(t) => {
-            prescan_suite(&t.body, globals, nonlocals, locals);
+            prescan_suite(&t.body, globals, nonlocals, locals, seed_defs);
             for h in &t.handlers {
                 // `except SomeError as e:` — `e` is a Python local for the whole
                 // function (unlike in Python 2, it is deleted after the block, but it
@@ -233,29 +256,29 @@ fn prescan_compound(
                 if let Some(asname) = &h.name {
                     crate::imports::collect_target_names(&asname.name, locals);
                 }
-                prescan_suite(&h.body, globals, nonlocals, locals);
+                prescan_suite(&h.body, globals, nonlocals, locals, seed_defs);
             }
             if let Some(orelse) = &t.orelse {
-                prescan_suite(&orelse.body, globals, nonlocals, locals);
+                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
             }
             if let Some(fin) = &t.finalbody {
-                prescan_suite(&fin.body, globals, nonlocals, locals);
+                prescan_suite(&fin.body, globals, nonlocals, locals, seed_defs);
             }
         }
         CompoundStatement::TryStar(t) => {
-            prescan_suite(&t.body, globals, nonlocals, locals);
+            prescan_suite(&t.body, globals, nonlocals, locals, seed_defs);
             for h in &t.handlers {
                 // `except* SomeError as e:` — same binding semantics as `except … as`.
                 if let Some(asname) = &h.name {
                     crate::imports::collect_target_names(&asname.name, locals);
                 }
-                prescan_suite(&h.body, globals, nonlocals, locals);
+                prescan_suite(&h.body, globals, nonlocals, locals, seed_defs);
             }
             if let Some(orelse) = &t.orelse {
-                prescan_suite(&orelse.body, globals, nonlocals, locals);
+                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
             }
             if let Some(fin) = &t.finalbody {
-                prescan_suite(&fin.body, globals, nonlocals, locals);
+                prescan_suite(&fin.body, globals, nonlocals, locals, seed_defs);
             }
         }
         CompoundStatement::With(w) => {
@@ -267,11 +290,11 @@ fn prescan_compound(
                     crate::imports::collect_target_names(&asname.name, locals);
                 }
             }
-            prescan_suite(&w.body, globals, nonlocals, locals);
+            prescan_suite(&w.body, globals, nonlocals, locals, seed_defs);
         }
         CompoundStatement::Match(m) => {
             for case in &m.cases {
-                prescan_suite(&case.body, globals, nonlocals, locals);
+                prescan_suite(&case.body, globals, nonlocals, locals, seed_defs);
             }
         }
     }
@@ -282,16 +305,17 @@ fn prescan_orelse(
     globals: &mut HashSet<String>,
     nonlocals: &mut HashSet<String>,
     locals: &mut HashSet<String>,
+    seed_defs: bool,
 ) {
     match orelse {
         libcst_native::OrElse::Elif(elif) => {
-            prescan_suite(&elif.body, globals, nonlocals, locals);
+            prescan_suite(&elif.body, globals, nonlocals, locals, seed_defs);
             if let Some(inner) = &elif.orelse {
-                prescan_orelse(inner, globals, nonlocals, locals);
+                prescan_orelse(inner, globals, nonlocals, locals, seed_defs);
             }
         }
         libcst_native::OrElse::Else(e) => {
-            prescan_suite(&e.body, globals, nonlocals, locals);
+            prescan_suite(&e.body, globals, nonlocals, locals, seed_defs);
         }
     }
 }
@@ -907,6 +931,69 @@ mod tests {
             m["mutates_imported_module"].contains(&(GlobalMutation, false)),
             "config.settings.append(…) where `config` is imported must be GlobalMutation(false), got: {:?}",
             m["mutates_imported_module"]
+        );
+    }
+
+    /// refs #55: attribute-tagging a locally-defined nested `def` (the Django
+    /// `fn.alters_data = True` pattern) must be LocalMutation(contained), not a
+    /// spurious `hidden.mutation` "captured-binding" — the def name IS a local binding.
+    #[test]
+    fn nested_def_name_is_local_binding_not_captured() {
+        let m = mutation_effects("mutation");
+        let effs = &m["tags_nested_def"];
+        assert!(
+            effs.contains(&(LocalMutation, true)),
+            "helper.alters_data = True should be LocalMutation(contained=true), got: {effs:?}"
+        );
+        assert!(
+            !effs.iter().any(|(k, _)| *k == HiddenMutation),
+            "must not be a captured-binding hidden.mutation, got: {effs:?}"
+        );
+    }
+
+    /// refs #55 (Opus review): the `seed_defs` flag must reach nested defs inside
+    /// CONTROL FLOW, not just at the top of a function body. A `def` nested in an
+    /// `if` is still a function-local, so tagging it is LocalMutation — this guards
+    /// that the `If`/orelse recursion arm forwards `seed_defs`.
+    #[test]
+    fn nested_def_inside_control_flow_is_local() {
+        let m = mutation_effects("mutation");
+        let effs = &m["tags_nested_def_in_branch"];
+        assert!(
+            effs.contains(&(LocalMutation, true)),
+            "helper_in_if.alters_data (nested def inside `if`) should be LocalMutation, got: {effs:?}"
+        );
+        assert!(
+            !effs.iter().any(|(k, _)| *k == HiddenMutation),
+            "must not be captured-binding hidden.mutation, got: {effs:?}"
+        );
+    }
+
+    /// refs #55 (regression guard): the nested-def-name seeding must NOT reach the
+    /// synthetic `<module>` unit. At module scope a def/class name is a module-level
+    /// binding, so `module_level_taggable.alters_data = True` stays GlobalMutation/6
+    /// (via module_bindings), not LocalMutation. The `<module>` unit is built by
+    /// `module_init_unit`, not `functions::collect`, so this test drives it directly.
+    #[test]
+    fn module_level_def_attr_write_stays_global_not_local() {
+        let src = std::fs::read_to_string("tests/fixtures/mutation.py").unwrap();
+        let module = libcst_native::parse_module(&src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
+        let module_bindings = crate::imports::module_bindings(&module);
+        let span = crate::source::SpanIndex::new(&src);
+        let unit =
+            crate::functions::module_init_unit(&module).expect("module has executable top-level");
+        let effs: Vec<(EffectKind, bool)> = detect(&unit, &imports, &module_bindings, &span)
+            .iter()
+            .map(|(e, c)| (e.kind, *c))
+            .collect();
+        assert!(
+            effs.contains(&(GlobalMutation, false)),
+            "module-level `def.attr = …` must be GlobalMutation(false), got: {effs:?}"
+        );
+        assert!(
+            !effs.contains(&(LocalMutation, true)),
+            "module-level def-attr write must NOT be downgraded to LocalMutation, got: {effs:?}"
         );
     }
 
