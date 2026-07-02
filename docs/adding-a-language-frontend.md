@@ -10,7 +10,14 @@ Work an existing frontend beside you as a worked example: **Rust**
 (`crates/fxrank-lang-rust`) is the smallest (syntactic; uses the mut-channel discount but
 no coverage-based boundary discount, hence no `coverage.rs`);
 **Python** (`crates/fxrank-lang-python`) is the fullest (coverage, module-init, dual
-test-skip). Mirror the one whose language shape is closest to yours.
+test-skip); **Shell** (`crates/fxrank-lang-shell`) is the contrast case for the boundary
+discount — an untyped language with **no signature to measure coverage over at all**, so
+it applies `apply_boundary_discount(_, BoundaryCoverage::None, contained)` unconditionally
+(a permanent no-op shift-0, not a computed floor) and ships no `coverage.rs`. It's also the
+example for "no import syntax, no `ImportTable`, same-file-only cross-file resolution" (see
+the cross-file guideline's *Per-frontend realization*) and for a corpus profile with only
+`test_file_globs` populated (no vendor dir, no venv-style marker). Mirror the one whose
+language shape is closest to yours.
 
 ## 0. The one invariant that must hold
 

@@ -1,0 +1,18 @@
+---
+source: crates/fxrank-lang-shell/src/lib.rs
+expression: syms
+---
+[
+    (
+        "deploy",
+        7,
+    ),
+    (
+        "rollback",
+        6,
+    ),
+    (
+        "<script>",
+        6,
+    ),
+]

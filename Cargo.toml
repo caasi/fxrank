@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"   # explicit: a virtual manifest has no edition, so resolver isn't inferred
-members = ["crates/fxrank-core", "crates/fxrank-lang-rust", "crates/fxrank-cli", "crates/fxrank-lang-ts", "crates/fxrank-lang-python"]
+members = ["crates/fxrank-core", "crates/fxrank-lang-rust", "crates/fxrank-cli", "crates/fxrank-lang-ts", "crates/fxrank-lang-python", "crates/fxrank-lang-shell"]
 
 [workspace.package]
 edition = "2024"

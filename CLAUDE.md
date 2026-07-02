@@ -246,7 +246,13 @@ See spec 025 + `docs/cross-file-resolution-guideline.md`.
   shifts down 2, `&mut self` down 1, clamped at class 1, and **cancelled inside `unsafe`**.
   The discount touches only the mutation channel, never sibling effects.
 - **Centralize new vocabulary**: add effect kinds to `EffectKind` and risk kinds to
-  `RiskKind` (both have `wire()` + class) — never hand-write wire strings at call sites.
+  `RiskKind` (both have `wire()` + class) — never hand-write wire strings at call sites. The
+  Shell frontend (spec 029) added two `RiskKind`s this way: `DestructiveFs` (wire
+  `destructive.fs`, class 5 — `rm -rf`/`mkfs`/`dd`-style irreversible filesystem ops) and
+  `PrivilegeEscalation` (wire `privilege.escalation`, class 6 — `sudo`/`su`/`doas`). Both are
+  `escapes() == true` (capability risks that propagate through the cross-file fold, spec 025)
+  — calling a function that invokes `sudo rm -rf` should make the caller's propagated score
+  reflect that, not encapsulate it the way an `unsafe`-only risk would.
 - **`--exclude` is a three-class matcher** (spec 004, `fxrank_core::corpus::CorpusMatcher`):
   a no-`/` literal prunes a matching directory and excludes a matching file; a no-`/` glob
   (`*.min.js`, `*.stories.*`) excludes files only (never prunes a same-named dir); a

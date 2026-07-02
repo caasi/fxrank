@@ -21,13 +21,13 @@ Every frontend already resolves a local name to a **module string** and stops th
 It never reads the target module, so it cannot see the *definition*. This is the
 floor 025 builds the second hop on.
 
-| | Rust (`syn`) | TS/JS (`swc`) | Python (`libcst`) |
-|---|---|---|---|
-| import table | `ImportTable::from_file` | `ImportTable::from_module` | `Imports::build` |
-| local → … | `::` path (`fs`→`std::fs`) | module string (`fs`→`"node:fs"`) | dotted path (`run`→`"subprocess.run"`) |
-| dynamic flag | `has_glob` | `has_dynamic` | `dynamic` |
-| module bindings | `collect_static_names` (real `static` only) | `module_bindings` (top-level `const`/`let`/`var`/`fn`/`class`) | `module_bindings` (assign targets + `def`/`class`) |
-| second hop (name → **definition**) | **✗** | **✗** | **✗** |
+| | Rust (`syn`) | TS/JS (`swc`) | Python (`libcst`) | Shell (`brush-parser`) |
+|---|---|---|---|---|
+| import table | `ImportTable::from_file` | `ImportTable::from_module` | `Imports::build` | *(none — no import syntax)* |
+| local → … | `::` path (`fs`→`std::fs`) | module string (`fs`→`"node:fs"`) | dotted path (`run`→`"subprocess.run"`) | *(n/a)* |
+| dynamic flag | `has_glob` | `has_dynamic` | `dynamic` | *(n/a)* |
+| module bindings | `collect_static_names` (real `static` only) | `module_bindings` (top-level `const`/`let`/`var`/`fn`/`class`) | `module_bindings` (assign targets + `def`/`class`) | *(n/a — see mutation guideline's declaration-vs-hidden gate)* |
+| second hop (name → **definition**) | **✗** | **✗** | **✗** | **same-file only** (see below) |
 
 The module-binding sets already drive same-file `global.mutation` (spec 008 F2/F5,
 #29). 025 generalizes the *resolution* itself — the missing second hop — and reuses it
@@ -199,6 +199,12 @@ mutating-method allowlists**:
   names from the import table); bare member/method accesses are dropped.
 - **Python** (when records land) — a reach is recorded for **dotted-module / imported** names;
   bare attribute and method calls are dropped.
+- **Shell** — a reach is recorded only for `source`/`.` with a **literal path argument**
+  (absolute, slash-relative, or a bare filename — the sourced script's identity is knowable even
+  though shell has no import syntax); a *computed* `source` path (`source "$dir/x"`) gets no ref
+  at all (a `DynamicCode` risk instead — the `base` would be non-literal garbage). Same-file
+  function calls are never reaches — they resolve via `canonical_path` (see below), not the
+  reach mechanism.
 
 Dogfood evidence (Rust, `scan crates/fxrank-cli/src`): the filter took the surface from **160
 reaches** (dominated by `.clone()`/`.push()`/`Some`/`Ok`) down to **32** meaningful qualified
@@ -284,7 +290,13 @@ memo-wrapper unwrapping). If a future task genuinely needs *program*-entry detec
   class bodies, static blocks, field initializers). **Rust has essentially no import-time
   execution**: `static`/`const` initializers are *const-evaluated at compile time*, there
   are no decorators or executable class bodies, and only `fn main` runs — so Rust rarely
-  synthesizes a module-init unit. This is an honest difference, not a gap.
+  synthesizes a module-init unit. This is an honest difference, not a gap. **Shell doesn't
+  need a synthesized module-init unit at all**: a shell script's top-level statements execute
+  every time the file runs, with no distinct "import" phase — so the frontend's synthetic
+  `<script>` unit *is* the whole file's top-level body directly (built by `functions::collect`,
+  not the core module-init synthesis path TS/Python use). Conceptually closest to Python's
+  module-init unit (both capture "code that runs just by the file being reached"), but it's a
+  frontend-local construct, not an instance of the shared mechanism.
 - **Module-string → file resolution differs per frontend.** Rust resolves `use` paths
   through the module tree; TS resolves relative specifiers via an extension/index
   ladder (`./hooks` → `hooks.ts`/`hooks.tsx`/`hooks/index.ts`); Python resolves dotted
@@ -308,6 +320,35 @@ memo-wrapper unwrapping). If a future task genuinely needs *program*-entry detec
   frontend falls back to the per-file heuristic floor (the module string) and the
   opaque-boundary default — never an error. The cross-file index only *adds* confidence
   when the definition is in scope.
+- **Shell's function-call resolution is same-file only, and routes through the exact
+  `CanonicalIndex`, not the flat `SymbolIndex`.** Shell has no import syntax, so there is no
+  cross-file "name → module string → definition" hop to build at all — a shell function is only
+  ever called by (a) another command in the same file, or (b) after being `source`d into a
+  caller's shell, which the frontend cannot statically distinguish from "just runs whatever code
+  is in that file." Each unit carries a `canonical_path` (`[path, "fn", name]` for a real
+  function, `[path, "<script>"]` for the synthetic script unit) that is unique **within its own
+  file**; `refs()` resolves a same-file call site directly to that path
+  (`resolved_target: Some([path,"fn",name])`, first-party, not qualified). This makes the shell
+  partition "adopted" by the core fold (`CanonicalIndex::adopted()`), so resolution runs the
+  exact per-file lookup instead of the name-based `SymbolIndex` fallback the other frontends can
+  fall back to. The reason is deliberate, not an oversight: shell scripts reuse helper names
+  (`log`/`die`/`main`/`usage`) across unrelated files far more than the typed languages do, so
+  the flat `SymbolIndex` would collide and drop even same-file calls as ambiguous. A call is
+  only recognized under `ResMode::Normal` — a wrapper that forces `FunctionBypass`
+  (`sudo greet`) or `BuiltinOnly` (`builtin`) means the wrapped word can never resolve to a local
+  function.
+- **`source`/`.` is a path-keyed opaque effect + reach, not a followed import — and its opaque
+  token deliberately diverges from the guideline's standard `external.unresolved`/2.** Every
+  other frontend's opaque-boundary default for an unresolved-but-real reference is
+  `external.unresolved`/class 2 (§*The opaque boundary*). Shell's `source`/`.` is different in
+  kind, not just unresolved: it **executes code in the current shell** (not a mere symbol
+  reference), so at the `source` site the frontend emits an own **`process.control`/6** effect
+  (not `external.unresolved`/2) — a `source` runs *something*, unknown to us, at a severity that
+  reflects "arbitrary code in this process," not "an unresolved dependency touch." The literal
+  path additionally becomes a **path-keyed** `ThirdParty` `external_reach` (`base` = the literal
+  path text, not the bare word `"source"`), so the app's outward `source` surface is still
+  recorded even though the target is never followed. Do not "align" the `process.control`/6
+  token down to `external.unresolved`/2 — the divergence is intentional (see spec 029 §9).
 
 ## Per-frontend realization
 
@@ -322,6 +363,13 @@ memo-wrapper unwrapping). If a future task genuinely needs *program*-entry detec
 - **Python** — `from … import` / dotted module → module-level `def`/`class`/assignment;
   module-init units capture import-time side effects. Out-of-scope dotted modules are
   opaque boundaries.
+- **Shell** — no import table, no cross-file symbol resolution; `canonical_path` +
+  `CanonicalIndex` resolve same-file function calls exactly (`resolved_target`); `source`/`.`
+  is the only cross-unit linkage, and it stays opaque by design (`process.control`/6 own effect
+  + a path-keyed `ThirdParty` reach for a literal path; `DynamicCode` risk, no reach, for a
+  computed path). No synthesized module-init unit (see *Module-init units are TS/Python-shaped*
+  above). `is_root` is always emitted `false` (per the shared *Roots* model above); the CLI sets
+  roots from explicit FILE args.
 
 ## Schema additions this model requires (enumerated in spec 025)
 

@@ -6,11 +6,13 @@ per-language differences. It is not a contract; nothing is required to conform.
 
 ## Shared model
 
-Each frontend (`crates/fxrank-lang-{rust,ts,python}/src/detect/mutation.rs`) reduces
+Each frontend (`crates/fxrank-lang-{rust,ts,python,shell}/src/detect/mutation.rs`) reduces
 a write to a **base name**, classifies it against **flat per-unit binding sets** via a
 **fixed priority cascade**, and emits an `EffectKind` (`fxrank-core`). No lexical scope
 stack; an *unresolved base* is the proxy for "captured/module". TS/Python stop at nested
-functions; Rust's mutation walker descends into closures and block-local `fn` items.
+functions; Rust's mutation walker descends into closures and block-local `fn` items. Shell
+has no closures — its cascade is a **declaration-vs-hidden gate**, not a binding-resolution
+cascade (see *Per-frontend realization*).
 
 ## Canonical mapping
 
@@ -27,6 +29,9 @@ functions; Rust's mutation walker descends into closures and block-local `fn` it
 | write to imported binding | global.mutation | 6 | no | no | Heuristic |
 | interior-mutability / ref-cell write | hidden.mutation | 3 | no | yes | Heuristic |
 | captured-enclosing / unresolved base | hidden.mutation | 3 | no | yes | Heuristic |
+| top-level `FOO=bar` declaration (Shell, script scope) | *(no effect)* | — | — | — | — |
+| function bare non-local write (Shell, dynamic scoping) | global.mutation | 6 | no | no | Heuristic |
+| computed/indirect write target (Shell, `printf -v "$var"`) | global.mutation | 6 | no | **yes** | Heuristic |
 
 `hidden.mutation` subreasons: `"interior-mut"` (Rust interior-mutability), `"ref-cell-write"`
 (TS `useRef().current`), `"captured-binding"` (the unresolved fallback, all three).
@@ -56,6 +61,36 @@ functions; Rust's mutation walker descends into closures and block-local `fn` it
 - **Destructuring-target writes** — dropped in all three (accepted limitation).
 - **Constructor breadth** — only a *direct* `this.x=`/`self.attr=` field-init is contained-local;
   a method/subscript write on the receiver escapes (TS aligned to Python's rule).
+- **Shell's declaration-vs-hidden gate replaces binding-resolution entirely.** The other three
+  frontends resolve a base name against local/param/receiver/static/import/module sets; shell has
+  none of those channels. Its gate is purely `unit.is_script`: a **top-level** `FOO=bar` is a
+  script-scope *declaration* (no effect — shell has no "module" to pollute, the whole script
+  *is* the scope), while the identical assignment inside a **function**, to a name the function
+  never declared `local`, is a *hidden* write to the caller's dynamic scope — `global.mutation`/6
+  (shell's dynamic scoping folds cleanly into the existing global channel; no separate kind
+  needed).
+- **Subshell containment is a fourth axis, orthogonal to the other three frontends' escape
+  logic.** A write inside `$(…)`/`( )`/`&`/a pipeline stage can never mutate the parent shell's
+  state (the subshell is a forked copy), so **every** mutation detected inside one is forced
+  `contained = true` regardless of what the write would score outside — even a bare non-local
+  write that would otherwise be `global.mutation`/6 escaping. No other frontend has an analogous
+  "this whole syntactic region cannot escape" rule; Rust/TS/Python contain by declared channel
+  (`&mut`, typed boundary), not by execution context.
+- **Shell is the first frontend to pair `hidden: true` with `global.mutation`** (indirect/computed
+  write targets: `printf -v "$var" value`, where the target name is itself a runtime value, not a
+  literal). This is a deliberate departure from the canonical mapping's usual "hidden ⇒
+  `hidden.mutation`/3" pairing: routing an indirect write through `hidden.mutation`/3 would score
+  it *below* an honest plain named-but-undeclared write (`global.mutation`/6), inverting the
+  anti-Goodhart ordering (an indirect/obfuscated target should never score lower than a plain
+  one). `hidden` stays evidentiary-only here — it documents the indirection for a human/agent
+  reader but is unread by scoring/fold. Do not "fix" this by rerouting it to `hidden.mutation`.
+- **`global.mutation` (in-script shared state) and `env.write` (child-process environment) are
+  distinct axes in Shell**, both real but orthogonal: `export FOO=bar` / `FOO=bar cmd` write into
+  the environment a child process inherits (`env.write`), while a bare `FOO=bar` write to an
+  undeclared name in a function mutates the *current shell's* dynamic scope (`global.mutation`).
+  A single statement can be both channels at once (`export` on an undeclared name), but they are
+  never conflated into one kind — an agent reading effects needs to tell "this leaks to children"
+  apart from "this corrupts caller state" even when they co-occur.
 
 ## The differentiator (must hold)
 
@@ -78,3 +113,12 @@ discounted to 2). Hidden state scores above declared state.
   → global; a genuinely captured enclosing-function local → hidden.
   **Residual accepted limits:** `match` pattern captures, comprehension-scope targets
   (Python 3 gives them their own scope), and walrus (`:=`) operator targets.
+- **Shell** — no binding-resolution cascade; a `unit.is_script` gate (top-level = declaration,
+  no effect; function body = dynamic-scope write, `global.mutation`/6 unless the name is
+  `local`-declared) plus a `subshell` flag that forces `contained = true` on every write inside
+  `$(…)`/`( )`/`&`/a pipeline stage. `declare`/`readonly`/`let`/`export`/`unset`/`read`/
+  `mapfile`/`readarray`/`getopts`/`printf -v`/assignment prefixes (`VAR=v cmd`) are each their
+  own detector; `local`-declared names stay `local.mutation`/1 contained; `export`/env-prefix
+  writes are `env.write`/6 (a separate axis, see above); indirect/computed targets
+  (`printf -v "$var"`) are `global.mutation`/6 with `hidden: true` (the one deliberate exception
+  to "hidden ⇒ `hidden.mutation`", see above).
