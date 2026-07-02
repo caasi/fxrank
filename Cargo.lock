@@ -578,6 +578,7 @@ dependencies = [
  "fxrank-core",
  "fxrank-lang-python",
  "fxrank-lang-rust",
+ "fxrank-lang-shell",
  "fxrank-lang-ts",
  "predicates",
  "serde_json",
