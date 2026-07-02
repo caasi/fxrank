@@ -6,6 +6,7 @@ pub enum Language {
     Rust,
     Ts,
     Python,
+    Shell,
 }
 
 pub struct SourceFile {
