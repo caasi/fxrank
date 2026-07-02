@@ -31,6 +31,7 @@
 //!      inside `CompoundCommand`.
 
 pub mod bindings;
+pub mod detect;
 pub mod functions;
 pub mod walk;
 
