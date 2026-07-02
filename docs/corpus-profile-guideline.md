@@ -93,6 +93,19 @@ never holds a real directory name.
 etc.) that `prune_dirs` cannot enumerate. A directory containing `pyvenv.cfg` is
 pruned at walk-entry time before any of its contents are read.
 
+### Shell frontend (`fxrank-lang-shell`)
+
+| Channel | Entries |
+|---|---|
+| `prune_dirs` | *(empty)* |
+| `exclude_file_globs` | *(empty)* |
+| `test_file_globs` | `*_test.sh`, `test_*.sh` |
+| `prune_marker_files` | *(empty)* |
+
+Shell has no standard vendor/build directory or venv-style marker to prune (no package
+manager owns a shell project's dependency tree the way `node_modules`/`.venv` do), so only
+`test_file_globs` is populated.
+
 ## Honest per-language differences (intentional — not aligned)
 
 - **Rust tests are source-based; `test_file_globs` is empty.** Rust projects put
@@ -121,6 +134,18 @@ pruned at walk-entry time before any of its contents are read.
   slim `--features ts` build has no marker prune — `default_prune_markers()` is empty.)
   The content-marker prune runs separately from the `CorpusMatcher`; passing `--exclude`
   does not disable it (see *CLI behavior* below).
+
+- **Shell test-skip is file-name based only, like TS/Python, but `skipped_tests` counts
+  differently.** Shell has no in-file test marker (no equivalent of Rust's `#[test]` or
+  Python's `unittest.TestCase`), so — like TS/Python — it skips by `test_file_globs`
+  (`*_test.sh`/`test_*.sh`). But unlike TS/Python, a skipped shell file is **never parsed at
+  all** (the frontend `continue`s before invoking the parser), so its function count is
+  unknowable; `FrontendOutput::skipped_tests` therefore counts **one per skipped file**, not
+  one per skipped unit. TS/Python parse the file regardless and count individual test units
+  (or, for Python's dual layer, individual test functions/methods). This is a deliberate
+  per-language divergence in what the `skipped_tests` wire field's unit *means* — don't
+  "align" shell to per-unit counting; it would require parsing files the whole point of the
+  skip is to avoid parsing.
 
 ## CLI behavior
 
@@ -189,3 +214,9 @@ never consult the matcher.
   matching for `tests`). `pyvenv.cfg` in `prune_marker_files` catches renamed venvs.
   Generated protobuf files (`*_pb2.py`, `*_pb2_grpc.py`) are in `exclude_file_globs`.
   Multiple build/cache artifact directories are in `prune_dirs`.
+
+- **Shell** — `test_file_globs` (`*_test.sh`/`test_*.sh`) drives a whole-file, pre-parse skip:
+  a matching path is counted in `skipped_tests` and the file is never handed to the parser
+  (contrast Rust/TS/Python, which always parse and skip at the unit or AST level). No
+  `prune_dirs`/`prune_marker_files`/`exclude_file_globs` — shell has no standard vendored
+  directory or venv-equivalent marker.

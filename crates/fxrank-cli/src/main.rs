@@ -13,7 +13,7 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(
     name = "fxrank",
-    about = "Effect-rank your Rust, TypeScript/JavaScript, and Python codebase"
+    about = "Effect-rank your Rust, TypeScript/JavaScript, Python, and Shell codebase"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -32,8 +32,8 @@ enum Cmd {
         /// Include test functions and modules in the analysis (skipped by default).
         #[arg(long, short = 't')]
         include_tests: bool,
-        /// Language dialect for stdin (`ts`, `tsx`, `js`, `jsx`, `python`). Only meaningful
-        /// for stdin; for files/directories the extension decides the frontend.
+        /// Language dialect for stdin (`ts`, `tsx`, `js`, `jsx`, `python`, `shell`). Only
+        /// meaningful for stdin; for files/directories the extension decides the frontend.
         #[arg(long, short = 'L')]
         lang: Option<String>,
         /// Patterns to skip during directory scans (comma-separated; REPLACES the
@@ -46,7 +46,8 @@ enum Cmd {
         #[arg(long, short = 'R')]
         no_resolve: bool,
         /// Path to a tsconfig.json (or a directory containing one) for resolving TS
-        /// `paths`/`baseUrl` aliases (tsc-compatible `-p`). TS/JS only; ignored for Rust/Python.
+        /// `paths`/`baseUrl` aliases (tsc-compatible `-p`). TS/JS only; ignored for
+        /// Rust/Python/Shell.
         #[arg(long, short = 'p')]
         project: Option<PathBuf>,
     },
@@ -65,6 +66,8 @@ enum Route {
     Ts(String),
     /// Python source.
     Python,
+    /// Shell (Bash/POSIX) source.
+    Shell,
 }
 
 /// A source file paired with the frontend it should be routed to.
@@ -165,18 +168,21 @@ fn run_scan(
         // Stdin is always an explicit target → mark as root.
         explicit_files.insert("stdin".to_owned());
         // Back-compat: stdin defaults to Rust. `--lang` selects the frontend
-        // for the given dialect: `ts`, `tsx`, `js`, `jsx` (TS frontend) or
-        // `python` (Python frontend). There is no `--lang rust`.
+        // for the given dialect: `ts`, `tsx`, `js`, `jsx` (TS frontend),
+        // `python` (Python frontend), or `shell` (Shell frontend). There is no
+        // `--lang rust`.
         let route = match lang.as_deref() {
             None => Route::Rust,
             Some(flag) => {
-                // Accept the TS dialects (`ts`/`tsx`/`js`/`jsx`) and `python`; reject anything else.
+                // Accept the TS dialects (`ts`/`tsx`/`js`/`jsx`), `python`, and `shell`;
+                // reject anything else.
                 match flag {
                     "ts" | "tsx" | "js" | "jsx" => Route::Ts(flag.to_owned()),
                     "python" => Route::Python,
+                    "shell" => Route::Shell,
                     other => {
                         return Err(format!(
-                            "unknown --lang value '{other}' (expected ts, tsx, js, jsx, or python)"
+                            "unknown --lang value '{other}' (expected ts, tsx, js, jsx, python, or shell)"
                         ));
                     }
                 }
@@ -332,6 +338,8 @@ fn default_corpus_profiles() -> Vec<fxrank_core::CorpusProfile> {
     v.push(fxrank_lang_ts::CORPUS_PROFILE);
     #[cfg(feature = "python")]
     v.push(fxrank_lang_python::CORPUS_PROFILE);
+    #[cfg(feature = "shell")]
+    v.push(fxrank_lang_shell::CORPUS_PROFILE);
     v
 }
 
@@ -367,6 +375,7 @@ fn route_for_path(path: &std::path::Path) -> Option<Route> {
         "rs" => Some(Route::Rust),
         "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => Some(Route::Ts(ext.to_owned())),
         "py" => Some(Route::Python),
+        "sh" | "bash" => Some(Route::Shell),
         _ => None,
     }
 }
@@ -551,12 +560,14 @@ fn dispatch(
     // TS sources keyed by extension so each `Lang` dialect group runs separately.
     let mut ts_sources: Vec<(String, SourceFile)> = Vec::new();
     let mut python_sources: Vec<SourceFile> = Vec::new();
+    let mut shell_sources: Vec<SourceFile> = Vec::new();
 
     for r in routed {
         match r.route {
             Route::Rust => rust_sources.push(r.source),
             Route::Ts(ext) => ts_sources.push((ext, r.source)),
             Route::Python => python_sources.push(r.source),
+            Route::Shell => shell_sources.push(r.source),
         }
     }
 
@@ -565,6 +576,7 @@ fn dispatch(
     let (ts_output, ts_config_errors) = dispatch_ts(ts_sources, include_tests, project);
     merge_output(&mut output, ts_output);
     merge_output(&mut output, dispatch_python(python_sources, include_tests));
+    merge_output(&mut output, dispatch_shell(shell_sources, include_tests));
     (output, ts_config_errors)
 }
 
@@ -691,6 +703,29 @@ fn dispatch_python(sources: Vec<SourceFile>, _include_tests: bool) -> FrontendOu
     output
 }
 
+#[cfg(feature = "shell")]
+fn dispatch_shell(sources: Vec<SourceFile>, include_tests: bool) -> FrontendOutput {
+    use fxrank_core::frontend::Frontend;
+    use fxrank_lang_shell::ShellFrontend;
+    if sources.is_empty() {
+        return FrontendOutput::default();
+    }
+    ShellFrontend { include_tests }.analyze(&sources)
+}
+
+#[cfg(not(feature = "shell"))]
+fn dispatch_shell(sources: Vec<SourceFile>, _include_tests: bool) -> FrontendOutput {
+    let mut output = FrontendOutput::default();
+    for src in sources {
+        output.diagnostics.push(Diagnostic {
+            path: src.path,
+            parsed: false,
+            error: "no frontend available for .sh/.bash (built without 'shell' feature)".into(),
+        });
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +737,19 @@ mod tests {
     fn cli_has_no_conflicting_short_flags() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// `.sh` and `.bash` extensions must route to the Shell frontend.
+    #[test]
+    fn routes_sh_and_bash_to_shell() {
+        assert!(matches!(
+            route_for_path(std::path::Path::new("a.sh")),
+            Some(Route::Shell)
+        ));
+        assert!(matches!(
+            route_for_path(std::path::Path::new("a.bash")),
+            Some(Route::Shell)
+        ));
     }
 
     /// Write two Rust files into a fresh temp dir under the OS temp root:

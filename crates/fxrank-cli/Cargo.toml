@@ -19,13 +19,17 @@ fxrank-core = { path = "../fxrank-core", version = "0.4.1" }
 fxrank-lang-rust = { path = "../fxrank-lang-rust", version = "0.4.1", optional = true }
 fxrank-lang-ts = { path = "../fxrank-lang-ts", version = "0.4.1", optional = true }
 fxrank-lang-python = { path = "../fxrank-lang-python", version = "0.4.1", optional = true }
+# NOTE: not yet in the crates.io publish order (spec 025 §11.6) — that bump + ordering
+# happens at release time per CLAUDE.md's "Releasing to crates.io", not on this branch.
+fxrank-lang-shell = { path = "../fxrank-lang-shell", version = "0.4.1", optional = true }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 [features]
-default = ["rust", "ts", "python"]
+default = ["rust", "ts", "python", "shell"]
 rust = ["dep:fxrank-lang-rust"]
 ts = ["dep:fxrank-lang-ts"]
 python = ["dep:fxrank-lang-python"]
+shell = ["dep:fxrank-lang-shell"]
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

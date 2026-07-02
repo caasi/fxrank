@@ -1,0 +1,14 @@
+---
+source: crates/fxrank-lang-shell/src/lib.rs
+expression: syms
+---
+[
+    (
+        "fetch_and_run",
+        7,
+    ),
+    (
+        "<script>",
+        6,
+    ),
+]

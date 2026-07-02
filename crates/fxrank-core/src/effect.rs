@@ -93,6 +93,8 @@ pub enum RiskKind {
     ProtoPollution,
     HtmlInjection,
     EffectInRender,
+    DestructiveFs,
+    PrivilegeEscalation,
 }
 impl RiskKind {
     pub fn wire(self) -> &'static str {
@@ -119,6 +121,8 @@ impl RiskKind {
             ProtoPollution => "proto.pollution",
             HtmlInjection => "html.injection",
             EffectInRender => "effect.in.render",
+            DestructiveFs => "destructive.fs",
+            PrivilegeEscalation => "privilege.escalation",
         }
     }
     pub fn class(self) -> u8 {
@@ -126,7 +130,8 @@ impl RiskKind {
         match self {
             Transmute | RawPtrDeref | FfiCall | Asm | RawPtrOp | MaybeUninit | FromRaw
             | GetUnchecked | DynamicCode => 7,
-            UnsafeBlock | UnsafeFn | UnsafeImpl | HtmlInjection => 5,
+            PrivilegeEscalation => 6,
+            UnsafeBlock | UnsafeFn | UnsafeImpl | HtmlInjection | DestructiveFs => 5,
             BoxLeak | MemForget | ManuallyDrop | ProtoPollution | EffectInRender => 4,
             TypeEscape => 3,
             ImplDrop | ExternBlock => 2,
@@ -139,7 +144,13 @@ impl RiskKind {
         use RiskKind::*;
         matches!(
             self,
-            DynamicCode | FfiCall | HtmlInjection | ProtoPollution | EffectInRender
+            DynamicCode
+                | FfiCall
+                | HtmlInjection
+                | ProtoPollution
+                | EffectInRender
+                | DestructiveFs
+                | PrivilegeEscalation
         )
     }
 }
@@ -331,5 +342,15 @@ mod tests {
         assert!(j.contains("\"subreason\":\"ref-cell-write\""));
         e.subreason = None;
         assert!(!serde_json::to_string(&e).unwrap().contains("subreason"));
+    }
+
+    #[test]
+    fn shell_vocabulary_metadata() {
+        assert_eq!(RiskKind::DestructiveFs.wire(), "destructive.fs");
+        assert_eq!(RiskKind::DestructiveFs.class(), 5);
+        assert!(RiskKind::DestructiveFs.escapes());
+        assert_eq!(RiskKind::PrivilegeEscalation.wire(), "privilege.escalation");
+        assert_eq!(RiskKind::PrivilegeEscalation.class(), 6);
+        assert!(RiskKind::PrivilegeEscalation.escapes());
     }
 }
