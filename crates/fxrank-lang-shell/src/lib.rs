@@ -30,6 +30,7 @@
 //!      block-level redirect (`{ …; } > out.log`) is the second tuple element, not nested
 //!      inside `CompoundCommand`.
 
+pub mod bindings;
 pub mod functions;
 pub mod walk;
 
