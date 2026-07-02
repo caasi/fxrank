@@ -6,6 +6,11 @@
 //! branch. Single ownership across detectors: `FILTER`'s fs verdict is decided by Task
 //! 5's `classify_conditional`; `DECL`/`MUT_OWNED`'s mutation is owned by `mutation.rs`
 //! (Task 8) — `calls.rs` returns [`Cls::NoEffect`] for both so neither double-emits.
+//!
+//! [`strip_wrappers`] peels command-prefix wrappers (`sudo`/`command`/`exec`/`builtin`/…)
+//! so the classifiers above run against the WRAPPED command, not the wrapper itself. Its
+//! `CommandView` is not persisted on `CallSiteRef` — Tasks 5 (via [`classify_conditional`]
+//! below), 9, and 10 each re-call `strip_wrappers` on the sites they own.
 
 use std::collections::HashSet;
 
@@ -123,79 +128,247 @@ pub fn classify_command(name: &str, has_v: bool) -> Cls {
     Cls::Unknown // any other word → a spawn (0.7 conf)
 }
 
-/// Classify each `SimpleCommand` in `unit`'s body via [`classify_command`]. Consults
-/// `fns` (same-file function names): a command word matching one emits NO command
-/// effect — it's a call ref, handled in Task 10 (spec §4 function-vs-command
-/// precedence). Task 6 will additionally gate this on wrapper-stripping + resolution
-/// mode; here the resolution mode is Normal, so `fns` is consulted directly.
+/// Command-prefix wrappers that run ANOTHER program without themselves being a
+/// resolvable same-file function target: privilege wrappers (`sudo`/`su`/`doas`),
+/// environment/process-control wrappers (`env`/`nice`/`nohup`/`exec`), and the
+/// name-resolution-bypass builtins (`command`). Deliberately excludes `time` — it is a
+/// reserved word carried on `Pipeline.timed` (spec 029), never a `SimpleCommand` word, so
+/// there is no word to peel. `exec` additionally earns its own `process.control`/6 (see
+/// [`detect`]); `sudo`/`su`/`doas` additionally earn a `PrivilegeEscalation` risk (Task
+/// 9, not this module).
+const WRAP_EXTERNAL: &[&str] = &[
+    "sudo", "su", "doas", "env", "nice", "nohup", "exec", "command",
+];
+
+/// Resolution mode of a wrapper-peeled command word (spec 029 §4 function-vs-command
+/// precedence, extended for wrappers).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResMode {
+    /// No wrapper was peeled — ordinary same-file-function precedence applies.
+    Normal,
+    /// A [`WRAP_EXTERNAL`] wrapper was peeled — the wrapped word always resolves as an
+    /// external command; it can never be a same-file function (`sudo greet` does not
+    /// call the local `greet` function).
+    FunctionBypass,
+    /// `builtin` was peeled — the wrapped word resolves to a shell builtin ONLY. Unlike
+    /// [`ResMode::FunctionBypass`], an unrecognized wrapped word is not an external spawn
+    /// either: `builtin` never launches a program.
+    BuiltinOnly,
+}
+
+/// The wrapper-peeled view of a `SimpleCommand`: `head`/`args` name the INNER (wrapped)
+/// command and its real operands — wrapper option words are excluded from `args`, so a
+/// wrapped stream-filter (`sudo grep -f pats`) computes file-operand arity against the
+/// actual `grep` operands, not `sudo`'s. `kinds` is the ordered list of wrapper words
+/// peeled (e.g. `["sudo"]`, `["exec"]`, `[]` for an unwrapped command). `prefix_assignments`
+/// carries genuine `VAR=val` *prefix* assignments (`FOO=bar sudo cmd` — a real `Assignment`
+/// AST node before the command word); an `env`-style in-suffix `VAR=val` (`env FOO=1 cmd`)
+/// has no such AST node and is simply consumed as a wrapper option, not tracked here.
+pub struct CommandView<'a> {
+    pub kinds: Vec<String>,
+    pub mode: ResMode,
+    pub head: Option<String>,
+    pub args: Vec<&'a ast::Word>,
+    pub prefix_assignments: Vec<&'a ast::Assignment>,
+    pub span: (usize, usize),
+}
+
+/// Peel leading command-prefix wrappers off `sc` — `sudo`/`su`/`doas`/`env`/`nice`/
+/// `nohup`/`exec`/`command` ([`WRAP_EXTERNAL`]) and `builtin` — along with each wrapper's
+/// own option flags and (best-effort) `VAR=val`-shaped operands, exposing the wrapped
+/// command as [`CommandView::head`]/[`CommandView::args`]. Chained wrappers peel
+/// repeatedly (`sudo command rm …`); `mode` is sticky toward the most restrictive verdict
+/// seen: `builtin` always yields [`ResMode::BuiltinOnly`], a [`WRAP_EXTERNAL`] word yields
+/// [`ResMode::FunctionBypass`] unless `BuiltinOnly` already won.
 ///
-/// Ordering: same-file-fn guard → [`classify_conditional`] (FILTER's file-operand rule)
-/// → input-boundary `read`/`mapfile`/`readarray` → [`classify_command`]'s name-only
-/// tri-state. Each stage `continue`s on a match so a command is classified exactly once.
+/// Not persisted on `CallSiteRef` — Tasks 5 (below), 9, and 10 each re-call this on the
+/// sites they own rather than threading a stored `CommandView` through core.
+pub fn strip_wrappers<'a>(sc: &'a ast::SimpleCommand) -> CommandView<'a> {
+    let prefix_assignments = sc
+        .prefix
+        .iter()
+        .flat_map(|p| p.0.iter())
+        .filter_map(|item| match item {
+            ast::CommandPrefixOrSuffixItem::AssignmentWord(a, _) => Some(a),
+            _ => None,
+        })
+        .collect();
+
+    let suffix_words = operand_words(sc);
+
+    let mut kinds = Vec::new();
+    let mut mode = ResMode::Normal;
+    let mut head = command_word(sc);
+    let mut idx = 0usize;
+
+    while let Some(h) = head.clone() {
+        let is_builtin = h == "builtin";
+        let is_wrap = WRAP_EXTERNAL.contains(&h.as_str());
+        if !is_builtin && !is_wrap {
+            break;
+        }
+        kinds.push(h.clone());
+        if is_builtin {
+            mode = ResMode::BuiltinOnly;
+        } else if mode == ResMode::Normal {
+            mode = ResMode::FunctionBypass;
+        }
+
+        // Peel this wrapper's own option flags and VAR=val-shaped operands (best-effort:
+        // no full getopts, matching this module's other option handling) — a
+        // value-taking flag ([`wrapper_flag_takes_value`]) additionally consumes its
+        // following word so the value is never mistaken for the wrapped command (`sudo -u
+        // root rm -rf /x` must not treat `root` as the head).
+        while idx < suffix_words.len() {
+            let value = suffix_words[idx].value.as_str();
+            if is_flag(value) {
+                idx += 1;
+                if wrapper_flag_takes_value(&h, value) {
+                    if let Some(next) = suffix_words.get(idx) {
+                        let nv = next.value.as_str();
+                        if !is_flag(nv) && !is_assignment_like(nv) {
+                            idx += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            if is_assignment_like(value) {
+                idx += 1;
+                continue;
+            }
+            break;
+        }
+
+        head = suffix_words.get(idx).map(|w| {
+            idx += 1;
+            w.value.clone()
+        });
+    }
+
+    CommandView {
+        kinds,
+        mode,
+        head,
+        args: suffix_words[idx..].to_vec(),
+        prefix_assignments,
+        span: span_of(sc),
+    }
+}
+
+/// `true` if `value` is a `NAME=value`-shaped word (identifier chars then `=`) — an
+/// `env`-style operand a wrapper consumes as its own (e.g. `env FOO=1 cmd`), not part of
+/// the wrapped command's arguments.
+fn is_assignment_like(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    for c in chars {
+        if c == '=' {
+            return true;
+        }
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+    }
+    false
+}
+
+/// Classify each `SimpleCommand` in `unit`'s body via [`strip_wrappers`] +
+/// [`classify_command`]. Consults `fns` (same-file function names): a command word
+/// matching one emits NO command effect — it's a call ref, handled in Task 10 (spec §4
+/// function-vs-command precedence) — but only when [`ResMode::Normal`]; a wrapped word
+/// (`sudo greet`, `command greet`) is never treated as a same-file function call.
+///
+/// Ordering: `exec`'s own `process.control`/6 (unconditional, since `exec` can appear with
+/// no wrapped command) → same-file-fn guard → [`classify_conditional`] (FILTER's
+/// file-operand rule) → input-boundary `read`/`mapfile`/`readarray` →
+/// [`classify_command`]'s name-only tri-state. Each stage `continue`s on a match so a
+/// command is classified exactly once. In [`ResMode::BuiltinOnly`], an unrecognized
+/// wrapped word (`Cls::Unknown`) emits NOTHING — `builtin` never spawns an external
+/// program, so it must not fall through to the spawn branch.
 pub fn detect(unit: &FnUnit, fns: &HashSet<String>) -> Vec<Effect> {
     let mut out = Vec::new();
     for site in walk::walk_commands(unit) {
-        let Some(name) = command_word(site.sc) else {
+        let view = strip_wrappers(site.sc);
+
+        if view.kinds.iter().any(|k| k == "exec") {
+            out.push(mk_effect(
+                EffectKind::ProcessControl,
+                6,
+                site.sc,
+                Tier::Heuristic,
+                0.9,
+                "exec",
+            ));
+        }
+
+        let Some(head) = view.head else {
             continue;
         };
-        if fns.contains(&name) {
+        if view.mode == ResMode::Normal && fns.contains(&head) {
             continue; // same-file fn call → ref only (Task 10), no effect
         }
-        let operands = operand_words(site.sc);
 
-        if let Some((kind, class, ambiguous)) = classify_conditional(&name, &operands) {
+        if let Some((kind, class, ambiguous)) = classify_conditional(&head, &view.args) {
             let base = if ambiguous { 0.8 } else { 0.9 };
-            let confidence = confidence_for(&name, &operands, base);
+            let confidence = confidence_for(&head, &view.args, base);
             out.push(mk_effect(
                 kind,
                 class,
                 site.sc,
                 Tier::Heuristic,
                 confidence,
-                &name,
+                &head,
             ));
             continue;
         }
 
-        if is_input_reader(&name) {
+        if is_input_reader(&head) {
             // read/mapfile/readarray measure the *input boundary*: class 7 unless stdin
             // is fed by a here-doc/here-string (Task 7 sets `stdin_is_here`; until then
             // bare `read` is always class 7). Recognized regardless (DECL already marks
             // it NoEffect in classify_command), so this always continues.
             if !site.stdin_is_here {
-                let confidence = confidence_for(&name, &operands, 0.9);
+                let confidence = confidence_for(&head, &view.args, 0.9);
                 out.push(mk_effect(
                     EffectKind::NetFsDb,
                     7,
                     site.sc,
                     Tier::Heuristic,
                     confidence,
-                    &name,
+                    &head,
                 ));
             }
             continue;
         }
 
-        match classify_command(&name, has_flag(site.sc, "-v")) {
+        match classify_command(&head, has_flag_word(&view.args, "-v")) {
             Cls::Effect(kind, class) => {
-                let confidence = confidence_for(&name, &operands, 0.9);
+                let confidence = confidence_for(&head, &view.args, 0.9);
                 out.push(mk_effect(
                     kind,
                     class,
                     site.sc,
                     Tier::Heuristic,
                     confidence,
-                    &name,
+                    &head,
                 ))
             }
-            Cls::Unknown => out.push(mk_effect(
-                EffectKind::ProcessControl,
-                6,
-                site.sc,
-                Tier::Heuristic,
-                0.7,
-                &name,
-            )),
+            Cls::Unknown => {
+                if view.mode != ResMode::BuiltinOnly {
+                    out.push(mk_effect(
+                        EffectKind::ProcessControl,
+                        6,
+                        site.sc,
+                        Tier::Heuristic,
+                        0.7,
+                        &head,
+                    ));
+                }
+            }
             Cls::NoEffect => {}
         }
     }
@@ -210,11 +383,11 @@ fn is_input_reader(name: &str) -> bool {
 }
 
 /// A `SimpleCommand`'s argument `Word`s — its suffix's plain `Word` items only (excludes
-/// redirects, process substitutions, and `VAR=val` assignment words). This is the operand
-/// slice [`classify_conditional`]/[`has_file_operand`] inspect. Task 5 passes these raw
-/// operands from `site.sc`; Task 6 switches the call sites in `detect` to the
-/// wrapper-peeled `CommandView.args` so `sudo grep -f pats` computes arity against the
-/// real inner operands.
+/// redirects, process substitutions, and `VAR=val` assignment words). [`detect`] consumes
+/// this indirectly via [`strip_wrappers`]'s `CommandView.args` (the wrapper-peeled view),
+/// so [`classify_conditional`]/[`has_file_operand`] always see the real inner operands —
+/// `sudo grep -f pats` computes arity against `grep`'s operands, not `sudo`'s. Also used by
+/// `strip_wrappers` itself as the raw suffix-word scan it peels wrapper options from.
 fn operand_words(sc: &ast::SimpleCommand) -> Vec<&ast::Word> {
     sc.suffix
         .iter()
@@ -304,6 +477,24 @@ fn is_flag(value: &str) -> bool {
     value.starts_with('-') && value != "-"
 }
 
+/// `true` if `flag` takes a following value word for `wrapper` — a minimal per-wrapper
+/// table (not a full getopts) covering the common value-taking short flags so
+/// [`strip_wrappers`]'s peel loop consumes the value along with the flag instead of
+/// mistaking it for the wrapped command word (`sudo -u root rm -rf /x` must peel `root`
+/// as `-u`'s value, not treat it as the head). Long `--opt=val` forms already carry their
+/// value in one token and need no entry here; `--opt val` separate-value long forms are
+/// an accepted best-effort miss (matching this module's other option handling).
+fn wrapper_flag_takes_value(wrapper: &str, flag: &str) -> bool {
+    match wrapper {
+        "sudo" | "su" | "doas" => {
+            matches!(flag, "-u" | "-g" | "-p" | "-C" | "-r" | "-t" | "-h" | "-D")
+        }
+        "nice" => flag == "-n",
+        "env" => matches!(flag, "-u" | "-C"),
+        _ => false,
+    }
+}
+
 /// `true` if `value` is a single unquoted variable expansion for its *entire* extent —
 /// `$VAR` or `${VAR}` with no surrounding quotes and no other text. `Word::value` is
 /// brush-parser's raw source text (quote characters included verbatim), so a quoted
@@ -373,13 +564,12 @@ fn command_word(sc: &ast::SimpleCommand) -> Option<String> {
     sc.word_or_name.as_ref().map(|w| w.value.clone())
 }
 
-/// `true` if `sc`'s suffix carries an argument `Word` exactly equal to `flag` (e.g.
-/// `-v`) — used for the `printf -v` gate.
-fn has_flag(sc: &ast::SimpleCommand, flag: &str) -> bool {
-    sc.suffix
-        .iter()
-        .flat_map(|s| s.0.iter())
-        .any(|item| matches!(item, ast::CommandPrefixOrSuffixItem::Word(w) if w.value == flag))
+/// `true` if `args` carries a `Word` exactly equal to `flag` (e.g. `-v`) — used for the
+/// `printf -v` gate. Takes the wrapper-peeled operand slice (`CommandView.args`), not a
+/// raw `SimpleCommand`, so a wrapper's own flags never leak into the wrapped command's
+/// gate.
+fn has_flag_word(args: &[&ast::Word], flag: &str) -> bool {
+    args.iter().any(|w| w.value == flag)
 }
 
 fn span_of(sc: &ast::SimpleCommand) -> (usize, usize) {
@@ -502,5 +692,53 @@ mod tests {
         };
         // rm -rf $DIR (unquoted var) → the net.fs.db effect confidence is reduced (−0.1) vs a literal path
         assert!(effect("rm -rf $DIR\n").confidence < effect("rm -rf /tmp/x\n").confidence);
+    }
+
+    #[test]
+    fn wrappers_recurse_into_argv() {
+        // sudo rm -rf keeps the fs effect (Task 9 adds the PrivilegeEscalation risk)
+        assert!(kinds("sudo rm -rf /x\n").contains(&(EffectKind::NetFsDb, 7)));
+        // command rm -rf recurses to rm
+        assert!(kinds("command rm -rf /x\n").contains(&(EffectKind::NetFsDb, 7)));
+        // exec layers its own process.control atop the wrapped command
+        let k = kinds("exec rm -rf /x\n");
+        assert!(
+            k.contains(&(EffectKind::NetFsDb, 7)) && k.contains(&(EffectKind::ProcessControl, 6))
+        );
+    }
+
+    #[test]
+    fn wrapper_value_taking_flag_does_not_swallow_the_wrapped_command() {
+        // sudo -u root rm -rf /x: `-u` peels its value `root` too, so `rm` (not `root`)
+        // is the wrapped head and its fs effect is found (was silently dropped before
+        // the value-taking-flag fix).
+        assert!(kinds("sudo -u root rm -rf /x\n").contains(&(EffectKind::NetFsDb, 7)));
+        // nice -n 10 curl http://y: `-n` peels its value `10` too, so `curl` is found.
+        assert!(kinds("nice -n 10 curl http://y\n").contains(&(EffectKind::NetFsDb, 7)));
+    }
+
+    #[test]
+    fn wrapper_recurses_into_stream_filter_arity() {
+        // sudo grep -f pats → the peeled operands (not sudo's own words) drive the
+        // file-operand rule; sudo grep pat → no fs effect (bare pattern, no file operand).
+        assert!(kinds("sudo grep -f pats\n").contains(&(EffectKind::NetFsDb, 7)));
+        assert!(kinds("sudo grep pat\n").is_empty());
+    }
+
+    #[test]
+    fn builtin_only_mode_suppresses_unknown_spawn() {
+        // `builtin frobnicate` never launches an external program — an unrecognized
+        // wrapped word must NOT fall through to the Unknown → process.control spawn.
+        assert!(kinds("builtin frobnicate\n").is_empty());
+    }
+
+    #[test]
+    fn wrapped_word_bypasses_same_file_function_resolution() {
+        // `sudo greet`/`command greet` are never a same-file function call, even when a
+        // same-named function is defined in this file — the wrapper forces an external
+        // resolution (FunctionBypass), so `greet` still classifies as an unknown spawn.
+        let fns: HashSet<String> = ["greet".to_string()].into_iter().collect();
+        assert!(kinds_fns("sudo greet\n", &fns).contains(&(EffectKind::ProcessControl, 6)));
+        assert!(kinds_fns("command greet\n", &fns).contains(&(EffectKind::ProcessControl, 6)));
     }
 }
