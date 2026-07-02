@@ -128,6 +128,10 @@ pub fn classify_command(name: &str, has_v: bool) -> Cls {
 /// effect — it's a call ref, handled in Task 10 (spec §4 function-vs-command
 /// precedence). Task 6 will additionally gate this on wrapper-stripping + resolution
 /// mode; here the resolution mode is Normal, so `fns` is consulted directly.
+///
+/// Ordering: same-file-fn guard → [`classify_conditional`] (FILTER's file-operand rule)
+/// → input-boundary `read`/`mapfile`/`readarray` → [`classify_command`]'s name-only
+/// tri-state. Each stage `continue`s on a match so a command is classified exactly once.
 pub fn detect(unit: &FnUnit, fns: &HashSet<String>) -> Vec<Effect> {
     let mut out = Vec::new();
     for site in walk::walk_commands(unit) {
@@ -137,11 +141,52 @@ pub fn detect(unit: &FnUnit, fns: &HashSet<String>) -> Vec<Effect> {
         if fns.contains(&name) {
             continue; // same-file fn call → ref only (Task 10), no effect
         }
-        // Task 5 inserts classify_conditional(&name, &operands) here and, if it returns
-        // Some, emits that and `continue`s. Task 4 handles the name-only tri-state:
+        let operands = operand_words(site.sc);
+
+        if let Some((kind, class, ambiguous)) = classify_conditional(&name, &operands) {
+            let base = if ambiguous { 0.8 } else { 0.9 };
+            let confidence = confidence_for(&name, &operands, base);
+            out.push(mk_effect(
+                kind,
+                class,
+                site.sc,
+                Tier::Heuristic,
+                confidence,
+                &name,
+            ));
+            continue;
+        }
+
+        if is_input_reader(&name) {
+            // read/mapfile/readarray measure the *input boundary*: class 7 unless stdin
+            // is fed by a here-doc/here-string (Task 7 sets `stdin_is_here`; until then
+            // bare `read` is always class 7). Recognized regardless (DECL already marks
+            // it NoEffect in classify_command), so this always continues.
+            if !site.stdin_is_here {
+                let confidence = confidence_for(&name, &operands, 0.9);
+                out.push(mk_effect(
+                    EffectKind::NetFsDb,
+                    7,
+                    site.sc,
+                    Tier::Heuristic,
+                    confidence,
+                    &name,
+                ));
+            }
+            continue;
+        }
+
         match classify_command(&name, has_flag(site.sc, "-v")) {
             Cls::Effect(kind, class) => {
-                out.push(mk_effect(kind, class, site.sc, Tier::Heuristic, 0.9, &name))
+                let confidence = confidence_for(&name, &operands, 0.9);
+                out.push(mk_effect(
+                    kind,
+                    class,
+                    site.sc,
+                    Tier::Heuristic,
+                    confidence,
+                    &name,
+                ))
             }
             Cls::Unknown => out.push(mk_effect(
                 EffectKind::ProcessControl,
@@ -155,6 +200,171 @@ pub fn detect(unit: &FnUnit, fns: &HashSet<String>) -> Vec<Effect> {
         }
     }
     out
+}
+
+/// `true` for the `read`/`mapfile`/`readarray` input-boundary builtins (spec §6): they
+/// measure "did this unit consume external input", distinct from `FS_ALWAYS`'s literal
+/// filesystem verbs.
+fn is_input_reader(name: &str) -> bool {
+    matches!(name, "read" | "mapfile" | "readarray")
+}
+
+/// A `SimpleCommand`'s argument `Word`s — its suffix's plain `Word` items only (excludes
+/// redirects, process substitutions, and `VAR=val` assignment words). This is the operand
+/// slice [`classify_conditional`]/[`has_file_operand`] inspect. Task 5 passes these raw
+/// operands from `site.sc`; Task 6 switches the call sites in `detect` to the
+/// wrapper-peeled `CommandView.args` so `sudo grep -f pats` computes arity against the
+/// real inner operands.
+fn operand_words(sc: &ast::SimpleCommand) -> Vec<&ast::Word> {
+    sc.suffix
+        .iter()
+        .flat_map(|s| s.0.iter())
+        .filter_map(|item| match item {
+            ast::CommandPrefixOrSuffixItem::Word(w) => Some(w),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Option flags that take a FILE argument, per tool (best-effort, spec §4's stream-filter
+/// rule).
+fn file_taking_option(name: &str, flag: &str) -> bool {
+    matches!(
+        (name, flag),
+        ("grep", "-f") | ("sed", "-f") | ("awk", "-f") | ("sort", "-o")
+    )
+}
+
+/// Index of the first POSITIONAL that is a file operand — earlier positionals are the
+/// tool's own pattern/program (`grep PAT`, `sed SCRIPT`, `awk PROG`); every other FILTER
+/// tool's first positional is already a file.
+fn first_file_positional(name: &str) -> usize {
+    match name {
+        "grep" | "sed" | "awk" => 1,
+        _ => 0,
+    }
+}
+
+/// `Some(effect)` for a `FILTER` command iff it names a real file operand (spec §4's
+/// stream-filter rule / pipe containment): reading a *named file* is a durable fs read;
+/// a bare stdin stage (`… | grep pat`) is not. Operand-based (NOT `&SimpleCommand`) so a
+/// wrapped command can later pass peeled operands (Task 6) — Task 5 passes the raw
+/// command's arg `Word`s.
+fn classify_conditional(name: &str, args: &[&ast::Word]) -> Option<(EffectKind, u8, bool)> {
+    if !FILTER.contains(&name) {
+        return None; // tr/others are handled by Task 4's tri-state (NEVER_FS/FS_ALWAYS)
+    }
+    match has_file_operand(name, args) {
+        Some(true) => Some((EffectKind::NetFsDb, 7, false)),
+        Some(false) => None,
+        None => Some((EffectKind::NetFsDb, 7, true)), // ambiguous ($vars) → emit, but flag it
+    }
+}
+
+/// `Some(true)` if `args` names a real file operand for `name`: a positional `Word` at
+/// index `>= first_file_positional(name)` that isn't a bare (unquoted) variable
+/// expansion, or a `-x file` where [`file_taking_option`] recognizes `-x`. `Some(false)`
+/// when every candidate positional slot is empty (`grep pat` — only the pattern).
+/// `None` when arity can't be decided: a candidate positional exists but every one is a
+/// bare `$var`/`${var}` expansion (its runtime value is unknown, so it might expand to a
+/// filename or to nothing). Best-effort: option-argument consumption is only recognized
+/// for [`file_taking_option`]'s known flags; any other short/long flag is skipped without
+/// consuming a following word (an accepted heuristic edge, matching the spec's
+/// "operand-vs-flag detection is best-effort" note).
+fn has_file_operand(name: &str, args: &[&ast::Word]) -> Option<bool> {
+    let threshold = first_file_positional(name);
+    let mut positional_idx = 0usize;
+    let mut ambiguous = false;
+    let mut i = 0;
+    while i < args.len() {
+        let value = args[i].value.as_str();
+        if is_flag(value) {
+            if file_taking_option(name, value) && i + 1 < args.len() {
+                return Some(true);
+            }
+            i += 1;
+            continue;
+        }
+        if positional_idx >= threshold {
+            if is_bare_var_expansion(value) {
+                ambiguous = true;
+            } else {
+                return Some(true);
+            }
+        }
+        positional_idx += 1;
+        i += 1;
+    }
+    if ambiguous { None } else { Some(false) }
+}
+
+/// `true` for a short/long option word (`-f`, `--file`), never for a bare `-` (stdin
+/// placeholder, which is a positional, not a flag).
+fn is_flag(value: &str) -> bool {
+    value.starts_with('-') && value != "-"
+}
+
+/// `true` if `value` is a single unquoted variable expansion for its *entire* extent —
+/// `$VAR` or `${VAR}` with no surrounding quotes and no other text. `Word::value` is
+/// brush-parser's raw source text (quote characters included verbatim), so a quoted
+/// `"$VAR"` keeps its `"` and correctly fails this check. Used both to mark a
+/// file-operand candidate undecidable (spec §6 ambiguous-file-operand) and to detect an
+/// unquoted variable in a destructive command (spec §6 confidence delta).
+fn is_bare_var_expansion(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix('$') else {
+        return false;
+    };
+    let inner = match rest.strip_prefix('{') {
+        Some(braced) => match braced.strip_suffix('}') {
+            Some(inner) => inner,
+            None => return false,
+        },
+        None => rest,
+    };
+    !inner.is_empty() && inner.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// `true` for a `net.fs.db`/7 command whose operands make it destructive (spec §6):
+/// `rm` with a recursive short-flag cluster (`-r`/`-rf`/`-R`/…), `chmod -R`/`chown -R`,
+/// and the inherently-destructive `dd`/`shred` (no flag needed — both overwrite/wipe by
+/// design).
+fn is_destructive_fs(name: &str, args: &[&ast::Word]) -> bool {
+    match name {
+        "rm" => args
+            .iter()
+            .any(|w| is_short_flag_cluster(&w.value) && w.value.contains(['r', 'R'])),
+        "chmod" | "chown" => args
+            .iter()
+            .any(|w| is_short_flag_cluster(&w.value) && w.value.contains('R')),
+        "dd" | "shred" => true,
+        _ => false,
+    }
+}
+
+/// `true` for a short-flag word (`-rf`) as opposed to a long option (`--recursive`) —
+/// mirrors `bindings.rs::has_global_flag`'s combined-cluster convention.
+fn is_short_flag_cluster(value: &str) -> bool {
+    value.starts_with('-') && !value.starts_with("--")
+}
+
+/// `true` if any operand is a bare unquoted variable expansion (see
+/// [`is_bare_var_expansion`]) — the spec §6 confidence-delta trigger for a destructive fs
+/// command.
+fn has_unquoted_var_operand(args: &[&ast::Word]) -> bool {
+    args.iter().any(|w| is_bare_var_expansion(&w.value))
+}
+
+/// Apply the spec §6 unquoted-variable-in-destructive-command delta (−0.1, floored at
+/// 0.1) to `base` when `name`/`args` qualify; otherwise `base` unchanged. Centralized here
+/// so every `net.fs.db` emission in [`detect`] (FILTER's conditional path, the
+/// input-boundary path, and Task 4's name-only match) shares one confidence pipeline —
+/// it is a no-op for any non-destructive command.
+fn confidence_for(name: &str, args: &[&ast::Word], base: f64) -> f64 {
+    if is_destructive_fs(name, args) && has_unquoted_var_operand(args) {
+        (base - 0.1_f64).max(0.1)
+    } else {
+        base
+    }
 }
 
 /// The first literal word of a `SimpleCommand` (the command name itself), or `None` for
@@ -262,5 +472,35 @@ mod tests {
         assert!(kinds_fns("greet\n", &fns).is_empty());
         // but an unrecognized non-function word still spawns
         assert!(kinds_fns("frobnicate\n", &fns).contains(&(EffectKind::ProcessControl, 6)));
+    }
+
+    #[test]
+    fn stream_filter_rule() {
+        // grep with a file operand → fs read; bare (stdin) grep → no fs effect.
+        assert!(kinds("grep pat f.txt\n").contains(&(EffectKind::NetFsDb, 7)));
+        assert!(kinds("grep pat\n").is_empty());
+        // tr never fs, regardless of args
+        assert!(kinds("tr a b\n").is_empty());
+        // file via option counts
+        assert!(kinds("grep -f pats\n").contains(&(EffectKind::NetFsDb, 7)));
+        // read from real input is class 7; here-string fed read is NOT (Task 7 wires <<<; here bare read)
+        assert!(kinds("read x\n").contains(&(EffectKind::NetFsDb, 7)));
+    }
+
+    #[test]
+    fn unquoted_var_in_destructive_lowers_effect_confidence() {
+        let effect = |src: &str| {
+            let prog = parse(src).unwrap();
+            let unit = collect(&prog, "x.sh")
+                .into_iter()
+                .find(|u| u.is_script)
+                .unwrap();
+            detect(&unit, &HashSet::new())
+                .into_iter()
+                .find(|e| e.kind == EffectKind::NetFsDb)
+                .unwrap()
+        };
+        // rm -rf $DIR (unquoted var) → the net.fs.db effect confidence is reduced (−0.1) vs a literal path
+        assert!(effect("rm -rf $DIR\n").confidence < effect("rm -rf /tmp/x\n").confidence);
     }
 }
