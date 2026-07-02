@@ -61,9 +61,11 @@ pub enum Site<'a> {
     /// A pipeline, with subshell context (risk's `curl|sh` adjacency, Task 9).
     Pipeline(&'a ast::Pipeline, bool),
     /// A command-level redirect (on `Command::Compound`, `Command::ExtendedTest`, or a
-    /// function's own redirect list), with subshell context (calls emits fs effects,
-    /// Task 7). A `SimpleCommand`'s own redirects stay on `CmdSite::redirs`.
-    Redirect(&'a ast::IoRedirect, bool),
+    /// function's own redirect list), with subshell context and a `(line, col)` fallback
+    /// span (the enclosing command's own span, since `IoRedirect::location()` is `None` in
+    /// 0.4.0 — calls.rs uses the redirect's target `Word` span when present, else this
+    /// fallback; Task 7). A `SimpleCommand`'s own redirects stay on `CmdSite::redirs`.
+    Redirect(&'a ast::IoRedirect, bool, (usize, usize)),
 }
 
 /// Threaded traversal context. `in_function` is fixed for the whole call (set once from
@@ -80,6 +82,13 @@ fn start_of(loc: &SourceSpan) -> (usize, usize) {
     (loc.start.line, loc.start.column)
 }
 
+/// `(line, col)` of a node's own [`SourceLocation`], or `(0, 0)` when unknown — used as the
+/// [`Site::Redirect`] fallback span (the enclosing command's span, since
+/// `IoRedirect::location()` is always `None` in brush-parser 0.4.0).
+fn loc_of(node: &impl SourceLocation) -> (usize, usize) {
+    node.location().map(|l| start_of(&l)).unwrap_or((0, 0))
+}
+
 /// The one recursive descent every detector shares.
 pub fn walk<'a>(body: &FnBody<'a>, visit: &mut impl FnMut(Site<'a>)) {
     match body {
@@ -91,8 +100,9 @@ pub fn walk<'a>(body: &FnBody<'a>, visit: &mut impl FnMut(Site<'a>)) {
                 in_function: true,
             };
             if let Some(rl) = &fb.1 {
+                let fallback = loc_of(&fb.0);
                 for r in &rl.0 {
-                    visit(Site::Redirect(r, ctx.subshell));
+                    visit(Site::Redirect(r, ctx.subshell, fallback));
                     walk_io_redirect_subs(r, ctx, visit);
                 }
             }
@@ -166,8 +176,9 @@ fn walk_command<'a>(cmd: &'a ast::Command, ctx: Ctx, visit: &mut impl FnMut(Site
         }
         ast::Command::Compound(cc, redirs) => {
             if let Some(rl) = redirs {
+                let fallback = loc_of(cc);
                 for r in &rl.0 {
-                    visit(Site::Redirect(r, ctx.subshell));
+                    visit(Site::Redirect(r, ctx.subshell, fallback));
                     walk_io_redirect_subs(r, ctx, visit);
                 }
             }
@@ -181,10 +192,11 @@ fn walk_command<'a>(cmd: &'a ast::Command, ctx: Ctx, visit: &mut impl FnMut(Site
             // own `FnUnit` from `collect`, not a `<script>` mutation. Its body is not
             // descended here either way (see `functions::collect`'s own recursion).
         }
-        ast::Command::ExtendedTest(_, redirs) => {
+        ast::Command::ExtendedTest(expr, redirs) => {
             if let Some(rl) = redirs {
+                let fallback = loc_of(expr);
                 for r in &rl.0 {
-                    visit(Site::Redirect(r, ctx.subshell));
+                    visit(Site::Redirect(r, ctx.subshell, fallback));
                     walk_io_redirect_subs(r, ctx, visit);
                 }
             }
@@ -324,14 +336,23 @@ fn prefix_suffix_items(
 }
 
 /// A `SimpleCommand`'s words that can carry a command substitution: the command word
-/// itself, its arguments, and any `VAR=val` prefix assignment values (`x=$(curl …)`).
+/// itself, its arguments, and any `VAR=val` prefix assignment words (`x=$(curl …)`).
+///
+/// For a `CommandPrefixOrSuffixItem::AssignmentWord(assignment, word)`, this pushes the
+/// **raw `word`** (the whole `name=value` text, e.g. `x=$(curl http://y)`), not
+/// `assignment.value`'s own (scalar/array-element) `Word` — brush-parser 0.4.0 leaves that
+/// inner `Word.loc` unset (`None`) for an assignment value, while the raw `word` always
+/// carries a real span. [`subst_programs`] only cares about locating command-substitution
+/// pieces inside the text (the literal `name=` / array-literal `(`/`)` characters around it
+/// are inert to word-piece parsing), so scanning the raw word finds the same substitutions
+/// with a usable anchor span.
 pub fn subst_words(sc: &ast::SimpleCommand) -> Vec<&ast::Word> {
     let mut words = Vec::new();
 
     if let Some(prefix) = &sc.prefix {
         for item in &prefix.0 {
-            if let ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, _word) = item {
-                push_assignment_words(assignment, &mut words);
+            if let ast::CommandPrefixOrSuffixItem::AssignmentWord(_assignment, word) = item {
+                words.push(word);
             }
         }
     }
@@ -344,8 +365,8 @@ pub fn subst_words(sc: &ast::SimpleCommand) -> Vec<&ast::Word> {
         for item in &suffix.0 {
             match item {
                 ast::CommandPrefixOrSuffixItem::Word(w) => words.push(w),
-                ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, _word) => {
-                    push_assignment_words(assignment, &mut words);
+                ast::CommandPrefixOrSuffixItem::AssignmentWord(_assignment, word) => {
+                    words.push(word);
                 }
                 _ => {}
             }
@@ -353,20 +374,6 @@ pub fn subst_words(sc: &ast::SimpleCommand) -> Vec<&ast::Word> {
     }
 
     words
-}
-
-fn push_assignment_words<'a>(assignment: &'a ast::Assignment, words: &mut Vec<&'a ast::Word>) {
-    match &assignment.value {
-        ast::AssignmentValue::Scalar(w) => words.push(w),
-        ast::AssignmentValue::Array(items) => {
-            for (key, value) in items {
-                if let Some(key) = key {
-                    words.push(key);
-                }
-                words.push(value);
-            }
-        }
-    }
 }
 
 /// Word-parse `word`'s pieces (including inside double-quoted sequences) and, for each

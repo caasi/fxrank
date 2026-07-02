@@ -19,8 +19,8 @@ use brush_parser::ast;
 use fxrank_core::effect::{Effect, EffectKind, Tier};
 use fxrank_core::score::weight_for_class;
 
-use crate::functions::FnUnit;
-use crate::walk;
+use crate::functions::{FnBody, FnUnit};
+use crate::walk::{self, CmdSite, Site};
 
 /// Pure builtins: no effect, ever.
 const PURE: &[&str] = &[
@@ -276,103 +276,259 @@ fn is_assignment_like(value: &str) -> bool {
     false
 }
 
-/// Classify each `SimpleCommand` in `unit`'s body via [`strip_wrappers`] +
-/// [`classify_command`]. Consults `fns` (same-file function names): a command word
-/// matching one emits NO command effect — it's a call ref, handled in Task 10 (spec §4
-/// function-vs-command precedence) — but only when [`ResMode::Normal`]; a wrapped word
-/// (`sudo greet`, `command greet`) is never treated as a same-file function call.
+/// Classify every effect-producing site in `unit`'s body: [`Site::Command`] (the name
+/// classifier core, Tasks 4–6, plus Task 7's own-redirect fs effects and
+/// command-substitution recursion), [`Site::Redirect`] (compound-command / function-body
+/// redirect lists), and [`Site::Concurrency`] (background `&` / `coproc`, Task 7). Iterates
+/// the FULL [`walk::walk`] `Site` stream — not just [`walk::walk_commands`] — so Task 7's
+/// structural sites are reachable; other `Site` variants (owned by Tasks 3/8/9) are
+/// ignored here.
+pub fn detect(unit: &FnUnit, fns: &HashSet<String>) -> Vec<Effect> {
+    let mut out = Vec::new();
+    walk::walk(&unit.body, &mut |site| match site {
+        Site::Command(cs) => detect_command_site(&cs, fns, &mut out),
+        Site::Redirect(io, _subshell, fallback) => {
+            if let Some(eff) = redirect_effect(io, fallback) {
+                out.push(eff);
+            }
+        }
+        Site::Concurrency((line, col)) => out.push(concurrency_effect(line, col)),
+        _ => {}
+    });
+    out
+}
+
+/// Classify one [`CmdSite`] via [`strip_wrappers`] + [`classify_command`], then attribute
+/// its own redirects (own `CmdSite::redirs`) and recurse into any command substitution in
+/// its words. Consults `fns` (same-file function names): a command word matching one emits
+/// NO command effect — it's a call ref, handled in Task 10 (spec §4 function-vs-command
+/// precedence) — but only when [`ResMode::Normal`]; a wrapped word (`sudo greet`, `command
+/// greet`) is never treated as a same-file function call.
 ///
 /// Ordering: `exec`'s own `process.control`/6 (unconditional, since `exec` can appear with
 /// no wrapped command) → same-file-fn guard → [`classify_conditional`] (FILTER's
 /// file-operand rule) → input-boundary `read`/`mapfile`/`readarray` →
-/// [`classify_command`]'s name-only tri-state. Each stage `continue`s on a match so a
-/// command is classified exactly once. In [`ResMode::BuiltinOnly`], an unrecognized
-/// wrapped word (`Cls::Unknown`) emits NOTHING — `builtin` never spawns an external
-/// program, so it must not fall through to the spawn branch.
-pub fn detect(unit: &FnUnit, fns: &HashSet<String>) -> Vec<Effect> {
-    let mut out = Vec::new();
-    for site in walk::walk_commands(unit) {
-        let view = strip_wrappers(site.sc);
+/// [`classify_command`]'s name-only tri-state → own redirects → command-substitution
+/// recursion (the last two run regardless of whether a command word was classified, e.g.
+/// `exec > f` or a bare `x=$(curl …)` assignment with no command word at all). In
+/// [`ResMode::BuiltinOnly`], an unrecognized wrapped word (`Cls::Unknown`) emits NOTHING —
+/// `builtin` never spawns an external program, so it must not fall through to the spawn
+/// branch. Every effect attributed directly to this site (the classify effect and its own
+/// redirects) gets spec §6's `-0.1` substitution-context delta when `site.subst` is set
+/// (this site was reached through a process substitution `<(…)`/`>(…)`).
+fn detect_command_site(site: &CmdSite, fns: &HashSet<String>, out: &mut Vec<Effect>) {
+    let view = strip_wrappers(site.sc);
 
-        if view.kinds.iter().any(|k| k == "exec") {
-            out.push(mk_effect(
+    if view.kinds.iter().any(|k| k == "exec") {
+        push_effect(
+            out,
+            site.subst,
+            mk_effect(
                 EffectKind::ProcessControl,
                 6,
                 site.sc,
                 Tier::Heuristic,
                 0.9,
                 "exec",
-            ));
-        }
+            ),
+        );
+    }
 
-        let Some(head) = view.head else {
-            continue;
-        };
-        if view.mode == ResMode::Normal && fns.contains(&head) {
-            continue; // same-file fn call → ref only (Task 10), no effect
-        }
-
+    if let Some(head) = view.head.clone()
+        && !(view.mode == ResMode::Normal && fns.contains(&head))
+    {
         if let Some((kind, class, ambiguous)) = classify_conditional(&head, &view.args) {
             let base = if ambiguous { 0.8 } else { 0.9 };
             let confidence = confidence_for(&head, &view.args, base);
-            out.push(mk_effect(
-                kind,
-                class,
-                site.sc,
-                Tier::Heuristic,
-                confidence,
-                &head,
-            ));
-            continue;
-        }
-
-        if is_input_reader(&head) {
-            // read/mapfile/readarray measure the *input boundary*: class 7 unless stdin
-            // is fed by a here-doc/here-string (Task 7 sets `stdin_is_here`; until then
-            // bare `read` is always class 7). Recognized regardless (DECL already marks
-            // it NoEffect in classify_command), so this always continues.
+            push_effect(
+                out,
+                site.subst,
+                mk_effect(kind, class, site.sc, Tier::Heuristic, confidence, &head),
+            );
+        } else if is_input_reader(&head) {
+            // read/mapfile/readarray measure the *input boundary*: class 7 unless stdin is
+            // fed by a here-doc/here-string (`stdin_is_here`, Task 7).
             if !site.stdin_is_here {
                 let confidence = confidence_for(&head, &view.args, 0.9);
-                out.push(mk_effect(
-                    EffectKind::NetFsDb,
-                    7,
-                    site.sc,
-                    Tier::Heuristic,
-                    confidence,
-                    &head,
-                ));
-            }
-            continue;
-        }
-
-        match classify_command(&head, has_flag_word(&view.args, "-v")) {
-            Cls::Effect(kind, class) => {
-                let confidence = confidence_for(&head, &view.args, 0.9);
-                out.push(mk_effect(
-                    kind,
-                    class,
-                    site.sc,
-                    Tier::Heuristic,
-                    confidence,
-                    &head,
-                ))
-            }
-            Cls::Unknown => {
-                if view.mode != ResMode::BuiltinOnly {
-                    out.push(mk_effect(
-                        EffectKind::ProcessControl,
-                        6,
+                push_effect(
+                    out,
+                    site.subst,
+                    mk_effect(
+                        EffectKind::NetFsDb,
+                        7,
                         site.sc,
                         Tier::Heuristic,
-                        0.7,
+                        confidence,
                         &head,
-                    ));
-                }
+                    ),
+                );
             }
-            Cls::NoEffect => {}
+        } else {
+            match classify_command(&head, has_flag_word(&view.args, "-v")) {
+                Cls::Effect(kind, class) => {
+                    let confidence = confidence_for(&head, &view.args, 0.9);
+                    push_effect(
+                        out,
+                        site.subst,
+                        mk_effect(kind, class, site.sc, Tier::Heuristic, confidence, &head),
+                    );
+                }
+                Cls::Unknown => {
+                    if view.mode != ResMode::BuiltinOnly {
+                        push_effect(
+                            out,
+                            site.subst,
+                            mk_effect(
+                                EffectKind::ProcessControl,
+                                6,
+                                site.sc,
+                                Tier::Heuristic,
+                                0.7,
+                                &head,
+                            ),
+                        );
+                    }
+                }
+                Cls::NoEffect => {}
+            }
         }
     }
-    out
+
+    // This SimpleCommand's own redirects (`cat > out`, `grep pat < in`, …) — command-level
+    // redirects on an enclosing compound/function are handled via `Site::Redirect` in
+    // `detect` instead.
+    for io in site.redirs.iter().copied() {
+        if let Some(eff) = redirect_effect(io, span_of(site.sc)) {
+            push_effect(out, site.subst, eff);
+        }
+    }
+
+    recurse_command_substitutions(site.sc, fns, out);
+}
+
+/// Push `eff` onto `out`, applying spec §6's `-0.1` substitution-context delta (floored at
+/// 0.1) when `subst` is set.
+fn push_effect(out: &mut Vec<Effect>, subst: bool, mut eff: Effect) {
+    if subst {
+        eff.confidence = (eff.confidence - 0.1).max(0.1);
+    }
+    out.push(eff);
+}
+
+/// `$()`/backtick command substitutions inside `sc`'s words (command word, args, and
+/// `VAR=val` prefix assignment values — [`walk::subst_words`]) — text, re-parsed and
+/// recursed at the effect level (own half; `mutation.rs` recurses its own half separately,
+/// Task 8, avoiding a forward dependency between the two detectors). Each inner effect is
+/// re-anchored to the enclosing `Word`'s span and has its confidence reduced by 0.1 (spec
+/// §6 substitution-context delta). The transient inner `Program` is owned locally and drops
+/// at the end of each iteration — no `&'a` leak into the caller.
+fn recurse_command_substitutions(
+    sc: &ast::SimpleCommand,
+    fns: &HashSet<String>,
+    out: &mut Vec<Effect>,
+) {
+    for word in walk::subst_words(sc) {
+        for (anchor, inner_prog) in walk::subst_programs(word) {
+            let items: Vec<&ast::CompoundListItem> = inner_prog
+                .complete_commands
+                .iter()
+                .flat_map(|cc| cc.0.iter())
+                .collect();
+            let transient = FnUnit {
+                symbol: "<subst>".to_string(),
+                id: String::new(),
+                path: String::new(),
+                line: 0,
+                col: 0,
+                body: FnBody::Script(items),
+                is_script: true,
+            };
+            let (line, col) = (anchor.start.line, anchor.start.column);
+            for mut eff in detect(&transient, fns) {
+                eff.line = line;
+                eff.col = col;
+                eff.confidence = (eff.confidence - 0.1).max(0.1);
+                out.push(eff);
+            }
+        }
+    }
+}
+
+/// `Some(effect)` for a redirect that names a real file target: an output direction
+/// (`>`/`>>`/`>|`/`<>`, plus `&>`/`&>>`) → `net.fs.db`/7 write; an input direction (`<`) →
+/// `net.fs.db`/7 read. `None` for fd-dups (`>&1`), here-docs, here-strings, and a process-
+/// substitution target (that's a borrowed AST subtree walked in place, not a file operand —
+/// spec §4). **Location:** `IoRedirect::location()` is always `None` in brush-parser 0.4.0,
+/// so the effect is anchored to the target `Word`'s own span when present, else `fallback`
+/// (the enclosing command's span).
+fn redirect_effect(io: &ast::IoRedirect, fallback: (usize, usize)) -> Option<Effect> {
+    let (kind, class, word, evidence) = classify_redirect(io)?;
+    let (line, col) = word
+        .loc
+        .as_ref()
+        .map(|loc| (loc.start.line, loc.start.column))
+        .unwrap_or(fallback);
+    Some(Effect {
+        kind,
+        class,
+        discounted_to: None,
+        weight: weight_for_class(class),
+        line,
+        col,
+        tier: Tier::Heuristic,
+        hidden: false,
+        contained: false,
+        evidence: evidence.to_string(),
+        discount: None,
+        subreason: None,
+        confidence: 0.9,
+    })
+}
+
+/// The fs-effect verdict for a redirect's `IoFileRedirectKind`/target — see
+/// [`redirect_effect`].
+fn classify_redirect(io: &ast::IoRedirect) -> Option<(EffectKind, u8, &ast::Word, &'static str)> {
+    match io {
+        ast::IoRedirect::File(_, kind, ast::IoFileRedirectTarget::Filename(word)) => match kind {
+            ast::IoFileRedirectKind::Write
+            | ast::IoFileRedirectKind::Append
+            | ast::IoFileRedirectKind::Clobber
+            | ast::IoFileRedirectKind::ReadAndWrite => {
+                Some((EffectKind::NetFsDb, 7, word, "redirect:write"))
+            }
+            ast::IoFileRedirectKind::Read => Some((EffectKind::NetFsDb, 7, word, "redirect:read")),
+            ast::IoFileRedirectKind::DuplicateInput | ast::IoFileRedirectKind::DuplicateOutput => {
+                None
+            }
+        },
+        ast::IoRedirect::OutputAndError(word, _append) => {
+            Some((EffectKind::NetFsDb, 7, word, "redirect:write"))
+        }
+        ast::IoRedirect::File(..)
+        | ast::IoRedirect::HereDocument(..)
+        | ast::IoRedirect::HereString(..) => None,
+    }
+}
+
+/// A `concurrency`/6 escaping effect for a background `&` launch or a `coproc` (Task 7,
+/// [`Site::Concurrency`]) — genuinely outlives the statement, unlike a plain multi-stage
+/// pipeline (bounded/joined, no effect of its own; spec §4).
+fn concurrency_effect(line: usize, col: usize) -> Effect {
+    Effect {
+        kind: EffectKind::Concurrency,
+        class: 6,
+        discounted_to: None,
+        weight: weight_for_class(6),
+        line,
+        col,
+        tier: Tier::Heuristic,
+        hidden: false,
+        contained: false,
+        evidence: "&".to_string(),
+        discount: None,
+        subreason: None,
+        confidence: 0.9,
+    }
 }
 
 /// `true` for the `read`/`mapfile`/`readarray` input-boundary builtins (spec §6): they
@@ -740,5 +896,36 @@ mod tests {
         let fns: HashSet<String> = ["greet".to_string()].into_iter().collect();
         assert!(kinds_fns("sudo greet\n", &fns).contains(&(EffectKind::ProcessControl, 6)));
         assert!(kinds_fns("command greet\n", &fns).contains(&(EffectKind::ProcessControl, 6)));
+    }
+
+    #[test]
+    fn redirections_and_here_strings() {
+        assert!(kinds("cat > out\n").contains(&(EffectKind::NetFsDb, 7))); // output redirect = write
+        assert!(kinds("grep pat < in\n").contains(&(EffectKind::NetFsDb, 7))); // input redirect = read
+        assert!(kinds("read x <<< \"$s\"\n").is_empty()); // here-string: no fs
+    }
+
+    #[test]
+    fn command_substitution_recurses_as_subshell() {
+        // $() in an AssignmentValue (not an arg Word) — inner curl still counts
+        assert!(kinds("x=$(curl http://y)\n").contains(&(EffectKind::NetFsDb, 7)));
+    }
+
+    #[test]
+    fn process_substitution_inner_command_counts() {
+        // <(...) is a borrowed SubshellCommand AST node — walk it; inner curl counts,
+        // and the pseudo-file is NOT an fs operand for the outer grep.
+        assert!(kinds("grep pat <(curl http://y)\n").contains(&(EffectKind::NetFsDb, 7)));
+    }
+
+    #[test]
+    fn background_launch_is_concurrency_but_a_plain_pipeline_is_not() {
+        assert!(kinds("sleep 1 &\n").contains(&(EffectKind::Concurrency, 6))); // background job escapes
+        // a plain multi-stage pipeline is bounded/joined — NO concurrency effect (only the stages' own effects)
+        assert!(
+            !kinds("a | b\n")
+                .iter()
+                .any(|(k, _)| *k == EffectKind::Concurrency)
+        );
     }
 }
