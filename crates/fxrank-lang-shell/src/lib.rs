@@ -1,6 +1,11 @@
-//! Shell (Bash/POSIX) frontend for fxrank — SPIKE scaffold (Task 0).
+//! Shell (Bash/POSIX) frontend for fxrank.
 //!
-//! # Confirmed `brush-parser` 0.4.0 API (spike findings)
+//! Parses Bash/POSIX shell source with [`brush_parser`], collects function units (plus
+//! the synthetic `<script>` unit for top-level executable statements — see
+//! [`ShellFrontend`]), and scores each via the shared `detect::analyze_unit` pipeline,
+//! emitting effect-scored `Hotspot`s and `UnitRecord`s like the other frontends.
+//!
+//! # `brush-parser` 0.4.0 API notes
 //!
 //! 1. **Tokenize → parse entry point** (both re-exported at the crate root):
 //!    - `brush_parser::tokenize_str(text: &str) -> Result<Vec<Token>, TokenizerError>`

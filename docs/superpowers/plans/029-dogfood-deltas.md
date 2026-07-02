@@ -12,9 +12,9 @@ distro driver install/remove scripts).
 
 ## Corpora scanned
 
-1. **`review-loop` skill scripts** (`~/.claude/plugins/marketplaces/caasi-dong3/plugins/review-loop/skills/review-loop/scripts/`)
-   — 3 files, 16 functions (`copilot.sh`, `pr-comments.sh`, `sandbox-preflight.sh`). GitHub-API
-   wrapper scripts: mostly `gh`/`curl` calls, `set -e`/`shift`/status tracking.
+1. **A local `review-loop` plugin's `scripts/` directory** — 3 files, 16 functions
+   (`copilot.sh`, `pr-comments.sh`, `sandbox-preflight.sh`). GitHub-API wrapper scripts:
+   mostly `gh`/`curl` calls, `set -e`/`shift`/status tracking.
 2. **A 146-file bulk sample** of this machine's real system shell scripts (copied to a
    scratch dir): Linux kernel build/test scripts (`conftest.sh`, `test-bootconfig.sh`,
    `adjust_autoksyms.sh`), `netdata-updater.sh` (self-update logic, ~1400 lines), an
@@ -67,33 +67,36 @@ distro driver install/remove scripts).
   helpers sourcing `/lib/lsb/init-functions` — all `ThirdParty`, keyed by the literal path
   text (not the bare word `source`), matching spec §9.
 
-## Known accepted-heuristic limits (surfaced during review, not fixed in this branch)
+## Resolved after this doc was first written (Copilot PR review + final review)
 
-These were identified during the spec-029 review pass (Sonnet 5 + Codex) and are deliberately
-left as **documented Milestone-B candidates**, not blockers — recorded here so a future author
-doesn't have to rediscover them:
+Four items originally listed here were **fixed** on the branch by the whole-branch final review
+and the Copilot PR review-loop (PR #66), so they are no longer limitations:
 
-- **`has_file_operand` can false-positive on numeric-arg flags** (`sort -k 2`) — a flag's
-  numeric argument can be mistaken for a file operand by the stream-filter heuristic.
-- **Command substitution inside a redirect TARGET word is not recursed**
-  (`cmd > "$(mktemp)"`) — the redirect-target side of a `>`/`>>` is not walked for nested
-  `$()`, unlike the general command-substitution recursion used elsewhere.
-- **`Site::FnDefine` drops subshell context** — a function defined inside `( )` within an
-  enclosing function is wrongly reported `contained: false` (the subshell-forced containment
-  doesn't propagate through a nested function *definition* site, only through the mutation
-  sites directly inside the subshell).
-- **A bare non-local write inside a function's `$()` yields no effect**
-  (`f(){ x=$(g=5); }`) — command-substitution recursion runs with `is_script=true`, so the
-  inner `g=5` is (mis)classified as a script-scope declaration (no effect) instead of a
-  hidden write escaping the substitution's parent function.
-- **`detect_pipeline`'s doc-comment example isn't actually caught** — `curl | tee f | sh`
-  (the canonical "read something, hand it straight to a shell" example in the detector's own
-  doc comment) fails to match because the detector's `windows(2)` adjacency check doesn't
-  span the 3-stage pipe the way the example implies.
-- **Disabled-feature CLI diagnostic wording differs from the sibling frontends' phrasing** —
-  a minor cosmetic inconsistency in the `#[cfg(not(feature = "shell"))]` stub's error message
-  versus the Rust/TS/Python equivalents.
+- **`has_file_operand` numeric-arg flags** (`sort -k 2`) — fixed: value-taking flags
+  (`sort -k/-t/-S/-o`, `head`/`tail -n/-c`, `uniq -f/-w/-s`) now consume their argument.
+- **Bare non-local write inside a function's `$()`** (`f(){ x=$(g=5); }`) — fixed: the
+  substitution-recursion transient unit is now `is_script=false`, so the inner write surfaces
+  as a `global.mutation` with `contained: true`.
+- **`detect_pipeline` doc-comment example** — fixed (comment corrected to the real
+  literal-adjacency limitation).
+- **Disabled-feature CLI wording** — fixed (aligned with the sibling frontends' phrasing).
 
-None of these affected the dogfood sanity checks above (they are narrow syntactic corners, not
-systemic false-positive/negative sources); they're listed here as the honest residual, per the
-same convention `008-dogfood-deltas.md` used for spec 008.
+The Copilot loop also fixed: `is_computed_path` single-quoted-literal false positive,
+`local_names` missing bare `local x` declarations, `risk.rs` not respecting `BuiltinOnly`, and
+`env.write` wrongly contained under subshell (it now escapes per spec §A).
+
+## Remaining Milestone-B / residual gaps (tracked as issues)
+
+Narrow syntactic corners, not systemic false-positive/negative sources — filed as follow-ups:
+
+- **Shebang-based routing** for extension-less scripts → **#67**.
+- **Follow `source`** for cross-file symbol resolution → **#68**.
+- **`alias` resolution / `trap` handlers** → **#69**.
+- **`xargs` / `find -exec` argv recursion** → **#70**.
+- Tracking issue **#71** for the smaller residuals: command-sub in a redirect TARGET word
+  (`cmd > "$(mktemp)"`); `Site::FnDefine` dropping subshell context; `shopt -s lastpipe`;
+  `.ksh`/`.zsh`/`.bats` routing; `set +e`/strict-mode risk metadata; external-tool dependency
+  surface via `external_reaches`; and the upstream brush-parser apostrophe-in-`#`-comment gap
+  (degrades gracefully to a `Diagnostic`).
+
+Recorded per the same convention `008-dogfood-deltas.md` used for spec 008.

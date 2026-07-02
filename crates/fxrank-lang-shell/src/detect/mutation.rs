@@ -31,7 +31,10 @@
 //! Command substitution (`$()`/backticks) is recursed at the effect level (own half —
 //! `calls.rs` recurses its own half separately, avoiding a forward dependency between the
 //! two detectors): every result is **forced `contained = true`** (a subshell never
-//! escapes to the enclosing scope) and re-anchored to the substitution's word span.
+//! escapes to the enclosing scope) and re-anchored to the substitution's word span —
+//! **except `env.write`**, forced `contained = false` instead: an `export`/`declare -x`/
+//! exported `unset` still crosses the process boundary from inside a subshell, so it is a
+//! WORLD effect (spec §A) that always escapes, unlike a shell-internal write.
 
 use std::collections::HashSet;
 
@@ -625,6 +628,16 @@ fn scan_pieces(
 /// enclosing `Word`'s span, with confidence reduced by 0.1 (spec §6 substitution-context
 /// delta). The transient inner `Program` is owned locally and drops at the end of each
 /// iteration — no `&'a` leak into the caller.
+///
+/// The transient unit is built with `is_script: false` (NOT `true`, despite `$()`
+/// syntactically containing a script fragment) — `is_script: true` would route a bare
+/// non-local write (`x=$(g=5)`) through [`classify_plain_write`]'s top-level-declaration
+/// branch, which emits NO effect at all (the "no effect" gate meant for real script-top
+/// declarations), silently dropping the inner mutation instead of reporting it as
+/// contained. Treating the substitution body as "inside a function" routes the same write
+/// through the escaping `global.mutation`/6 branch, which the force-`contained = true`
+/// below then correctly downgrades to a contained subshell mutation — matching the "a
+/// subshell's writes are contained, not invisible" model this recursion is built for.
 fn recurse_command_substitutions(
     sc: &ast::SimpleCommand,
     top: &HashSet<String>,
@@ -644,14 +657,17 @@ fn recurse_command_substitutions(
                 line: 0,
                 col: 0,
                 body: FnBody::Script(items),
-                is_script: true,
+                is_script: false,
             };
             let (line, col) = (anchor.start.line, anchor.start.column);
             for (mut eff, _contained) in detect(&transient, top) {
                 eff.line = line;
                 eff.col = col;
                 eff.confidence = (eff.confidence - 0.1).max(0.1);
-                out.push((eff, true));
+                // A subshell contains its shell-internal writes, but `env.write` still
+                // crosses the process boundary from inside one — always escapes (spec §A).
+                let contained = eff.kind != EffectKind::EnvWrite;
+                out.push((eff, contained));
             }
         }
     }
@@ -754,6 +770,12 @@ fn emit_target(
 /// 0.5; either way a `-0.1` delta applies when `subst` (a process-substitution site).
 /// `Effect.contained` itself is left at its struct default — the returned `bool` is
 /// authoritative; Task 11's `gather` sets `Effect.contained` from it.
+///
+/// `EffectKind::EnvWrite` is special-cased to `contained = false` regardless of the
+/// passed-in flag: `export`/`declare -x`/an exported `unset` cross the process boundary,
+/// so they are a WORLD effect (spec §A), not a shell-internal mutation a subshell can
+/// contain — an `export` inside `$(...)`/`( ... )`/a pipeline stage still leaves its mark
+/// on the child process's environment and must escape the fold.
 #[allow(clippy::too_many_arguments)]
 fn push_write(
     out: &mut Vec<(Effect, bool)>,
@@ -766,6 +788,11 @@ fn push_write(
     computed: bool,
     subst: bool,
 ) {
+    let contained = if kind == EffectKind::EnvWrite {
+        false
+    } else {
+        contained
+    };
     let class = apply_boundary_discount(kind.base_class(), BoundaryCoverage::None, contained);
     let mut confidence = if computed { 0.5 } else { 0.9 };
     if subst {
@@ -972,12 +999,68 @@ mod tests {
     }
 
     #[test]
+    fn bare_local_declaration_makes_later_write_a_contained_local() {
+        // `local x` (no initializer) must still register x as a declared local, so the
+        // later `x=5` classifies as a contained local.mutation/1, not an escaping
+        // global.mutation/6 (a Copilot-flagged false positive).
+        let v = muts("f(){ local x; x=5; }\n", "f");
+        assert!(v.contains(&(EffectKind::LocalMutation, 1, true)));
+        assert!(!v.iter().any(|(k, _, _)| *k == EffectKind::GlobalMutation));
+
+        // `local -g y` still escapes to global scope even in the bare-declaration form.
+        assert!(muts("f(){ local -g y; y=5; }\n", "f").contains(&(
+            EffectKind::GlobalMutation,
+            6,
+            false
+        )));
+    }
+
+    #[test]
     fn subshell_mutation_is_contained() {
         // cd inside $(...) does not escape → contained
         let v = muts("f(){ x=$(cd /y && pwd); }\n", "f");
         assert!(
             v.iter()
                 .any(|(k, _, c)| *k == EffectKind::GlobalMutation && *c)
+        );
+    }
+
+    #[test]
+    fn paren_subshell_shell_internal_mutation_stays_contained() {
+        // A `( ... )` compound subshell genuinely contains a shell-internal mutation like
+        // `cd` — this is unchanged by the env.write world-effect fix below.
+        let v = muts("f(){ ( cd /y ); }\n", "f");
+        assert!(
+            v.iter()
+                .any(|(k, _, c)| *k == EffectKind::GlobalMutation && *c),
+            "expected a contained global.mutation for `cd` inside a `( )` subshell, got: {v:?}"
+        );
+    }
+
+    #[test]
+    fn env_write_inside_command_substitution_still_escapes() {
+        // `export` crosses the process boundary — it's a WORLD effect (spec §A), not a
+        // shell-internal mutation a subshell can contain. Even inside `$(...)`, the
+        // EnvWrite effect must NOT be marked contained (it must still escape the fold).
+        let v = muts("f(){ x=$(export Y=1); }\n", "f");
+        assert!(
+            v.iter().any(|(k, _, c)| *k == EffectKind::EnvWrite && !*c),
+            "expected an escaping (contained=false) env.write for `export` inside $(...), got: {v:?}"
+        );
+    }
+
+    #[test]
+    fn bare_write_inside_command_substitution_is_contained_not_dropped() {
+        // `x=$(g=5)`: the inner `g=5` is a bare assignment with no command word — before
+        // the fix, the transient inner unit was built with `is_script: true`, so it hit
+        // the top-level-declaration "no effect" gate and vanished entirely. It must
+        // instead surface as a global.mutation/6 effect forced `contained = true` (a
+        // subshell's writes are contained, not invisible).
+        let v = muts("f(){ x=$(g=5); }\n", "f");
+        assert!(
+            v.iter()
+                .any(|(k, _, c)| *k == EffectKind::GlobalMutation && *c),
+            "expected a contained global.mutation effect for the inner `g=5`, got: {v:?}"
         );
     }
 

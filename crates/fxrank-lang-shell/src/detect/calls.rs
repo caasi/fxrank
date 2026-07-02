@@ -615,11 +615,13 @@ fn classify_conditional(name: &str, args: &[&ast::Word]) -> Option<(EffectKind, 
 
 /// `Some(true)` if `args` names a real file operand for `name`: a positional `Word` at
 /// index `>= first_file_positional(name)` that isn't a bare (unquoted) variable
-/// expansion, or a `-x file` where [`file_taking_option`] recognizes `-x`. `Some(false)`
-/// when every candidate positional slot is empty (`grep pat` — only the pattern).
-/// `None` when arity can't be decided: a candidate positional exists but every one is a
-/// bare `$var`/`${var}` expansion (its runtime value is unknown, so it might expand to a
-/// filename or to nothing). Best-effort: option-argument consumption is only recognized
+/// expansion, or a `-x file` where [`file_taking_option`] recognizes `-x` and `file` isn't
+/// itself a bare variable expansion. `Some(false)` when every candidate positional slot is
+/// empty (`grep pat` — only the pattern). `None` when arity can't be decided: a candidate
+/// positional or a [`file_taking_option`] value exists but every one is a bare `$var`/
+/// `${var}` expansion (its runtime value is unknown, so it might expand to a filename or
+/// to nothing) — `grep -f $pats` is exactly as ambiguous as a bare-var positional, so it
+/// shares the same undecidable signal (spec §6). Best-effort: option-argument consumption is only recognized
 /// for [`file_taking_option`]'s and [`non_file_value_option`]'s known flags; any other
 /// short/long flag is skipped without consuming a following word (an accepted heuristic
 /// edge, matching the spec's "operand-vs-flag detection is best-effort" note). Without
@@ -634,6 +636,15 @@ fn has_file_operand(name: &str, args: &[&ast::Word]) -> Option<bool> {
         let value = args[i].value.as_str();
         if is_flag(value) {
             if file_taking_option(name, value) && i + 1 < args.len() {
+                if is_bare_var_expansion(args[i + 1].value.as_str()) {
+                    // spec §6: a bare `$var`/`${var}` option VALUE (`grep -f $pats`,
+                    // `sort -o $out`) is as undecidable as a bare-var POSITIONAL — its
+                    // runtime expansion might be a filename or might be empty/multi-word.
+                    // Still consume the value so it isn't re-scanned as a positional.
+                    ambiguous = true;
+                    i += 2;
+                    continue;
+                }
                 return Some(true);
             }
             if non_file_value_option(name, value) {
@@ -893,6 +904,37 @@ mod tests {
         };
         // rm -rf $DIR (unquoted var) → the net.fs.db effect confidence is reduced (−0.1) vs a literal path
         assert!(effect("rm -rf $DIR\n").confidence < effect("rm -rf /tmp/x\n").confidence);
+    }
+
+    #[test]
+    fn bare_var_option_value_is_ambiguous_like_a_bare_var_positional() {
+        // Copilot round-4: `grep -f $pats` names its file via a value-taking OPTION whose
+        // value is a bare $var — the runtime expansion is as unknown as a bare-var
+        // POSITIONAL, so it must get the same −0.1 ambiguity delta, not the full 0.9
+        // "definite file" confidence.
+        let effect = |src: &str| {
+            let prog = parse(src).unwrap();
+            let unit = collect(&prog, "x.sh")
+                .into_iter()
+                .find(|u| u.is_script)
+                .unwrap();
+            detect(&unit, &HashSet::new())
+                .into_iter()
+                .find(|e| e.kind == EffectKind::NetFsDb)
+                .unwrap()
+        };
+        // grep -f $pats: still emits net.fs.db/7, but at lowered (ambiguous) confidence.
+        let ambiguous = effect("grep -f $pats\n");
+        assert_eq!(ambiguous.class, 7);
+        assert!(ambiguous.confidence < 0.9);
+        // grep -f patterns.txt: a literal option value is a definite file → full 0.9.
+        let literal = effect("grep -f patterns.txt\n");
+        assert_eq!(literal.class, 7);
+        assert_eq!(literal.confidence, 0.9);
+        // sort -o $out: same ambiguity delta for another file_taking_option flag.
+        let sort_ambiguous = effect("sort -o $out\n");
+        assert_eq!(sort_ambiguous.class, 7);
+        assert!(sort_ambiguous.confidence < 0.9);
     }
 
     #[test]

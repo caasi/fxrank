@@ -1,9 +1,14 @@
 //! Per-function local-name pre-scan + script-top binding set.
 //!
-//! The scope model that `mutation.rs` (Task 8) consults for declaration-vs-hidden
-//! classification: a write to a name in [`local_names`] is a declared, contained local
-//! binding; a write to a name that isn't local and isn't a [`script_top_names`] top-level
-//! binding is a captured/global write.
+//! [`local_names`] is the scope set `mutation.rs` (Task 8) actually consults for
+//! declaration-vs-hidden classification: a write to a name in [`local_names`] is a
+//! declared, contained local binding (`local.mutation`/1); otherwise, inside a function,
+//! it's an escaping write (`global.mutation`/6). The declaration-vs-hidden gate itself is
+//! `unit.is_script` (top-level vs. "inside a function"), NOT membership in
+//! [`script_top_names`] — `script_top_names` is threaded through `mutation.rs`'s
+//! command-substitution recursion as a parameter but is not consulted by the
+//! classification gate (`classify_plain_write`); it exists as scope-model bookkeeping
+//! available for that purpose, not currently load-bearing for it.
 
 use std::collections::HashSet;
 
@@ -13,7 +18,11 @@ use crate::functions::FnUnit;
 use crate::walk::{Site, walk};
 
 /// Names declared **local in this function**: `local`, `declare`/`typeset` (without a
-/// `-g` flag — that escapes to global scope), and `for`-loop iteration variables.
+/// `-g` flag — that escapes to global scope), and `for`-loop iteration variables. Both
+/// the initializer form (`local x=1`, an `AssignmentWord`) and the bare declaration form
+/// (`local x`, a plain `Word` operand with no initializer) count — a later `x=5` in the
+/// same function must still resolve as a contained local write, not a hidden global one
+/// (a Copilot-flagged false positive: the bare form was previously missed entirely).
 ///
 /// **Excluded by construction** (not in the recognized-command set below): `readonly`
 /// (declares a constant, not local scope), `select` (no AST variant in brush-parser
@@ -37,6 +46,7 @@ pub fn local_names(unit: &FnUnit<'_>) -> HashSet<String> {
                 return;
             }
             names.extend(assigned_names(cs.sc));
+            names.extend(bare_operand_names(cs.sc));
         }
         Site::ForVar(name, _) => {
             names.insert(name.to_string());
@@ -45,6 +55,38 @@ pub fn local_names(unit: &FnUnit<'_>) -> HashSet<String> {
     });
 
     names
+}
+
+/// The bare (no-initializer) identifier operands of a `local`/`declare`/`typeset` suffix
+/// — `local x` declares `x` local with no `AssignmentWord` at all, so [`assigned_names`]
+/// (which only scans `AssignmentWord` items) misses it entirely. A flag (`-r`, `-gx`, …)
+/// is excluded by [`is_bare_identifier`] rejecting the leading `-`.
+fn bare_operand_names(sc: &ast::SimpleCommand) -> Vec<String> {
+    sc.suffix
+        .iter()
+        .flat_map(|s| s.0.iter())
+        .filter_map(|item| match item {
+            ast::CommandPrefixOrSuffixItem::Word(w) if is_bare_identifier(&w.value) => {
+                Some(w.value.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `true` for a plain shell identifier (`x`, `_foo`, `n2`) — a leading alphabetic/`_`
+/// character followed by alphanumeric/`_` characters, and nothing else (no `=`, no `-`
+/// flag prefix, no subscript). This is deliberately narrower than
+/// `mutation.rs::is_literal_target` (which also accepts an array-subscript suffix like
+/// `arr[0]`) — a bare `local arr[0]` operand is an existing accepted edge case, not this
+/// fix's concern.
+fn is_bare_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Names assigned at the script's top level: bare `Assignment`s and pure `VAR=val`
@@ -201,6 +243,36 @@ mod tests {
         assert!(
             names.contains("arr"),
             "local arr[0]=1 is an ArrayElementName assignment; its base name arr is the local binding"
+        );
+    }
+
+    #[test]
+    fn local_names_includes_bare_declaration_without_initializer() {
+        let src = "f(){ local x; declare y; typeset z; }\n";
+        let prog = parse(src).unwrap();
+        let unit = collect(&prog, "x.sh")
+            .into_iter()
+            .find(|u| u.symbol == "f")
+            .unwrap();
+        let names = local_names(&unit);
+        assert!(
+            names.contains("x") && names.contains("y") && names.contains("z"),
+            "a bare `local x` (no initializer) must still declare x local"
+        );
+    }
+
+    #[test]
+    fn local_names_bare_declare_g_still_excluded() {
+        let src = "f(){ local -g y; }\n";
+        let prog = parse(src).unwrap();
+        let unit = collect(&prog, "x.sh")
+            .into_iter()
+            .find(|u| u.symbol == "f")
+            .unwrap();
+        let names = local_names(&unit);
+        assert!(
+            !names.contains("y"),
+            "local -g y is global, not local, even in bare-declaration form"
         );
     }
 

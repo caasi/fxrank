@@ -198,6 +198,28 @@ mod tests {
     }
 
     #[test]
+    fn single_quoted_literal_source_path_still_gets_a_ref() {
+        // `$dir` inside single quotes is literal text, not an expansion — `is_computed_path`
+        // must not treat it as computed, or this path-keyed ref would wrongly vanish.
+        let src = "main(){ source '$dir/x'; }\n";
+        let prog = parse(src).unwrap();
+        let fns = defined_function_names(&prog);
+        let main = collect(&prog, "x.sh")
+            .into_iter()
+            .find(|u| u.symbol == "main")
+            .unwrap();
+        let r = refs(&main, &fns);
+        // `base` is the raw `Word::value` (quotes retained verbatim, like the existing
+        // `./lib.sh` case above) — the point of this test is that a ref is emitted AT ALL
+        // (it used to vanish because `is_computed_path` wrongly saw the raw `$` and treated
+        // the site as computed).
+        assert!(
+            r.iter()
+                .any(|x| x.qualified && x.resolved_target.is_none() && x.base == "'$dir/x'")
+        );
+    }
+
+    #[test]
     fn computed_source_path_emits_no_ref() {
         let src = "main(){ source \"$dir/x\"; }\n";
         let prog = parse(src).unwrap();
