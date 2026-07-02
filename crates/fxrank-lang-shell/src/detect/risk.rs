@@ -155,8 +155,11 @@ fn program_has_net_fetch(prog: &ast::Program) -> bool {
 
 /// `true` for a "computed" path argument — one carrying a `$…` expansion (a variable or
 /// command substitution), as opposed to a literal path. Heuristic (spec §9): `source
-/// "$dir/x"` is computed, `source ./lib.sh` is not.
-fn is_computed_path(word: &ast::Word) -> bool {
+/// "$dir/x"` is computed, `source ./lib.sh` is not. `pub(crate)` — `detect/refs.rs`
+/// (Task 10) reuses this exact rule to decide whether a `source`/`.` site gets an opaque
+/// path-keyed ref, so the literal-vs-computed heuristic can't drift between the risk-
+/// emission use here and the ref-emission use there.
+pub(crate) fn is_computed_path(word: &ast::Word) -> bool {
     word.value.contains('$')
 }
 
