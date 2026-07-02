@@ -30,6 +30,9 @@
 //!      block-level redirect (`{ …; } > out.log`) is the second tuple element, not nested
 //!      inside `CompoundCommand`.
 
+pub mod functions;
+pub mod walk;
+
 /// Parse a shell script into a brush-parser AST, or a diagnostic string.
 ///
 /// Never panics: tokenizer and parser errors are both mapped to `Err`.
