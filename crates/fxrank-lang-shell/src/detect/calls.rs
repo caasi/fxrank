@@ -674,8 +674,10 @@ fn is_bare_var_expansion(value: &str) -> bool {
 /// `true` for a `net.fs.db`/7 command whose operands make it destructive (spec §6):
 /// `rm` with a recursive short-flag cluster (`-r`/`-rf`/`-R`/…), `chmod -R`/`chown -R`,
 /// and the inherently-destructive `dd`/`shred` (no flag needed — both overwrite/wipe by
-/// design).
-fn is_destructive_fs(name: &str, args: &[&ast::Word]) -> bool {
+/// design). `pub(crate)` — `detect/risk.rs` (Task 9) reuses this exact rule for its
+/// `DestructiveFs` risk rather than re-deriving it, so the recursive-flag heuristic can't
+/// drift between the confidence-delta use here and the risk-emission use there.
+pub(crate) fn is_destructive_fs(name: &str, args: &[&ast::Word]) -> bool {
     match name {
         "rm" => args
             .iter()
