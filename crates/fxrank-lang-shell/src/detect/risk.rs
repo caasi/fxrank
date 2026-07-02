@@ -107,8 +107,12 @@ fn detect_command_site(sc: &ast::SimpleCommand, path: &str, out: &mut Vec<RiskFe
 
 /// A pipeline's adjacent-stage scan for the plain (non-substitution) form of
 /// download-piped-to-shell: a net-fetch stage immediately followed by a shell-interpreter
-/// stage, anywhere in `pipe.seq` (not just a two-stage pipeline — `curl … | tee f | sh`
-/// still has the qualifying adjacent pair).
+/// stage, anywhere in `pipe.seq` (not just a two-stage pipeline — a net-fetch stage
+/// directly followed by a shell-interpreter stage is caught no matter where in a longer
+/// pipeline it occurs, e.g. `curl … | sh | wc`). This is literal-adjacency only —
+/// `windows(2)` sees `(curl, tee)` and `(tee, sh)`, so `curl … | tee f | sh` does NOT
+/// qualify (a `tee`-relay breaks the adjacent pair); real data-flow tracking through
+/// intermediate stages is a Milestone-B item.
 fn detect_pipeline(pipe: &ast::Pipeline, path: &str, out: &mut Vec<RiskFeature>) {
     for pair in pipe.seq.windows(2) {
         let [a, b] = pair else { continue };

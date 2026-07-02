@@ -564,6 +564,29 @@ fn file_taking_option(name: &str, flag: &str) -> bool {
     )
 }
 
+/// Option flags that take a following value argument that is NOT a file (a count, a
+/// field/key spec, a buffer size, …) — the value word must still be CONSUMED so
+/// [`has_file_operand`] doesn't mistake it for a file operand: `sort -k 2` (a key spec)
+/// and `head -n 5` (a line count) name no file at all. Distinct from
+/// [`file_taking_option`], whose flags name a real file (`sort -o out`). Best-effort,
+/// same spirit as [`file_taking_option`]: only these common flags are recognized; any
+/// other flag is skipped without consuming a value (an accepted heuristic edge).
+fn non_file_value_option(name: &str, flag: &str) -> bool {
+    matches!(
+        (name, flag),
+        ("sort", "-k")
+            | ("sort", "-t")
+            | ("sort", "-S")
+            | ("head", "-n")
+            | ("head", "-c")
+            | ("tail", "-n")
+            | ("tail", "-c")
+            | ("uniq", "-f")
+            | ("uniq", "-w")
+            | ("uniq", "-s")
+    )
+}
+
 /// Index of the first POSITIONAL that is a file operand — earlier positionals are the
 /// tool's own pattern/program (`grep PAT`, `sed SCRIPT`, `awk PROG`); every other FILTER
 /// tool's first positional is already a file.
@@ -597,9 +620,11 @@ fn classify_conditional(name: &str, args: &[&ast::Word]) -> Option<(EffectKind, 
 /// `None` when arity can't be decided: a candidate positional exists but every one is a
 /// bare `$var`/`${var}` expansion (its runtime value is unknown, so it might expand to a
 /// filename or to nothing). Best-effort: option-argument consumption is only recognized
-/// for [`file_taking_option`]'s known flags; any other short/long flag is skipped without
-/// consuming a following word (an accepted heuristic edge, matching the spec's
-/// "operand-vs-flag detection is best-effort" note).
+/// for [`file_taking_option`]'s and [`non_file_value_option`]'s known flags; any other
+/// short/long flag is skipped without consuming a following word (an accepted heuristic
+/// edge, matching the spec's "operand-vs-flag detection is best-effort" note). Without
+/// the [`non_file_value_option`] table a value like `sort -k 2`'s `2` or `head -n 5`'s `5`
+/// would be misread as a file operand (its own word is never consumed by the flag).
 fn has_file_operand(name: &str, args: &[&ast::Word]) -> Option<bool> {
     let threshold = first_file_positional(name);
     let mut positional_idx = 0usize;
@@ -610,6 +635,10 @@ fn has_file_operand(name: &str, args: &[&ast::Word]) -> Option<bool> {
         if is_flag(value) {
             if file_taking_option(name, value) && i + 1 < args.len() {
                 return Some(true);
+            }
+            if non_file_value_option(name, value) {
+                i += if i + 1 < args.len() { 2 } else { 1 };
+                continue;
             }
             i += 1;
             continue;
@@ -833,6 +862,20 @@ mod tests {
         assert!(kinds("grep -f pats\n").contains(&(EffectKind::NetFsDb, 7)));
         // read from real input is class 7; here-string fed read is NOT (Task 7 wires <<<; here bare read)
         assert!(kinds("read x\n").contains(&(EffectKind::NetFsDb, 7)));
+    }
+
+    #[test]
+    fn non_file_value_option_is_consumed_not_read_as_a_file() {
+        // sort -k 2 (a key spec): "2" is the -k value, not a file operand → no fs effect.
+        assert!(kinds("sort -k 2\n").is_empty());
+        // head -n 5 (a line count): "5" is the -n value, not a file operand → no fs effect.
+        assert!(kinds("head -n 5\n").is_empty());
+        // head -n 5 f.txt: f.txt is a real, un-consumed file operand → fs effect.
+        assert!(kinds("head -n 5 f.txt\n").contains(&(EffectKind::NetFsDb, 7)));
+        // sort -o out: -o's value IS a file (file_taking_option), unlike -k/-t/-S → fs effect.
+        assert!(kinds("sort -o out\n").contains(&(EffectKind::NetFsDb, 7)));
+        // tail -n 5 x: "5" is consumed by -n, "x" is the real file operand → fs effect.
+        assert!(kinds("tail -n 5 x\n").contains(&(EffectKind::NetFsDb, 7)));
     }
 
     #[test]

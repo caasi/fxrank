@@ -720,7 +720,7 @@ fn dispatch_shell(sources: Vec<SourceFile>, _include_tests: bool) -> FrontendOut
         output.diagnostics.push(Diagnostic {
             path: src.path,
             parsed: false,
-            error: "shell feature not enabled".into(),
+            error: "no frontend available for .sh/.bash (built without 'shell' feature)".into(),
         });
     }
     output
