@@ -45,6 +45,12 @@ pub struct Imports {
     /// e.g. `from . import sibling` → level 1, `from .. import x` → level 2.
     /// Plain `import` and absolute `from m import n` do not appear here.
     relative_levels: HashMap<String, usize>,
+    /// Local names bound by a plain `import` statement (`import os`,
+    /// `import a.b.c`, `import numpy as np`) — i.e. names that denote a **module**.
+    /// `from m import n` names are NOT here (they bind an arbitrary member that may
+    /// be a mutable object). Used to tell a method call on an immutable module
+    /// (`os.remove()`) from one on a possibly-mutable imported object (#50).
+    module_imports: HashSet<String>,
     /// `true` when `importlib` or `__import__` appears as an imported name.
     dynamic: bool,
 }
@@ -61,13 +67,21 @@ impl Imports {
     pub fn build(module: &Module) -> Self {
         let mut table: HashMap<String, String> = HashMap::new();
         let mut relative_levels: HashMap<String, usize> = HashMap::new();
+        let mut module_imports: HashSet<String> = HashSet::new();
         let mut dynamic = false;
         for stmt in &module.body {
-            collect_stmt(stmt, &mut table, &mut relative_levels, &mut dynamic);
+            collect_stmt(
+                stmt,
+                &mut table,
+                &mut relative_levels,
+                &mut module_imports,
+                &mut dynamic,
+            );
         }
         Self {
             table,
             relative_levels,
+            module_imports,
             dynamic,
         }
     }
@@ -84,6 +98,15 @@ impl Imports {
     /// Returns `false` for absolute imports and unknown names.
     pub fn is_relative(&self, local: &str) -> bool {
         self.relative_levels.contains_key(local)
+    }
+
+    /// `true` when `local` was bound by a plain `import` statement — i.e. it
+    /// denotes a **module** (`os`, `a.b.c`, aliased `np`), not a member pulled in
+    /// by `from m import n`. A mutating-method call on a module never mutates the
+    /// module itself, so this gates the #50 mutation-suppression to modules only
+    /// (a `from`-imported name may be a mutable object and keeps its signal).
+    pub fn is_module_import(&self, local: &str) -> bool {
+        self.module_imports.contains(local)
     }
 
     /// The dot-level of a relative import's local name (`from.relative.len()`).
@@ -109,15 +132,18 @@ fn collect_stmt(
     stmt: &Statement,
     table: &mut HashMap<String, String>,
     relative_levels: &mut HashMap<String, usize>,
+    module_imports: &mut HashSet<String>,
     dynamic: &mut bool,
 ) {
     match stmt {
         Statement::Simple(line) => {
             for small in &line.body {
-                collect_small(small, table, relative_levels, dynamic);
+                collect_small(small, table, relative_levels, module_imports, dynamic);
             }
         }
-        Statement::Compound(c) => collect_compound(c, table, relative_levels, dynamic),
+        Statement::Compound(c) => {
+            collect_compound(c, table, relative_levels, module_imports, dynamic)
+        }
     }
 }
 
@@ -125,17 +151,18 @@ fn collect_suite(
     suite: &Suite,
     table: &mut HashMap<String, String>,
     relative_levels: &mut HashMap<String, usize>,
+    module_imports: &mut HashSet<String>,
     dynamic: &mut bool,
 ) {
     match suite {
         Suite::IndentedBlock(b) => {
             for stmt in &b.body {
-                collect_stmt(stmt, table, relative_levels, dynamic);
+                collect_stmt(stmt, table, relative_levels, module_imports, dynamic);
             }
         }
         Suite::SimpleStatementSuite(s) => {
             for small in &s.body {
-                collect_small(small, table, relative_levels, dynamic);
+                collect_small(small, table, relative_levels, module_imports, dynamic);
             }
         }
     }
@@ -145,59 +172,64 @@ fn collect_compound(
     c: &CompoundStatement,
     table: &mut HashMap<String, String>,
     relative_levels: &mut HashMap<String, usize>,
+    module_imports: &mut HashSet<String>,
     dynamic: &mut bool,
 ) {
     match c {
         CompoundStatement::FunctionDef(d) => {
-            collect_suite(&d.body, table, relative_levels, dynamic)
+            collect_suite(&d.body, table, relative_levels, module_imports, dynamic)
         }
-        CompoundStatement::ClassDef(d) => collect_suite(&d.body, table, relative_levels, dynamic),
+        CompoundStatement::ClassDef(d) => {
+            collect_suite(&d.body, table, relative_levels, module_imports, dynamic)
+        }
         CompoundStatement::If(i) => {
-            collect_suite(&i.body, table, relative_levels, dynamic);
+            collect_suite(&i.body, table, relative_levels, module_imports, dynamic);
             if let Some(orelse) = &i.orelse {
-                collect_orelse(orelse, table, relative_levels, dynamic);
+                collect_orelse(orelse, table, relative_levels, module_imports, dynamic);
             }
         }
         CompoundStatement::For(f) => {
-            collect_suite(&f.body, table, relative_levels, dynamic);
+            collect_suite(&f.body, table, relative_levels, module_imports, dynamic);
             if let Some(e) = &f.orelse {
-                collect_suite(&e.body, table, relative_levels, dynamic);
+                collect_suite(&e.body, table, relative_levels, module_imports, dynamic);
             }
         }
         CompoundStatement::While(w) => {
-            collect_suite(&w.body, table, relative_levels, dynamic);
+            collect_suite(&w.body, table, relative_levels, module_imports, dynamic);
             if let Some(e) = &w.orelse {
-                collect_suite(&e.body, table, relative_levels, dynamic);
+                collect_suite(&e.body, table, relative_levels, module_imports, dynamic);
             }
         }
         CompoundStatement::Try(t) => {
-            collect_suite(&t.body, table, relative_levels, dynamic);
+            collect_suite(&t.body, table, relative_levels, module_imports, dynamic);
             for h in &t.handlers {
-                collect_suite(&h.body, table, relative_levels, dynamic);
+                collect_suite(&h.body, table, relative_levels, module_imports, dynamic);
             }
             if let Some(e) = &t.orelse {
-                collect_suite(&e.body, table, relative_levels, dynamic);
+                collect_suite(&e.body, table, relative_levels, module_imports, dynamic);
             }
             if let Some(e) = &t.finalbody {
-                collect_suite(&e.body, table, relative_levels, dynamic);
+                collect_suite(&e.body, table, relative_levels, module_imports, dynamic);
             }
         }
         CompoundStatement::TryStar(t) => {
-            collect_suite(&t.body, table, relative_levels, dynamic);
+            collect_suite(&t.body, table, relative_levels, module_imports, dynamic);
             for h in &t.handlers {
-                collect_suite(&h.body, table, relative_levels, dynamic);
+                collect_suite(&h.body, table, relative_levels, module_imports, dynamic);
             }
             if let Some(e) = &t.orelse {
-                collect_suite(&e.body, table, relative_levels, dynamic);
+                collect_suite(&e.body, table, relative_levels, module_imports, dynamic);
             }
             if let Some(e) = &t.finalbody {
-                collect_suite(&e.body, table, relative_levels, dynamic);
+                collect_suite(&e.body, table, relative_levels, module_imports, dynamic);
             }
         }
-        CompoundStatement::With(w) => collect_suite(&w.body, table, relative_levels, dynamic),
+        CompoundStatement::With(w) => {
+            collect_suite(&w.body, table, relative_levels, module_imports, dynamic)
+        }
         CompoundStatement::Match(m) => {
             for case in &m.cases {
-                collect_suite(&case.body, table, relative_levels, dynamic);
+                collect_suite(&case.body, table, relative_levels, module_imports, dynamic);
             }
         }
     }
@@ -207,24 +239,27 @@ fn collect_orelse(
     orelse: &OrElse,
     table: &mut HashMap<String, String>,
     relative_levels: &mut HashMap<String, usize>,
+    module_imports: &mut HashSet<String>,
     dynamic: &mut bool,
 ) {
     match orelse {
         OrElse::Elif(elif) => {
-            collect_suite(&elif.body, table, relative_levels, dynamic);
+            collect_suite(&elif.body, table, relative_levels, module_imports, dynamic);
             if let Some(inner) = &elif.orelse {
-                collect_orelse(inner, table, relative_levels, dynamic);
+                collect_orelse(inner, table, relative_levels, module_imports, dynamic);
             }
         }
-        OrElse::Else(e) => collect_suite(&e.body, table, relative_levels, dynamic),
+        OrElse::Else(e) => collect_suite(&e.body, table, relative_levels, module_imports, dynamic),
     }
 }
 
-/// Record imports from a single small statement into `table` / `relative_levels` / `dynamic`.
+/// Record imports from a single small statement into `table` / `relative_levels`
+/// / `module_imports` / `dynamic`.
 fn collect_small(
     small: &SmallStatement,
     table: &mut HashMap<String, String>,
     relative_levels: &mut HashMap<String, usize>,
+    module_imports: &mut HashSet<String>,
     dynamic: &mut bool,
 ) {
     match small {
@@ -243,6 +278,10 @@ fn collect_small(
                     // bare `import a.b.c` — local key is root component
                     root_component(&path)
                 };
+                // A plain `import` binds a MODULE — record it so a mutating-method
+                // call on it (`os.remove()`) can be told from a call on a possibly
+                // -mutable `from`-imported object (#50).
+                module_imports.insert(local.clone());
                 table.insert(local, path);
                 // Plain `import` is never relative — no dots needed here.
             }
@@ -472,6 +511,30 @@ mod tests {
         let i = build_str("import a.b.c\n");
         assert_eq!(i.resolve("a"), Some("a.b.c"));
         assert_eq!(i.resolve("a.b.c"), None);
+    }
+
+    #[test]
+    fn is_module_import_distinguishes_import_from_from_import() {
+        let i = build_str(
+            "import os\nimport numpy as np\nimport a.b.c\nfrom cfg import CACHE\nfrom . import sib\n",
+        );
+        // Plain `import` statements bind modules:
+        assert!(i.is_module_import("os"), "import os → module");
+        assert!(i.is_module_import("np"), "import numpy as np → module");
+        assert!(
+            i.is_module_import("a"),
+            "import a.b.c → root `a` is a module"
+        );
+        // `from … import name` binds an arbitrary member, not a module:
+        assert!(
+            !i.is_module_import("CACHE"),
+            "from cfg import CACHE → not a module"
+        );
+        assert!(
+            !i.is_module_import("sib"),
+            "from . import sib → not a module"
+        );
+        assert!(!i.is_module_import("unknown"), "unknown name → false");
     }
 
     #[test]

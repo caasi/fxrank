@@ -54,7 +54,7 @@ use swc_ecma_ast::{
 use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::functions::{FnBodyOwned, FnSig};
-use crate::imports::ImportTable;
+use crate::imports::{ImportTable, ImportTarget};
 use crate::source::SpanLines;
 
 /// Detect mutation effects in `body`, classifying each write by escape analysis.
@@ -270,13 +270,21 @@ impl<'a> MutationWalker<'a> {
     }
 
     /// #50: `true` when `expr` is a bare identifier (modulo paren / TS wrappers)
-    /// that resolves through the ES import table — a namespace / default / named
-    /// import. A method call on such a receiver targets the (immutable) module
-    /// binding, so it is not a mutation of the receiver.
-    fn is_bare_imported_ident(&self, expr: &Expr) -> bool {
+    /// that is a **namespace import** (`import * as V`) and is not shadowed by a
+    /// closer binding. An ES module namespace object is immutable, so a method
+    /// call on it is never a mutation of the receiver. Only namespace imports
+    /// qualify: a `default` / `named` import — or a CommonJS `const v =
+    /// require(...)` (recorded as `Default`) — binds a possibly-mutable object, so
+    /// `v.push(x)` keeps its `global.mutation` signal. The shadow guard mirrors
+    /// `classify`'s locals/params-before-imports precedence, so a param/local that
+    /// shadows the import name still classifies normally instead of being dropped.
+    fn is_bare_namespace_import(&self, expr: &Expr) -> bool {
         matches!(
             strip_place_wrappers(expr),
-            Expr::Ident(id) if self.imports.resolve(&id.sym).is_some()
+            Expr::Ident(id)
+                if !self.locals.contains(id.sym.as_ref())
+                    && !self.params.contains(id.sym.as_ref())
+                    && matches!(self.imports.import_target(&id.sym), Some(ImportTarget::Namespace))
         )
     }
 }
@@ -369,14 +377,14 @@ impl Visit for MutationWalker<'_> {
             && let Expr::Member(MemberExpr { obj, prop, .. }) = callee.as_ref()
             && let MemberProp::Ident(method) = prop
             && is_mutating_method(&method.sym)
-            // #50: a method call whose receiver is a bare imported name is a call
-            // on an immutable ES module namespace (`V.add()`), not a mutation of it
-            // — the effect belongs to the callee. Only bare imported idents are
-            // suppressed; a module-level binding (`m.set()`, indistinguishable from
-            // the #29 module-shared case) and deeper member receivers still record a
-            // write. (Accepted FN: `import cache from './c'; cache.push(x)` — a
-            // mutable default import — is also suppressed.)
-            && !self.is_bare_imported_ident(obj)
+            // #50: a method call whose receiver is a bare **namespace import**
+            // (`import * as V; V.add()`) is a call on an immutable ES module
+            // namespace, not a mutation of it — the effect belongs to the callee.
+            // Only namespace imports are suppressed; a module-level binding
+            // (`m.set()`, indistinguishable from the #29 module-shared case), a
+            // default/named/`require` import (a possibly-mutable object), and deeper
+            // member receivers all still record a write.
+            && !self.is_bare_namespace_import(obj)
         {
             let (line, col) = self.lines.line_col(node.span);
             self.record_write(obj, line, col, &format!(".{} on", method.sym), false);
@@ -1035,6 +1043,42 @@ mod tests {
                 .any(|(e, _)| e.kind == EffectKind::GlobalMutation),
             "m.set() on a module-level binding must stay GlobalMutation, got: {:?}",
             kept.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// #50 regression (local review): the namespace-import suppression must respect
+    /// `classify`'s locals/params-before-imports precedence, and must not swallow a
+    /// default / named / `require` import (a possibly-mutable object).
+    #[test]
+    fn method_call_suppression_respects_shadowing_and_non_namespace_imports() {
+        // A param shadows the namespace-import name → the param mutation must survive.
+        let shadowed = detect_in_fn(
+            "import * as V from 'vecmath'; function f(V) { V.push(1); }",
+            "f",
+        );
+        assert!(
+            shadowed
+                .iter()
+                .any(|(e, _)| e.kind == EffectKind::ParamMutation),
+            "a param `V` shadowing `import * as V` must stay ParamMutation, got: {:?}",
+            shadowed.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+
+        // A default import binds a possibly-mutable object → keep global.mutation
+        // (only namespace imports are suppressed). Same for `require` (Default).
+        let default_import = detect_in_fn(
+            "import cache from './cache'; function g() { cache.set('k', 1); }",
+            "g",
+        );
+        assert!(
+            default_import
+                .iter()
+                .any(|(e, _)| e.kind == EffectKind::GlobalMutation),
+            "default-import `cache.set()` must stay GlobalMutation, got: {:?}",
+            default_import
+                .iter()
+                .map(|(e, _)| e.kind)
+                .collect::<Vec<_>>()
         );
     }
 

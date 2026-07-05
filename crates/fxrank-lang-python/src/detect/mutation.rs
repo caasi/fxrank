@@ -393,18 +393,28 @@ impl EffectSink for MutSink<'_> {
         if !is_mutating_method(attr.attr.value) {
             return;
         }
-        // #50: a method call whose receiver is a **bare imported name** is a call
-        // on a module / namespace (`os.remove()`, a namespace import `V.add()`),
-        // not a mutation of that name — the effect, if any, belongs to the callee
-        // and is scored by the call detector. Only bare names are suppressed: an
-        // *attribute* receiver reached through an import (`config.settings.append()`)
-        // still mutates module-shared state and stays a global.mutation. (Accepted
-        // FN: `from cfg import CACHE; CACHE.append(x)` — a mutable object imported by
-        // name — is also suppressed, the tolerated cost of killing the dominant FP.)
-        if let Expression::Name(recv) = attr.value.as_ref()
-            && self.imports.resolve(recv.value).is_some()
-        {
-            return;
+        // #50: a mutating-method call whose receiver is a bare imported **module**
+        // name (`os.remove()`) is a call on the module, not a mutation of it — the
+        // effect belongs to the callee and is scored by the call detector. Suppress
+        // it, but only when the name genuinely resolves to the module here:
+        //   - it must NOT be shadowed by a closer binding (a param/local/global/
+        //     nonlocal named `os` wins per Python scoping — `classify_and_push`
+        //     checks those before the import arm, so the gate must respect the same
+        //     precedence or it drops a real mutation);
+        //   - it must be a plain `import` (a module), NOT a `from m import n` name
+        //     (which may bind a mutable object — `from cfg import CACHE;
+        //     CACHE.append(x)` stays a global.mutation).
+        // An *attribute* receiver reached through an import (`config.settings.append()`)
+        // still mutates module-shared state and stays a global.mutation.
+        if let Expression::Name(recv) = attr.value.as_ref() {
+            let name = recv.value;
+            let shadowed = self.params.contains(name)
+                || self.locals.contains(name)
+                || self.globals.contains(name)
+                || self.nonlocals.contains(name);
+            if !shadowed && self.imports.is_module_import(name) {
+                return;
+            }
         }
         // The receiver's root name is the write target.
         let Some(root) = root_name_of_expr(&attr.value) else {
@@ -1135,6 +1145,35 @@ mod tests {
             pairs4.iter().any(|(e, c)| e.kind == GlobalMutation && !*c),
             "SHARED.append() on a module-level binding must stay GlobalMutation, got: {:?}",
             pairs4.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// #50 regression (local review): the module-import suppression must respect
+    /// Python binding precedence (a param/local shadowing the module name wins) and
+    /// must not swallow a `from`-imported name (which may bind a mutable object).
+    #[test]
+    fn method_call_suppression_respects_shadowing_and_from_imports() {
+        // A param shadows the imported module name → the param mutation must survive
+        // (not be dropped by the import gate).
+        let shadowed = detect_src("import os\ndef f(os):\n    os.append(1)\n", "f");
+        assert!(
+            shadowed.iter().any(|(e, _)| e.kind == ParamMutation),
+            "a param `os` shadowing `import os` must stay ParamMutation, got: {:?}",
+            shadowed.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+
+        // A `from`-imported name may be a mutable object → keep global.mutation
+        // (only plain `import module` receivers are suppressed).
+        let from_import = detect_src(
+            "from cfg import CACHE\ndef f():\n    CACHE.append(1)\n",
+            "f",
+        );
+        assert!(
+            from_import
+                .iter()
+                .any(|(e, c)| e.kind == GlobalMutation && !*c),
+            "from-imported `CACHE.append()` must stay GlobalMutation, got: {:?}",
+            from_import.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
         );
     }
 
