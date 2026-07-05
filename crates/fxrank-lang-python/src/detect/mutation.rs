@@ -393,6 +393,29 @@ impl EffectSink for MutSink<'_> {
         if !is_mutating_method(attr.attr.value) {
             return;
         }
+        // #50: a mutating-method call whose receiver is a bare imported **module**
+        // name (`os.remove()`) is a call on the module, not a mutation of it — the
+        // effect belongs to the callee and is scored by the call detector. Suppress
+        // it, but only when the name genuinely resolves to the module here:
+        //   - it must NOT be shadowed by a closer binding (a param/local/global/
+        //     nonlocal named `os` wins per Python scoping — `classify_and_push`
+        //     checks those before the import arm, so the gate must respect the same
+        //     precedence or it drops a real mutation);
+        //   - it must be a plain `import` (a module), NOT a `from m import n` name
+        //     (which may bind a mutable object — `from cfg import CACHE;
+        //     CACHE.append(x)` stays a global.mutation).
+        // An *attribute* receiver reached through an import (`config.settings.append()`)
+        // still mutates module-shared state and stays a global.mutation.
+        if let Expression::Name(recv) = attr.value.as_ref() {
+            let name = recv.value;
+            let shadowed = self.params.contains(name)
+                || self.locals.contains(name)
+                || self.globals.contains(name)
+                || self.nonlocals.contains(name);
+            if !shadowed && self.imports.is_module_import(name) {
+                return;
+            }
+        }
         // The receiver's root name is the write target.
         let Some(root) = root_name_of_expr(&attr.value) else {
             return;
@@ -1075,6 +1098,118 @@ mod tests {
         assert!(
             !pairs.iter().any(|(e, _)| e.kind == HiddenMutation),
             "module-level content mutation must not be hidden.mutation"
+        );
+    }
+
+    /// #50: a mutating-method CALL whose receiver is a **bare imported name**
+    /// (`os.remove()`, a namespace import `V.add()`) is a call on a module /
+    /// namespace, not a mutation of it. It must NOT escalate to global.mutation
+    /// (the effect, if any, is the callee's — already scored by the call detector).
+    #[test]
+    fn method_call_on_bare_imported_name_is_not_mutation() {
+        // `os.remove(...)` — receiver is the bare imported module `os`.
+        let pairs = detect_src("import os\ndef f():\n    os.remove(\"x\")\n", "f");
+        assert!(
+            !pairs.iter().any(|(e, _)| e.kind == GlobalMutation),
+            "os.remove() must not emit GlobalMutation (call on an imported module), got: {:?}",
+            pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+
+        // Namespace import used as a pure-math helper: `import vecmath as V; V.add(a, b)`.
+        let pairs2 = detect_src(
+            "import vecmath as V\ndef g(a, b):\n    return V.add(a, b)\n",
+            "g",
+        );
+        assert!(
+            !pairs2.iter().any(|(e, _)| e.kind == GlobalMutation),
+            "V.add() on a namespace import must not emit GlobalMutation, got: {:?}",
+            pairs2.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+
+        // BOUNDARY (must stay a true positive): a method call on an *attribute*
+        // reached through an imported module mutates module-shared state.
+        let pairs3 = detect_src(
+            "import config\ndef h():\n    config.settings.append(1)\n",
+            "h",
+        );
+        assert!(
+            pairs3.iter().any(|(e, c)| e.kind == GlobalMutation && !*c),
+            "config.settings.append() must stay GlobalMutation (module-shared state), got: {:?}",
+            pairs3.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+
+        // BOUNDARY (must stay a true positive): a bare *module-level binding*
+        // (not an import) mutated by content is module-shared state.
+        let pairs4 = detect_src("SHARED = []\ndef k():\n    SHARED.append(1)\n", "k");
+        assert!(
+            pairs4.iter().any(|(e, c)| e.kind == GlobalMutation && !*c),
+            "SHARED.append() on a module-level binding must stay GlobalMutation, got: {:?}",
+            pairs4.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// #50 regression (local review): the module-import suppression must respect
+    /// Python binding precedence (a param/local shadowing the module name wins) and
+    /// must not swallow a `from`-imported name (which may bind a mutable object).
+    #[test]
+    fn method_call_suppression_respects_shadowing_and_from_imports() {
+        // A param shadows the imported module name → the param mutation must survive
+        // (not be dropped by the import gate).
+        let shadowed = detect_src("import os\ndef f(os):\n    os.append(1)\n", "f");
+        assert!(
+            shadowed.iter().any(|(e, _)| e.kind == ParamMutation),
+            "a param `os` shadowing `import os` must stay ParamMutation, got: {:?}",
+            shadowed.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+
+        // A LOCAL binding shadows the imported module name → local.mutation, not
+        // suppressed (the pre-scan marks `os` local for the whole function).
+        let local_shadow = detect_src("import os\ndef f():\n    os = []\n    os.append(1)\n", "f");
+        assert!(
+            local_shadow.iter().any(|(e, _)| e.kind == LocalMutation),
+            "a local `os` shadowing `import os` must stay LocalMutation, got: {:?}",
+            local_shadow.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+
+        // A `from`-imported name may be a mutable object → keep global.mutation
+        // (only plain `import module` receivers are suppressed).
+        let from_import = detect_src(
+            "from cfg import CACHE\ndef f():\n    CACHE.append(1)\n",
+            "f",
+        );
+        assert!(
+            from_import
+                .iter()
+                .any(|(e, c)| e.kind == GlobalMutation && !*c),
+            "from-imported `CACHE.append()` must stay GlobalMutation, got: {:?}",
+            from_import.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// Characterization test — ACCEPTED LIMITATION, not desired behavior (#78).
+    ///
+    /// `Imports` is a single file-wide, flat table (a documented over-approximation:
+    /// an import in one function resolves same-named calls in another). So a
+    /// function-local `import x as NAME` in one function marks `NAME` a module for
+    /// the WHOLE file, and the #50 suppression then drops another function's
+    /// `NAME.<mut>()` — turning the flat table's pre-existing mis-resolution from a
+    /// *mis-classified* mutation into a *dropped* one. The precise fix is
+    /// scope-aware import resolution (deferred, #78 / spec 025 §13a); when it lands,
+    /// this test should flip to assert `GlobalMutation`. Pinned here so the
+    /// behavior change is deliberate, not silent. The trigger is contrived (the
+    /// same short name bound as a module alias in one function and a `from`-imported
+    /// mutable at module scope).
+    #[test]
+    fn cross_function_flat_import_collision_drops_signal_accepted_limitation() {
+        let src = "from cfg import CACHE\n\
+                   def f():\n    CACHE.append(1)\n\
+                   def g():\n    import os as CACHE\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            !pairs.iter().any(|(e, _)| e.kind == GlobalMutation),
+            "accepted limitation (#78): `g`'s local `import os as CACHE` pollutes the \
+             file-wide table so `f`'s CACHE.append() is currently dropped; got: {:?}",
+            pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
         );
     }
 

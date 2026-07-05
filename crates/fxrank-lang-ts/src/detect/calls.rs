@@ -10,10 +10,13 @@
 //! `SourceMap` that parsed the file) to resolve each effect's line.
 //!
 //! **Bare globals classify without imports.** `fetch`, `Date`, `Math`,
-//! `console`, and `process` are ambient globals — never in the `ImportTable` —
-//! so they match on rendered name alone. `imports` is consulted only to map a
-//! bare imported name (`readFile` from `node:fs`) back to its module for fs/db
-//! classification.
+//! `console`, `process`, and the web-global IO APIs (`localStorage` /
+//! `sessionStorage` / `indexedDB` / `navigator.sendBeacon`) are ambient globals
+//! — never in the `ImportTable` — so they match on rendered name alone. A leading
+//! global-object alias (`window.` / `globalThis.`) is canonicalized away first,
+//! so `window.localStorage.setItem` classifies like the bare `localStorage.setItem`.
+//! `imports` is consulted only to map a bare imported name (`readFile` from
+//! `node:fs`) back to its module for fs/db classification.
 //!
 //! NOTE: namespace-import member calls (`import * as fs from 'node:fs';
 //! fs.readFile()`) are NOT resolved through `imports` yet — only bare
@@ -142,6 +145,13 @@ impl CallWalker<'_> {
     fn classify_call(&self, rendered: &str) -> Option<(EffectKind, Tier)> {
         use EffectKind::*;
 
+        // A member access through a global-object alias (`window.localStorage`,
+        // `globalThis.fetch`) refers to the SAME ambient global as the bare name,
+        // so canonicalize the alias away before matching — qualified and bare forms
+        // classify identically (Copilot PR #79). Applies uniformly to every ambient
+        // global below (fetch/console/Date/…), not just web storage.
+        let rendered = strip_global_object_prefix(rendered);
+
         // --- Bare global idents (no `.`) -------------------------------------
         // net.fs.db — fetch only; XMLHttpRequest/WebSocket/EventSource are
         // constructors (NewExpr) and are classified in visit_new_expr.
@@ -154,6 +164,19 @@ impl CallWalker<'_> {
             // `console.<anything>` → logging.
             if obj == "console" {
                 return Some((Logging, Tier::Path));
+            }
+            // `localStorage.*` / `sessionStorage.*` / `indexedDB.*` → net.fs.db.
+            // Implicit web globals (never imported): synchronous (Web Storage) or
+            // async (IndexedDB) persistent client stores — persistent/external
+            // stores equivalent to fs/db (spec 003 net.fs.db row). Reads and
+            // writes both count, as fs `open()` is c7 regardless of direction.
+            if matches!(obj, "localStorage" | "sessionStorage" | "indexedDB") {
+                return Some((NetFsDb, Tier::Path));
+            }
+            // `navigator.sendBeacon(url, data)` posts data to a URL — a network
+            // write (spec 003 net.fs.db row).
+            if obj == "navigator" && method == "sendBeacon" {
+                return Some((NetFsDb, Tier::Path));
             }
             // `Date.now()` → time.read.
             if obj == "Date" && method == "now" {
@@ -244,6 +267,36 @@ fn classify_method_call(method: &str) -> Option<(EffectKind, Tier)> {
     }
 }
 
+/// Global-object aliases that denote the global scope. A member access through
+/// one (`window.localStorage`, `globalThis.fetch`) is the same ambient global as
+/// the bare name, so [`classify_call`] strips the alias before matching. The strip
+/// is **shadow-unaware** — consistent with this detector's existing model, where
+/// bare ambient globals already match by name with shadowing accepted (a call in
+/// `fn f(fetch) { fetch() }` is already classified today). A param literally named
+/// `window`/`globalThis` is vanishingly rare, so that accepted FP stays negligible.
+///
+/// `self` is deliberately NOT in this set: unlike `window`/`globalThis` it is
+/// *commonly* a local (the classic `var self = this` idiom), so stripping it would
+/// turn a frequent pattern into a false positive. A worker's `self.localStorage`
+/// is the accepted miss. (Canonicalization is applied only to call callees in
+/// `classify_call`; qualified `new window.WebSocket()` and `globalThis.process.env.X`
+/// reads are not canonicalized — rarer forms, accepted misses.)
+const GLOBAL_OBJECT_ALIASES: [&str; 2] = ["window", "globalThis"];
+
+/// Strip a single leading global-object alias (`window.` / `globalThis.`) so a
+/// qualified global access canonicalizes to the bare ambient global. Returns the
+/// input unchanged when no alias prefixes it.
+fn strip_global_object_prefix(rendered: &str) -> &str {
+    for alias in GLOBAL_OBJECT_ALIASES {
+        if let Some(rest) = rendered.strip_prefix(alias)
+            && let Some(after) = rest.strip_prefix('.')
+        {
+            return after;
+        }
+    }
+    rendered
+}
+
 /// Whether a module specifier denotes node's filesystem API.
 fn is_fs_db_module(module: &str) -> bool {
     matches!(
@@ -282,6 +335,88 @@ mod tests {
         assert!(k.contains(&"net.fs.db".to_string()));
         assert!(k.contains(&"logging".to_string()));
         assert!(k.contains(&"time.read".to_string()));
+    }
+
+    /// #51: implicit web-global IO APIs are never imported, so they were silently
+    /// missed (own_score 0). Per spec 003's net.fs.db row these persistent/external
+    /// client stores + the beacon post all classify net.fs.db. Both a write
+    /// (`setItem`) and a read (`getItem`) count, like fs `open()`.
+    #[test]
+    fn web_global_io_apis_are_net_fs_db() {
+        let src = "function f() { \
+            localStorage.setItem('k','v'); \
+            const x = sessionStorage.getItem('k'); \
+            indexedDB.open('db'); \
+            navigator.sendBeacon('/u', x); \
+        }";
+        let k = kinds(src, "f");
+        assert_eq!(
+            k.iter().filter(|x| *x == "net.fs.db").count(),
+            4,
+            "localStorage/sessionStorage/indexedDB/navigator.sendBeacon must all be net.fs.db, got {k:?}"
+        );
+    }
+
+    /// Copilot PR #79: qualified global-object access (`window.localStorage`,
+    /// `globalThis.indexedDB`, `window.navigator.sendBeacon`, `window.fetch`)
+    /// canonicalizes to the bare ambient global and classifies identically.
+    /// `self.` is intentionally NOT stripped (it is a shadowable local-var name).
+    #[test]
+    fn qualified_web_globals_via_window_or_globalthis() {
+        let src = "function f() { \
+            window.localStorage.setItem('k','v'); \
+            globalThis.indexedDB.open('db'); \
+            window.navigator.sendBeacon('/u', 1); \
+            window.fetch('/x'); \
+        }";
+        let k = kinds(src, "f");
+        assert_eq!(
+            k.iter().filter(|x| *x == "net.fs.db").count(),
+            4,
+            "window./globalThis.-qualified web-global IO must all be net.fs.db, got {k:?}"
+        );
+
+        // `self.` is the accepted miss (FP-safety: `self` may be a local `this` alias).
+        let self_src = "function g() { self.localStorage.setItem('k','v'); }";
+        assert!(
+            !kinds(self_src, "g").contains(&"net.fs.db".to_string()),
+            "self.-qualified access must NOT be classified (excluded alias), got {:?}",
+            kinds(self_src, "g")
+        );
+    }
+
+    /// The global-object canonicalization must not OVER-fire. After stripping a
+    /// `window.`/`globalThis.` prefix the result is fed back through the SAME
+    /// conservative matcher, so an unknown / unmodeled member stays unclassified
+    /// (worst case a false negative, never a false positive), a non-alias
+    /// look-alike prefix (`windowManager.`) is not stripped, and `self` is
+    /// excluded. Guards the strip from silently widening into an FP source.
+    #[test]
+    fn global_object_canonicalization_does_not_overfire() {
+        for src in [
+            // unmodeled global member (setTimeout is not an effect we classify)
+            "function f() { window.setTimeout(() => {}, 0); }",
+            // unknown global member
+            "function f() { window.somethingRandom(); }",
+            // `self` is deliberately not an alias (shadowable `var self = this`)
+            "function f() { self.localStorage.setItem('k','v'); }",
+            // partial-name look-alike: `windowManager` must NOT be stripped to `Manager`
+            "function f() { windowManager.localStorage.setItem('k','v'); }",
+        ] {
+            assert!(
+                kinds(src, "f").is_empty(),
+                "canonicalization must not classify this; src={src:?} got {:?}",
+                kinds(src, "f")
+            );
+        }
+
+        // Consistency: the strip routes to the CORRECT classifier, not a
+        // storage-only special-case — `window.console.log` → logging, not net.fs.db.
+        assert_eq!(
+            kinds("function f() { window.console.log('hi'); }", "f"),
+            vec!["logging".to_string()],
+            "window.console.log must canonicalize to console.log → logging"
+        );
     }
 
     #[test]
