@@ -279,8 +279,8 @@ fn collect_small(
                     root_component(&path)
                 };
                 // A plain `import` binds a MODULE — record it so a mutating-method
-                // call on it (`os.remove()`) can be told from a call on a possibly
-                // -mutable `from`-imported object (#50).
+                // call on it (`os.remove()`) is distinguished from a call on a
+                // `from`-imported object, which may be mutable (#50).
                 module_imports.insert(local.clone());
                 table.insert(local, path);
                 // Plain `import` is never relative — no dots needed here.

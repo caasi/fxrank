@@ -237,7 +237,11 @@ fn classify_resolved(full: &str) -> Option<(EffectKind, Tier)> {
     let leaf = full.rsplit('.').next().unwrap_or(full);
 
     // ── net.fs.db (class 7) ──
-    // Whole-package IO roots: every member is (or wraps) a real fs/net/db op.
+    // Roots still classified whole-package. `requests`/`httpx`/`aiohttp` are
+    // IO-dominant at the root. `tempfile`/`csv`/`socket`/`sqlalchemy` are actually
+    // mixed-purity (pure helpers exist — `csv.reader`, `socket.htons`,
+    // `sqlalchemy.select`), but they were NOT in this fix's validated-FP set, so
+    // member-splitting them (like shutil/urllib/sqlite3 below) is deferred to #63.
     if matches!(root, "tempfile" | "csv" | "socket")
         || matches!(root, "requests" | "httpx" | "aiohttp" | "sqlalchemy")
     {
