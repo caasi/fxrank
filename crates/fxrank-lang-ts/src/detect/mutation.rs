@@ -287,6 +287,22 @@ impl<'a> MutationWalker<'a> {
                     && matches!(self.imports.import_target(&id.sym), Some(ImportTarget::Namespace))
         )
     }
+
+    /// #55/D4: `true` when `expr` is a bare ambient web-storage global
+    /// (`localStorage` / `sessionStorage` / `indexedDB`) that the call detector
+    /// already classifies as `net.fs.db` — modulo shadowing, so a param/local of
+    /// the same name still records its real mutation. A mutating-method call on
+    /// such a global is not a mutation of it, so the mutation walker must not emit
+    /// a captured-binding hidden.mutation for it.
+    fn is_web_global_receiver(&self, expr: &Expr) -> bool {
+        matches!(
+            strip_place_wrappers(expr),
+            Expr::Ident(id)
+                if matches!(id.sym.as_ref(), "localStorage" | "sessionStorage" | "indexedDB")
+                    && !self.locals.contains(id.sym.as_ref())
+                    && !self.params.contains(id.sym.as_ref())
+        )
+    }
 }
 
 /// The result of escape-classifying a write's base ident.
@@ -385,6 +401,12 @@ impl Visit for MutationWalker<'_> {
             // default/named/`require` import (a possibly-mutable object), and deeper
             // member receivers all still record a write.
             && !self.is_bare_namespace_import(obj)
+            // #55/D4: same principle for the ambient web-storage globals whose IO
+            // the call detector already owns (`sessionStorage.clear()` → net.fs.db
+            // there). A mutating call on one is a call on the global, not a
+            // mutation of it — don't also emit a spurious captured-binding
+            // hidden.mutation.
+            && !self.is_web_global_receiver(obj)
         {
             let (line, col) = self.lines.line_col(node.span);
             self.record_write(obj, line, col, &format!(".{} on", method.sym), false);
@@ -1090,6 +1112,41 @@ mod tests {
                 effects.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// D4 (#55): a mutating-method call on a bare ambient web-storage global
+    /// (`sessionStorage.clear()`) is a call on the global — its IO is scored by the
+    /// call detector as net.fs.db — NOT a captured-binding mutation of it. The
+    /// mutation walker must not double-emit a spurious hidden.mutation c3.
+    #[test]
+    fn mutating_call_on_web_global_is_not_a_captured_mutation() {
+        for src in [
+            "function f() { sessionStorage.clear(); }",
+            "function f() { localStorage.clear(); }",
+        ] {
+            let effects = detect_in_fn(src, "f");
+            assert!(
+                effects
+                    .iter()
+                    .all(|(e, _)| e.kind != EffectKind::HiddenMutation),
+                "web-global .clear() must not emit hidden.mutation; src={src:?} got {:?}",
+                effects.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+            );
+        }
+
+        // Shadow boundary: a PARAM named `sessionStorage` is a real param mutation,
+        // kept (the guard checks locals/params first, like the #50 gate).
+        let shadowed = detect_in_fn(
+            "function f(sessionStorage) { sessionStorage.clear(); }",
+            "f",
+        );
+        assert!(
+            shadowed
+                .iter()
+                .any(|(e, _)| e.kind == EffectKind::ParamMutation),
+            "a param named sessionStorage must keep its ParamMutation, got {:?}",
+            shadowed.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
     }
 
     #[test]

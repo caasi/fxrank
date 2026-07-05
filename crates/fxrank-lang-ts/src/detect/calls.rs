@@ -165,12 +165,19 @@ impl CallWalker<'_> {
             if obj == "console" {
                 return Some((Logging, Tier::Path));
             }
-            // `localStorage.*` / `sessionStorage.*` / `indexedDB.*` → net.fs.db.
-            // Implicit web globals (never imported): synchronous (Web Storage) or
-            // async (IndexedDB) persistent client stores — persistent/external
-            // stores equivalent to fs/db (spec 003 net.fs.db row). Reads and
-            // writes both count, as fs `open()` is c7 regardless of direction.
-            if matches!(obj, "localStorage" | "sessionStorage" | "indexedDB") {
+            // `localStorage.*` / `sessionStorage.*` → net.fs.db. Implicit web
+            // globals (never imported): synchronous persistent/session client
+            // stores — persistent/external stores equivalent to fs/db (spec 003
+            // net.fs.db row). Reads and writes both count, as fs `open()` is c7
+            // regardless of direction.
+            if matches!(obj, "localStorage" | "sessionStorage") {
+                return Some((NetFsDb, Tier::Path));
+            }
+            // `indexedDB.*` opens the store (`open`/`deleteDatabase`/`databases`),
+            // EXCEPT `indexedDB.cmp(a, b)` — a pure key comparison returning
+            // -1/0/1 that touches no store. Excluding it avoids the whole-root
+            // over-flags-a-pure-member FP shape #49 fixed for other roots.
+            if obj == "indexedDB" && method != "cmp" {
                 return Some((NetFsDb, Tier::Path));
             }
             // `navigator.sendBeacon(url, data)` posts data to a URL — a network
@@ -391,6 +398,26 @@ mod tests {
     /// (worst case a false negative, never a false positive), a non-alias
     /// look-alike prefix (`windowManager.`) is not stripped, and `self` is
     /// excluded. Guards the strip from silently widening into an FP source.
+    /// D3 (#63/#49 member-precision): blanket `indexedDB.*` over-flagged the pure
+    /// `indexedDB.cmp(a, b)` (a key comparison → -1/0/1) as net.fs.db c7. The real
+    /// store ops (`open`/`deleteDatabase`/`databases`) must still classify.
+    #[test]
+    fn indexeddb_cmp_is_pure_but_store_ops_are_net_fs_db() {
+        assert!(
+            kinds("function f() { indexedDB.cmp(a, b); }", "f").is_empty(),
+            "indexedDB.cmp is a pure comparison; must not be net.fs.db, got {:?}",
+            kinds("function f() { indexedDB.cmp(a, b); }", "f")
+        );
+        for m in ["open('db')", "deleteDatabase('db')", "databases()"] {
+            let src = format!("function f() {{ indexedDB.{m}; }}");
+            assert_eq!(
+                kinds(&src, "f"),
+                vec!["net.fs.db".to_string()],
+                "indexedDB.{m} must stay net.fs.db"
+            );
+        }
+    }
+
     #[test]
     fn global_object_canonicalization_does_not_overfire() {
         for src in [
