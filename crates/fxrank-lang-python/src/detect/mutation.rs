@@ -1186,6 +1186,33 @@ mod tests {
         );
     }
 
+    /// Characterization test — ACCEPTED LIMITATION, not desired behavior (#78).
+    ///
+    /// `Imports` is a single file-wide, flat table (a documented over-approximation:
+    /// an import in one function resolves same-named calls in another). So a
+    /// function-local `import x as NAME` in one function marks `NAME` a module for
+    /// the WHOLE file, and the #50 suppression then drops another function's
+    /// `NAME.<mut>()` — turning the flat table's pre-existing mis-resolution from a
+    /// *mis-classified* mutation into a *dropped* one. The precise fix is
+    /// scope-aware import resolution (deferred, #78 / spec 025 §13a); when it lands,
+    /// this test should flip to assert `GlobalMutation`. Pinned here so the
+    /// behavior change is deliberate, not silent. The trigger is contrived (the
+    /// same short name bound as a module alias in one function and a `from`-imported
+    /// mutable at module scope).
+    #[test]
+    fn cross_function_flat_import_collision_drops_signal_accepted_limitation() {
+        let src = "from cfg import CACHE\n\
+                   def f():\n    CACHE.append(1)\n\
+                   def g():\n    import os as CACHE\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            !pairs.iter().any(|(e, _)| e.kind == GlobalMutation),
+            "accepted limitation (#78): `g`'s local `import os as CACHE` pollutes the \
+             file-wide table so `f`'s CACHE.append() is currently dropped; got: {:?}",
+            pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn local_shadowing_module_binding_is_local() {
         // A bare local rebind shadows the module name (Python creates a local) ->
