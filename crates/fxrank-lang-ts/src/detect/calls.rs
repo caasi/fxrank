@@ -269,10 +269,18 @@ fn classify_method_call(method: &str) -> Option<(EffectKind, Tier)> {
 
 /// Global-object aliases that denote the global scope. A member access through
 /// one (`window.localStorage`, `globalThis.fetch`) is the same ambient global as
-/// the bare name, so [`classify_call`] strips the alias before matching. `self`
-/// is deliberately excluded — it is a valid local-variable name (the classic
-/// `var self = this` idiom), so stripping it would risk a false positive
-/// (FP-worse-than-FN); a worker's `self.localStorage` is the accepted miss.
+/// the bare name, so [`classify_call`] strips the alias before matching. The strip
+/// is **shadow-unaware** — consistent with this detector's existing model, where
+/// bare ambient globals already match by name with shadowing accepted (a call in
+/// `fn f(fetch) { fetch() }` is already classified today). A param literally named
+/// `window`/`globalThis` is vanishingly rare, so that accepted FP stays negligible.
+///
+/// `self` is deliberately NOT in this set: unlike `window`/`globalThis` it is
+/// *commonly* a local (the classic `var self = this` idiom), so stripping it would
+/// turn a frequent pattern into a false positive. A worker's `self.localStorage`
+/// is the accepted miss. (Canonicalization is applied only to call callees in
+/// `classify_call`; qualified `new window.WebSocket()` and `globalThis.process.env.X`
+/// reads are not canonicalized — rarer forms, accepted misses.)
 const GLOBAL_OBJECT_ALIASES: [&str; 2] = ["window", "globalThis"];
 
 /// Strip a single leading global-object alias (`window.` / `globalThis.`) so a
