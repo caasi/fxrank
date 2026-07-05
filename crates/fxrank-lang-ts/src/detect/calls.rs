@@ -385,6 +385,40 @@ mod tests {
         );
     }
 
+    /// The global-object canonicalization must not OVER-fire. After stripping a
+    /// `window.`/`globalThis.` prefix the result is fed back through the SAME
+    /// conservative matcher, so an unknown / unmodeled member stays unclassified
+    /// (worst case a false negative, never a false positive), a non-alias
+    /// look-alike prefix (`windowManager.`) is not stripped, and `self` is
+    /// excluded. Guards the strip from silently widening into an FP source.
+    #[test]
+    fn global_object_canonicalization_does_not_overfire() {
+        for src in [
+            // unmodeled global member (setTimeout is not an effect we classify)
+            "function f() { window.setTimeout(() => {}, 0); }",
+            // unknown global member
+            "function f() { window.somethingRandom(); }",
+            // `self` is deliberately not an alias (shadowable `var self = this`)
+            "function f() { self.localStorage.setItem('k','v'); }",
+            // partial-name look-alike: `windowManager` must NOT be stripped to `Manager`
+            "function f() { windowManager.localStorage.setItem('k','v'); }",
+        ] {
+            assert!(
+                kinds(src, "f").is_empty(),
+                "canonicalization must not classify this; src={src:?} got {:?}",
+                kinds(src, "f")
+            );
+        }
+
+        // Consistency: the strip routes to the CORRECT classifier, not a
+        // storage-only special-case — `window.console.log` → logging, not net.fs.db.
+        assert_eq!(
+            kinds("function f() { window.console.log('hi'); }", "f"),
+            vec!["logging".to_string()],
+            "window.console.log must canonicalize to console.log → logging"
+        );
+    }
+
     #[test]
     fn env_read_counted_once() {
         let src = "function f() { const e = process.env.HOME; }";
