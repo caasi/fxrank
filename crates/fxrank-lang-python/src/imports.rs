@@ -320,6 +320,11 @@ fn collect_small(
                 if level > 0 {
                     relative_levels.insert(local.clone(), level);
                 }
+                // A `from … import name` binds a member, not a module. Clear any
+                // stale module-import status left by an earlier same-name plain
+                // `import` (the last binding wins, mirroring `table`'s overwrite),
+                // so `is_module_import` never disagrees with `resolve` (#50 review).
+                module_imports.remove(&local);
                 table.insert(local, full);
             }
         }
@@ -535,6 +540,20 @@ mod tests {
             "from . import sib → not a module"
         );
         assert!(!i.is_module_import("unknown"), "unknown name → false");
+
+        // Same-name override: a later `from`-import must clear the earlier plain
+        // `import`'s module status, so is_module_import agrees with resolve (the
+        // last binding wins).
+        let ov = build_str("import os as CACHE\nfrom cfg import CACHE\n");
+        assert_eq!(
+            ov.resolve("CACHE"),
+            Some("cfg.CACHE"),
+            "last binding wins in table"
+        );
+        assert!(
+            !ov.is_module_import("CACHE"),
+            "a `from`-import overriding an `import as` must not stay a module"
+        );
     }
 
     #[test]

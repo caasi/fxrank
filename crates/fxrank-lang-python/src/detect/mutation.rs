@@ -1162,6 +1162,15 @@ mod tests {
             shadowed.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
         );
 
+        // A LOCAL binding shadows the imported module name → local.mutation, not
+        // suppressed (the pre-scan marks `os` local for the whole function).
+        let local_shadow = detect_src("import os\ndef f():\n    os = []\n    os.append(1)\n", "f");
+        assert!(
+            local_shadow.iter().any(|(e, _)| e.kind == LocalMutation),
+            "a local `os` shadowing `import os` must stay LocalMutation, got: {:?}",
+            local_shadow.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+
         // A `from`-imported name may be a mutable object → keep global.mutation
         // (only plain `import module` receivers are suppressed).
         let from_import = detect_src(

@@ -1064,22 +1064,32 @@ mod tests {
             shadowed.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
         );
 
-        // A default import binds a possibly-mutable object → keep global.mutation
-        // (only namespace imports are suppressed). Same for `require` (Default).
-        let default_import = detect_in_fn(
-            "import cache from './cache'; function g() { cache.set('k', 1); }",
-            "g",
-        );
-        assert!(
-            default_import
-                .iter()
-                .any(|(e, _)| e.kind == EffectKind::GlobalMutation),
-            "default-import `cache.set()` must stay GlobalMutation, got: {:?}",
-            default_import
-                .iter()
-                .map(|(e, _)| e.kind)
-                .collect::<Vec<_>>()
-        );
+        // Default / named imports, and a CommonJS `require`, all bind a
+        // possibly-mutable object → keep global.mutation (only namespace imports
+        // are suppressed).
+        for (label, src) in [
+            (
+                "default",
+                "import cache from './cache'; function g() { cache.set('k', 1); }",
+            ),
+            (
+                "named",
+                "import { cache } from './cache'; function g() { cache.set('k', 1); }",
+            ),
+            (
+                "require",
+                "const cache = require('./cache'); function g() { cache.set('k', 1); }",
+            ),
+        ] {
+            let effects = detect_in_fn(src, "g");
+            assert!(
+                effects
+                    .iter()
+                    .any(|(e, _)| e.kind == EffectKind::GlobalMutation),
+                "{label}-import `cache.set()` must stay GlobalMutation, got: {:?}",
+                effects.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
