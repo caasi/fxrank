@@ -237,12 +237,47 @@ fn classify_resolved(full: &str) -> Option<(EffectKind, Tier)> {
     let leaf = full.rsplit('.').next().unwrap_or(full);
 
     // ── net.fs.db (class 7) ──
-    if matches!(root, "shutil" | "tempfile" | "csv" | "socket")
-        || matches!(
-            root,
-            "requests" | "httpx" | "urllib" | "aiohttp" | "sqlite3" | "sqlalchemy"
+    // Whole-package IO roots: every member is (or wraps) a real fs/net/db op.
+    if matches!(root, "tempfile" | "csv" | "socket")
+        || matches!(root, "requests" | "httpx" | "aiohttp" | "sqlalchemy")
+    {
+        return Some((NetFsDb, Tier::Path));
+    }
+    // Mixed-purity roots (#49): classify by the specific member, not the package
+    // root — these packages carry pure members that must not land at c7 and top
+    // the ranking. Missing a real IO member here is a tolerated false negative;
+    // flagging a pure one is the class-corrupting false positive we're removing.
+    if root == "shutil"
+        && matches!(
+            leaf,
+            // real filesystem operations (copies/moves/removes/archives/metadata);
+            // `shutil.which` (PATH lookup → str) and the pure format-registry
+            // helpers are deliberately excluded.
+            "copy"
+                | "copy2"
+                | "copyfile"
+                | "copyfileobj"
+                | "copymode"
+                | "copystat"
+                | "copytree"
+                | "move"
+                | "rmtree"
+                | "make_archive"
+                | "unpack_archive"
+                | "disk_usage"
+                | "chown"
         )
     {
+        return Some((NetFsDb, Tier::Path));
+    }
+    // `urllib.request.urlopen`/`urlretrieve` fetch; `urllib.parse.*` (urljoin,
+    // urlencode, quote, …) and `urllib.error` are pure.
+    if root == "urllib" && matches!(leaf, "urlopen" | "urlretrieve") {
+        return Some((NetFsDb, Tier::Path));
+    }
+    // `sqlite3.connect` opens a database; `register_converter`/`register_adapter`
+    // are import-time type registration and `complete_statement` is a pure check.
+    if root == "sqlite3" && leaf == "connect" {
         return Some((NetFsDb, Tier::Path));
     }
     if root == "pathlib"
@@ -355,9 +390,15 @@ fn classify_resolved(full: &str) -> Option<(EffectKind, Tier)> {
 
 /// Method-name-only DB/file-write heuristics (receiver type unknown → all
 /// `net.fs.db` class 7, `Heuristic`).
+///
+/// `create` was dropped (#49): bare `.create()` is too ambiguous — Django's
+/// in-memory `Q.create()`/`WhereNode.create()` predicate-tree factories collide
+/// with the ORM's `objects.create()` DB insert, and receiver-type is unknown
+/// here. Losing the genuine-insert signal is an accepted false negative; keeping
+/// it produced class-corrupting false positives that topped the ranking.
 fn classify_method(method: &str) -> Option<EffectKind> {
     match method {
-        "commit" | "save" | "execute" | "to_sql" | "to_csv" | "create" => Some(EffectKind::NetFsDb),
+        "commit" | "save" | "execute" | "to_sql" | "to_csv" => Some(EffectKind::NetFsDb),
         _ => None,
     }
 }
@@ -660,5 +701,53 @@ mod tests {
             rng_effect.contained,
             rng_effect.kind
         );
+    }
+
+    /// #49: package-root heuristics must classify by the specific member, not the
+    /// whole root. The validated false positives (pure calls that were landing at
+    /// net.fs.db class 7 and topping the ranking) must NOT be flagged; the genuine
+    /// IO members of the same packages must still be flagged c7.
+    #[test]
+    fn package_root_heuristics_classify_by_member() {
+        // ── validated false positives: must NOT emit NetFsDb ──
+        let fp_cases = [
+            // shutil.which is a PATH lookup returning a str, not a file operation.
+            "import shutil\ndef f():\n    return shutil.which(\"git\")\n",
+            // urllib.parse.urljoin is a pure string join.
+            "import urllib.parse\ndef f(a, b):\n    return urllib.parse.urljoin(a, b)\n",
+            // sqlite3.register_converter is import-time type registration.
+            "import sqlite3\ndef f(conv):\n    sqlite3.register_converter(\"t\", conv)\n",
+            // bare `.create` on an unknown receiver — Django Q / WhereNode in-memory
+            // predicate-tree factories, not a DB insert.
+            "def f(node):\n    return node.create()\n",
+        ];
+        for src in fp_cases {
+            let effects = effects_for_src(src);
+            assert!(
+                !effects.iter().any(|e| e.kind == NetFsDb),
+                "must not flag pure call as net.fs.db; src={src:?} got {:?}",
+                effects.iter().map(|e| e.kind).collect::<Vec<_>>()
+            );
+        }
+
+        // ── genuine IO members of the same packages: must still emit NetFsDb c7 ──
+        let tp_cases = [
+            "import shutil\ndef f(a, b):\n    shutil.copytree(a, b)\n",
+            "import shutil\ndef f(a):\n    shutil.rmtree(a)\n",
+            "from urllib.request import urlopen\ndef f(u):\n    return urlopen(u)\n",
+            "import urllib.request\ndef f(u):\n    return urllib.request.urlopen(u)\n",
+            "import sqlite3\ndef f():\n    return sqlite3.connect(\"db\")\n",
+        ];
+        for src in tp_cases {
+            let effects = effects_for_src(src);
+            assert!(
+                effects.iter().any(|e| e.kind == NetFsDb && e.class == 7),
+                "genuine IO member must flag net.fs.db c7; src={src:?} got {:?}",
+                effects
+                    .iter()
+                    .map(|e| (e.kind, e.class))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }
