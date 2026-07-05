@@ -393,6 +393,19 @@ impl EffectSink for MutSink<'_> {
         if !is_mutating_method(attr.attr.value) {
             return;
         }
+        // #50: a method call whose receiver is a **bare imported name** is a call
+        // on a module / namespace (`os.remove()`, a namespace import `V.add()`),
+        // not a mutation of that name — the effect, if any, belongs to the callee
+        // and is scored by the call detector. Only bare names are suppressed: an
+        // *attribute* receiver reached through an import (`config.settings.append()`)
+        // still mutates module-shared state and stays a global.mutation. (Accepted
+        // FN: `from cfg import CACHE; CACHE.append(x)` — a mutable object imported by
+        // name — is also suppressed, the tolerated cost of killing the dominant FP.)
+        if let Expression::Name(recv) = attr.value.as_ref()
+            && self.imports.resolve(recv.value).is_some()
+        {
+            return;
+        }
         // The receiver's root name is the write target.
         let Some(root) = root_name_of_expr(&attr.value) else {
             return;
@@ -1075,6 +1088,53 @@ mod tests {
         assert!(
             !pairs.iter().any(|(e, _)| e.kind == HiddenMutation),
             "module-level content mutation must not be hidden.mutation"
+        );
+    }
+
+    /// #50: a mutating-method CALL whose receiver is a **bare imported name**
+    /// (`os.remove()`, a namespace import `V.add()`) is a call on a module /
+    /// namespace, not a mutation of it. It must NOT escalate to global.mutation
+    /// (the effect, if any, is the callee's — already scored by the call detector).
+    #[test]
+    fn method_call_on_bare_imported_name_is_not_mutation() {
+        // `os.remove(...)` — receiver is the bare imported module `os`.
+        let pairs = detect_src("import os\ndef f():\n    os.remove(\"x\")\n", "f");
+        assert!(
+            !pairs.iter().any(|(e, _)| e.kind == GlobalMutation),
+            "os.remove() must not emit GlobalMutation (call on an imported module), got: {:?}",
+            pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+
+        // Namespace import used as a pure-math helper: `import vecmath as V; V.add(a, b)`.
+        let pairs2 = detect_src(
+            "import vecmath as V\ndef g(a, b):\n    return V.add(a, b)\n",
+            "g",
+        );
+        assert!(
+            !pairs2.iter().any(|(e, _)| e.kind == GlobalMutation),
+            "V.add() on a namespace import must not emit GlobalMutation, got: {:?}",
+            pairs2.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+
+        // BOUNDARY (must stay a true positive): a method call on an *attribute*
+        // reached through an imported module mutates module-shared state.
+        let pairs3 = detect_src(
+            "import config\ndef h():\n    config.settings.append(1)\n",
+            "h",
+        );
+        assert!(
+            pairs3.iter().any(|(e, c)| e.kind == GlobalMutation && !*c),
+            "config.settings.append() must stay GlobalMutation (module-shared state), got: {:?}",
+            pairs3.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+
+        // BOUNDARY (must stay a true positive): a bare *module-level binding*
+        // (not an import) mutated by content is module-shared state.
+        let pairs4 = detect_src("SHARED = []\ndef k():\n    SHARED.append(1)\n", "k");
+        assert!(
+            pairs4.iter().any(|(e, c)| e.kind == GlobalMutation && !*c),
+            "SHARED.append() on a module-level binding must stay GlobalMutation, got: {:?}",
+            pairs4.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
         );
     }
 

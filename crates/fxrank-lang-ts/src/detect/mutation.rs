@@ -268,6 +268,17 @@ impl<'a> MutationWalker<'a> {
                 .with_subreason("captured-binding")
         }
     }
+
+    /// #50: `true` when `expr` is a bare identifier (modulo paren / TS wrappers)
+    /// that resolves through the ES import table — a namespace / default / named
+    /// import. A method call on such a receiver targets the (immutable) module
+    /// binding, so it is not a mutation of the receiver.
+    fn is_bare_imported_ident(&self, expr: &Expr) -> bool {
+        matches!(
+            strip_place_wrappers(expr),
+            Expr::Ident(id) if self.imports.resolve(&id.sym).is_some()
+        )
+    }
 }
 
 /// The result of escape-classifying a write's base ident.
@@ -358,6 +369,14 @@ impl Visit for MutationWalker<'_> {
             && let Expr::Member(MemberExpr { obj, prop, .. }) = callee.as_ref()
             && let MemberProp::Ident(method) = prop
             && is_mutating_method(&method.sym)
+            // #50: a method call whose receiver is a bare imported name is a call
+            // on an immutable ES module namespace (`V.add()`), not a mutation of it
+            // — the effect belongs to the callee. Only bare imported idents are
+            // suppressed; a module-level binding (`m.set()`, indistinguishable from
+            // the #29 module-shared case) and deeper member receivers still record a
+            // write. (Accepted FN: `import cache from './c'; cache.push(x)` — a
+            // mutable default import — is also suppressed.)
+            && !self.is_bare_imported_ident(obj)
         {
             let (line, col) = self.lines.line_col(node.span);
             self.record_write(obj, line, col, &format!(".{} on", method.sym), false);
@@ -983,6 +1002,40 @@ mod tests {
             .find(|e| e.kind == EffectKind::GlobalMutation)
             .expect("expected a global.mutation for .set on module-level `m`");
         assert_eq!(e.effective_class(), 6);
+    }
+
+    /// #50: a mutating-method CALL whose receiver is a bare imported name
+    /// (a namespace import `V.add()`) is a call on an immutable ES module
+    /// namespace, not a mutation of it — must NOT escalate to global.mutation.
+    /// The effect, if any, belongs to the callee. The module-level-binding case
+    /// (`m.set()` on a `const m = new Map()`) is intentionally NOT suppressed: it
+    /// is syntactically identical to the genuine #29 module-shared mutation and
+    /// unresolvable without type info, so it stays global.mutation (see the
+    /// `module_level_const_map_mutation_is_global` pin).
+    #[test]
+    fn method_call_on_bare_imported_name_is_not_mutation() {
+        // Namespace import used as a pure-math helper.
+        let effects = detect_in_fn(
+            "import * as V from 'vecmath'; function f(a,b){ return V.add(a,b); }",
+            "f",
+        );
+        assert!(
+            effects
+                .iter()
+                .all(|(e, _)| e.kind != EffectKind::GlobalMutation),
+            "V.add() on a namespace import must not be GlobalMutation, got: {:?}",
+            effects.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+
+        // BOUNDARY (must stay a true positive): `.set` on a module-level Map is a
+        // genuine module-shared mutation (#29) and is unaffected by the import gate.
+        let kept = detect_in_fn("const m = new Map(); function g(){ m.set('k', 1); }", "g");
+        assert!(
+            kept.iter()
+                .any(|(e, _)| e.kind == EffectKind::GlobalMutation),
+            "m.set() on a module-level binding must stay GlobalMutation, got: {:?}",
+            kept.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
     }
 
     #[test]
