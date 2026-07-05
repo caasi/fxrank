@@ -12,7 +12,9 @@
 //! **Bare globals classify without imports.** `fetch`, `Date`, `Math`,
 //! `console`, `process`, and the web-global IO APIs (`localStorage` /
 //! `sessionStorage` / `indexedDB` / `navigator.sendBeacon`) are ambient globals
-//! — never in the `ImportTable` — so they match on rendered name alone.
+//! — never in the `ImportTable` — so they match on rendered name alone. A leading
+//! global-object alias (`window.` / `globalThis.`) is canonicalized away first,
+//! so `window.localStorage.setItem` classifies like the bare `localStorage.setItem`.
 //! `imports` is consulted only to map a bare imported name (`readFile` from
 //! `node:fs`) back to its module for fs/db classification.
 //!
@@ -143,6 +145,13 @@ impl CallWalker<'_> {
     fn classify_call(&self, rendered: &str) -> Option<(EffectKind, Tier)> {
         use EffectKind::*;
 
+        // A member access through a global-object alias (`window.localStorage`,
+        // `globalThis.fetch`) refers to the SAME ambient global as the bare name,
+        // so canonicalize the alias away before matching — qualified and bare forms
+        // classify identically (Copilot PR #79). Applies uniformly to every ambient
+        // global below (fetch/console/Date/…), not just web storage.
+        let rendered = strip_global_object_prefix(rendered);
+
         // --- Bare global idents (no `.`) -------------------------------------
         // net.fs.db — fetch only; XMLHttpRequest/WebSocket/EventSource are
         // constructors (NewExpr) and are classified in visit_new_expr.
@@ -258,6 +267,28 @@ fn classify_method_call(method: &str) -> Option<(EffectKind, Tier)> {
     }
 }
 
+/// Global-object aliases that denote the global scope. A member access through
+/// one (`window.localStorage`, `globalThis.fetch`) is the same ambient global as
+/// the bare name, so [`classify_call`] strips the alias before matching. `self`
+/// is deliberately excluded — it is a valid local-variable name (the classic
+/// `var self = this` idiom), so stripping it would risk a false positive
+/// (FP-worse-than-FN); a worker's `self.localStorage` is the accepted miss.
+const GLOBAL_OBJECT_ALIASES: [&str; 2] = ["window", "globalThis"];
+
+/// Strip a single leading global-object alias (`window.` / `globalThis.`) so a
+/// qualified global access canonicalizes to the bare ambient global. Returns the
+/// input unchanged when no alias prefixes it.
+fn strip_global_object_prefix(rendered: &str) -> &str {
+    for alias in GLOBAL_OBJECT_ALIASES {
+        if let Some(rest) = rendered.strip_prefix(alias)
+            && let Some(after) = rest.strip_prefix('.')
+        {
+            return after;
+        }
+    }
+    rendered
+}
+
 /// Whether a module specifier denotes node's filesystem API.
 fn is_fs_db_module(module: &str) -> bool {
     matches!(
@@ -315,6 +346,34 @@ mod tests {
             k.iter().filter(|x| *x == "net.fs.db").count(),
             4,
             "localStorage/sessionStorage/indexedDB/navigator.sendBeacon must all be net.fs.db, got {k:?}"
+        );
+    }
+
+    /// Copilot PR #79: qualified global-object access (`window.localStorage`,
+    /// `globalThis.indexedDB`, `window.navigator.sendBeacon`, `window.fetch`)
+    /// canonicalizes to the bare ambient global and classifies identically.
+    /// `self.` is intentionally NOT stripped (it is a shadowable local-var name).
+    #[test]
+    fn qualified_web_globals_via_window_or_globalthis() {
+        let src = "function f() { \
+            window.localStorage.setItem('k','v'); \
+            globalThis.indexedDB.open('db'); \
+            window.navigator.sendBeacon('/u', 1); \
+            window.fetch('/x'); \
+        }";
+        let k = kinds(src, "f");
+        assert_eq!(
+            k.iter().filter(|x| *x == "net.fs.db").count(),
+            4,
+            "window./globalThis.-qualified web-global IO must all be net.fs.db, got {k:?}"
+        );
+
+        // `self.` is the accepted miss (FP-safety: `self` may be a local `this` alias).
+        let self_src = "function g() { self.localStorage.setItem('k','v'); }";
+        assert!(
+            !kinds(self_src, "g").contains(&"net.fs.db".to_string()),
+            "self.-qualified access must NOT be classified (excluded alias), got {:?}",
+            kinds(self_src, "g")
         );
     }
 
