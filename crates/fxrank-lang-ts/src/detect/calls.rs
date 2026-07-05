@@ -10,10 +10,11 @@
 //! `SourceMap` that parsed the file) to resolve each effect's line.
 //!
 //! **Bare globals classify without imports.** `fetch`, `Date`, `Math`,
-//! `console`, and `process` are ambient globals — never in the `ImportTable` —
-//! so they match on rendered name alone. `imports` is consulted only to map a
-//! bare imported name (`readFile` from `node:fs`) back to its module for fs/db
-//! classification.
+//! `console`, `process`, and the web-global IO APIs (`localStorage` /
+//! `sessionStorage` / `indexedDB` / `navigator.sendBeacon`) are ambient globals
+//! — never in the `ImportTable` — so they match on rendered name alone.
+//! `imports` is consulted only to map a bare imported name (`readFile` from
+//! `node:fs`) back to its module for fs/db classification.
 //!
 //! NOTE: namespace-import member calls (`import * as fs from 'node:fs';
 //! fs.readFile()`) are NOT resolved through `imports` yet — only bare
@@ -155,6 +156,19 @@ impl CallWalker<'_> {
             if obj == "console" {
                 return Some((Logging, Tier::Path));
             }
+            // `localStorage.*` / `sessionStorage.*` / `indexedDB.*` → net.fs.db.
+            // Implicit web globals (never imported): synchronous (Web Storage) or
+            // async (IndexedDB) persistent client stores — persistent/external
+            // stores equivalent to fs/db (spec 003 net.fs.db row). Reads and
+            // writes both count, as fs `open()` is c7 regardless of direction.
+            if matches!(obj, "localStorage" | "sessionStorage" | "indexedDB") {
+                return Some((NetFsDb, Tier::Path));
+            }
+            // `navigator.sendBeacon(url, data)` posts data to a URL — a network
+            // write (spec 003 net.fs.db row).
+            if obj == "navigator" && method == "sendBeacon" {
+                return Some((NetFsDb, Tier::Path));
+            }
             // `Date.now()` → time.read.
             if obj == "Date" && method == "now" {
                 return Some((TimeRead, Tier::Path));
@@ -282,6 +296,26 @@ mod tests {
         assert!(k.contains(&"net.fs.db".to_string()));
         assert!(k.contains(&"logging".to_string()));
         assert!(k.contains(&"time.read".to_string()));
+    }
+
+    /// #51: implicit web-global IO APIs are never imported, so they were silently
+    /// missed (own_score 0). Per spec 003's net.fs.db row these persistent/external
+    /// client stores + the beacon post all classify net.fs.db. Both a write
+    /// (`setItem`) and a read (`getItem`) count, like fs `open()`.
+    #[test]
+    fn web_global_io_apis_are_net_fs_db() {
+        let src = "function f() { \
+            localStorage.setItem('k','v'); \
+            const x = sessionStorage.getItem('k'); \
+            indexedDB.open('db'); \
+            navigator.sendBeacon('/u', x); \
+        }";
+        let k = kinds(src, "f");
+        assert_eq!(
+            k.iter().filter(|x| *x == "net.fs.db").count(),
+            4,
+            "localStorage/sessionStorage/indexedDB/navigator.sendBeacon must all be net.fs.db, got {k:?}"
+        );
     }
 
     #[test]
