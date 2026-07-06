@@ -297,10 +297,12 @@ fn classify_resolved(full: &str) -> Option<(EffectKind, Tier)> {
         return Some((NetFsDb, Tier::Path));
     }
     // `sqlalchemy` gets no arm: `create_engine`/`create_async_engine` are lazy
-    // (no DBAPI connection until `.connect()`/`.execute()`), have zero dogfood
-    // witnesses, AND the real DB IO IS caught by `classify_method` (`execute`) — so
-    // flagging the factory only preserves a theoretical c7 FP (model-diverse review).
-    // `select`/`Column`/`Table` build pure query/schema objects.
+    // (no DBAPI connection until first use), have zero dogfood witnesses, and the
+    // common real DB IO (`.execute()`) is independently caught by `classify_method`
+    // — so flagging the lazy factory only preserves a theoretical c7 FP
+    // (model-diverse review). (`.connect()` is not in `classify_method`, so it
+    // stays an accepted FN unless witnessed.) `select`/`Column`/`Table` build pure
+    // query/schema objects.
     if root == "shutil"
         && matches!(
             leaf,
