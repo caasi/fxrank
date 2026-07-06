@@ -38,9 +38,10 @@ set-membership-over-bare-name with resolution-to-nearest-binding. Same disciplin
 (position-independent canonical identity, matched by equality, never by bare name), one
 granularity down.
 
-The resolver is a **pass-1, per-frontend** component that walks the unit's native AST
-(the same walk that already does mutation classification and `CallSiteRef` emission). It
-produces two things consumed **before the `UnitRecord` leaves the frontend**:
+The resolver is a **pass-1, per-frontend** component over the unit's native AST — the same
+phase that already produces mutation effects and `CallSiteRef`s (one walk or several, per
+frontend; TS, e.g., runs separate mutation/ref walkers and a React two-pass). It produces
+two things consumed **before the `UnitRecord` leaves the frontend**:
 
 1. a `BindingOrigin` per name use — consumed by the mutation classifier (§*Vocabulary*);
 2. a correctly-scoped `CallSiteRef` — a call whose base resolves to a param/local is a
@@ -55,46 +56,62 @@ already imply, so the two docs stay aligned.
 
 | `BindingOrigin` | denotes | consuming rule (mutation classifier) |
 |---|---|---|
-| `Param` | a parameter of this unit | `param.mutation` (unless a declared `&mut` channel) |
-| `Local` | a body-local binding — `let`/`=`, `for`/`if let`/`while let`/`match`-arm, closure param, `with … as`, `except … as` | `local.mutation` |
-| `ModuleImport` | a plain `import module` name (`os`, `np`) — an **immutable module object** | a mutating-method *call* on it is **not** a mutation of it → **suppress** (subsumes the #50 module-import guard) |
+| `Param` | a parameter of this unit | a caller-shared param mutation — but the **channel is language-specific**: Rust escalates only a `&mut` / `&mut self` param (a by-value param is a `Local`); Python/TS treat any param write as `param.mutation` |
+| `Local` | a body-local binding — `let`/`=`, `for`/`if let`/`while let`/`match`-arm, `with … as`, `except … as`, **and Rust closure params** (a Rust closure shares its parent unit; a **TS/JS closure is its own unit**, so its params are that unit's `Param`) | `local.mutation` |
+| `ModuleImport` | a plain `import module` name (`os`, `np`) | a mutating-method **call** on it is **not** a mutation *of* it — the effect is the callee's → **suppress** (subsumes the #50 module-import guard). *(Module objects are mutable in general; this is about the call, not immutability.)* |
 | `FromImport` | a `from m import n` name — an **arbitrary, possibly-mutable** member | content-mutation → `global.mutation` (module-shared object) |
-| `ModuleBinding` | a module top-level binding (`const`/`let`/`var`/`fn`/`class`; Python assign/`def`/`class`; Rust `static`) | content-mutation → `global.mutation` |
-| `Global` | an explicitly **declared** global/static rebind (Python `global x`; Rust `static`) | `global.mutation` (Exact) |
+| `ModuleBinding` | a module top-level binding (`const`/`let`/`var`/`fn`/`class`; Python assign/`def`/`class`; **Rust `static` / `static mut` / interior-mut statics** — Rust's only global-write channel) | content-mutation → `global.mutation` (Rust: `Heuristic`) |
+| `Global` | an **explicitly declared** global rebind — **Python `global x` only** (Rust has no global-declaration keyword; its `static` is `ModuleBinding`) | `global.mutation` (Exact) |
 | `EnclosingCaptured` | a binding from an **enclosing function** scope, captured | implicit capture → `hidden.mutation` `"captured-binding"`; an explicitly declared capture (Python `nonlocal`) → `this.mutation` (Exact, not hidden) — the declared/implicit split is the classifier's, layered on this origin |
-| `HostGlobal` | an ambient language/host global, never declared or imported (`window`, `globalThis`, `localStorage`/`sessionStorage`/`indexedDB`, `process`) | a mutating-method *call* on it is **not** a mutation of it → **suppress** (subsumes the D4 web-global name list) |
+| `HostGlobalIO` | an ambient **IO** host global, never declared or imported (`localStorage` / `sessionStorage` / `indexedDB`) — its IO is owned by the call detector | a mutating-method **call** on it is **not** a mutation *of* it → **suppress** (subsumes the D4 web-global name list) |
 | `Unresolved` | nothing in scope matched — the honest fallback | `hidden.mutation` `"captured-binding"` |
+
+**Not mutation origins (do not `HostGlobalIO`-suppress them):** `window` / `globalThis` are the **global object** — a *write* to one (`window.x = 1`, `window.arr.push()`) is `global.mutation` (the classifier's global-object arm, matching `mutation-classification-guideline.md`), **never** suppressed. `process` appears only in the *call* detector (`process.exit` → `process.control`, `process.env.X` → `env.read`) and has no mutation origin. Keep `HostGlobalIO` suppression strictly to the three ambient-storage names.
 
 `Unresolved` is the proxy the flat model uses for *everything* it can't place; the scoped
 resolver shrinks it to its true meaning (genuinely out of this unit's lexical reach), so
 `captured-binding` stops over-firing (#55).
 
-## The binding-id scheme — a downward extension of `canonical_path`
+## The binding-id scheme — intra-unit identity, optionally `canonical_path`-prefixed
 
-A binding's identity **extends the unit's `canonical_path`** (the cross-file identity, a
-`Vec<String>` of FQ segments) downward with its lexical scope path and a kind-tagged name:
-
-```
-binding_id = unit.canonical_path ++ scope_segments ++ [ "kind:name" ]
-```
+Resolution is **intra-unit** (§*The load-bearing invariant*), so a binding id only needs to
+be **unique within its unit**: its lexical scope path plus a kind-tagged name.
 
 ```
-f's param os:                 ["mod","f","param:os"]
-module `import os`:           ["mod","import:os"]              (scope_segments empty ⇒ module scope)
-module `from cfg import CACHE`:["mod","from:CACHE"]
-g's `import os as CACHE`:      ["mod","g","import:CACHE"]
-a for-loop binding x in f:    ["mod","f","b3","local:x"]        (b3 = a lexical scope label)
+binding_id = scope_segments ++ [ "kind:name" ]     # intra-unit — always well-defined
 ```
+
+Where the unit *has* a `canonical_path` (the cross-file identity, a `Vec<String>` of FQ
+segments), prefixing it makes the id **globally** unique too — the same identity scheme at
+two granularities, #36's `canonical_path` extended one level down:
+
+```
+full_binding_id = unit.canonical_path ++ scope_segments ++ [ "kind:name" ]   # when canonical_path is non-empty
+```
+
+```
+f's param os:                  ["f","param:os"]        full: ["mod","f","param:os"]
+module `import os`:             ["import:os"]           full: ["mod","import:os"]   (scope_segments empty ⇒ module scope)
+module `from cfg import CACHE`: ["from:CACHE"]
+g's `import os as CACHE`:       ["g","import:CACHE"]
+a for-loop binding x in f:      ["f","b3","local:x"]    (b3 = a lexical scope label)
+```
+
+The global prefix is **optional and often absent**: a Python method / nested `def`, or a
+Rust file with no crate root in scope, has an **empty** `canonical_path` (spec 025-3e's
+degradation). That is fine — the intra-unit id is still well-defined, and #78 never needs
+the global form (nothing crosses the unit boundary). The prefix is a free tie-in to #36
+when available, not a dependency.
 
 Conventions:
 
-- **Position-independent.** `scope_segments` are **lexical labels** (block ordinal within
-  parent, comprehension/arm/closure markers) — **never `line:col`**. An edit that moves a
-  binding without changing its lexical nesting must not change its id. (Contrast the
-  hotspot `unit_id` = `path:line:col:symbol`, which is deliberately position-*bearing*;
-  the binding id is not.)
-- **The unit's `canonical_path` is the exact prefix** of every binding inside it — the id
-  is one identity scheme at two granularities, not a parallel scheme.
+- **Position-independent (structurally).** `scope_segments` are **lexical labels** (an
+  ordinal among sibling scopes in the same parent, comprehension/arm/closure markers) —
+  **never `line:col`**. An edit that moves a binding without changing its lexical nesting
+  must not change its id. (Contrast the hotspot `unit_id` = `path:line:col:symbol`, which is
+  deliberately position-*bearing*.) The labels are *structural*, not stable across edits
+  that reorder or insert sibling scopes — that churn is acceptable because the id is
+  frontend-internal and recomputed each scan; it is never persisted or compared across scans.
 - **Kind-tagged names** (`param:` / `local:` / `import:` / `from:` / `module:`) keep two
   bindings of the same name but different origin distinct even in the same scope.
 
@@ -123,11 +140,13 @@ corollaries — none needs a special case:
   mutation. The file-wide `Imports` table becomes a **per-scope** environment; the
   `cross_function_flat_import_collision_drops_signal_accepted_limitation` test flips from
   asserting the dropped signal to asserting `GlobalMutation`.
-- **Ambient/host globals (subsumes the D4 name list).** `localStorage`/`sessionStorage`/
-  `indexedDB` resolve to `HostGlobal`, so "a call on a known global is not a mutation of
-  it" is a **resolver outcome**, not a hardcoded name list in `mutation.rs`. Adding a new
-  ambient global is a one-line addition to the frontend's host-global set, and it fixes
-  the mutation FP **and** the reach classification at once.
+- **Ambient IO globals (subsumes the D4 name list).** `localStorage`/`sessionStorage`/
+  `indexedDB` resolve to `HostGlobalIO`, so "a mutating call on a known ambient IO global
+  is not a mutation of it" is a **resolver outcome**, not a hardcoded name list in
+  `mutation.rs`; adding a new one is a one-line addition to the frontend's host-global set.
+  (`window`/`globalThis` are the global *object* — a write to one is `global.mutation`, not
+  suppressed; see the vocabulary note. Whether a `HostGlobalIO` *call* is an external reach
+  is a separate reach-classification concern, not resolved here.)
 
 ## Honest per-language differences (intentional — not aligned)
 
@@ -139,7 +158,9 @@ model each resolver builds over its own AST is not**, and must not be.
   (→ `Global`/`EnclosingCaptured`, not `Local`); comprehension and generator expressions
   get **their own scope** (Python 3), so a comprehension target does not leak to the
   enclosing function; `import` vs `from`-import is the `ModuleImport`/`FromImport` split.
-  These are Python semantics — no other frontend has them.
+  These are Python semantics — no other frontend has them. *(Target note: `match`-arm
+  captures, comprehension-scope targets, and walrus `:=` are **uncollected residuals in the
+  code today** — see the mutation guideline's prescan limits; 078 is where they land.)*
 - **TS/JS (`swc`)** — `var` **hoists** to the function scope while `let`/`const` are
   **block-scoped with a TDZ**; closures capture by reference; a namespace import
   (`import * as V`) is an **immutable module namespace** (→ its own suppression, like
@@ -148,9 +169,10 @@ model each resolver builds over its own AST is not**, and must not be.
 - **Rust (`syn`)** — bindings come from **patterns**, not just `let`: `for <pat> in`,
   `if let`/`while let`, `match`-arm patterns (`Ok(mut x)`), and closure params all
   introduce `Local` bindings; item/block scoping and pattern destructuring are Rust's.
-  The mutable-static set (`static`/`static mut`/interior-mut statics) is the `Global`
-  channel (no casing proxy). These are Rust semantics — no other frontend has patterns or
-  `static`.
+  The mutable-static set (`static`/`static mut`/interior-mut statics) is the `ModuleBinding`
+  channel (`Heuristic`, by the real static-name set — no casing proxy); Rust has no
+  `global`-declaration keyword, so nothing is the `Exact` `Global` origin. These are Rust
+  semantics — no other frontend has patterns or `static`.
 - **Shell (`brush-parser`)** — has **no lexical binding cascade at all** (dynamic scoping;
   see the mutation guideline's declaration-vs-hidden gate). It does **not** implement this
   resolver; its `is_script`/`local`-declaration gate stands in for binding origin. Listed
