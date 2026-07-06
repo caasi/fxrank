@@ -49,6 +49,14 @@ two things consumed **before the `UnitRecord` leaves the frontend**:
 2. a correctly-scoped `CallSiteRef` — a call whose base resolves to a param/local is a
    bare local ref, **not** a qualified outward import ref (feeds the cross-file resolver).
 
+*(Staging note — Python 078: the first Python step delivers consumer 1 only. Consumer 2
+(scoped `CallSiteRef`) is a **named non-goal** of that step — `calls.rs` keeps consuming the
+file-wide `Imports` table, so the cross-function import collision still exists on the
+call-resolution side until a follow-up moves `calls.rs` onto the resolver. Deferring it
+keeps 078's Python step to two labelled deltas rather than adding a call-graph delta axis;
+the resolver it builds is the prerequisite. This is recorded so the half is deferred, not
+silently unfinished.)*
+
 ## The `BindingOrigin` vocabulary
 
 The canonical result classes every frontend's resolver returns. The resolver owns
@@ -172,9 +180,17 @@ model each resolver builds over its own AST is not**, and must not be.
   (→ `Global`/`EnclosingCaptured`, not `Local`); comprehension and generator expressions
   get **their own scope** (Python 3), so a comprehension target does not leak to the
   enclosing function; `import` vs `from`-import is the `ModuleImport`/`FromImport` split.
-  These are Python semantics — no other frontend has them. *(Target note: `match`-arm
-  captures, comprehension-scope targets, and walrus `:=` are **uncollected residuals in the
-  code today** — see the mutation guideline's prescan limits; 078 is where they land.)*
+  These are Python semantics — no other frontend has them. *(078 status: `match`-arm
+  captures, walrus `:=`, and comprehension targets — **uncollected residuals** in the flat
+  code — are collected in 078's Python step. **Deliberate divergence, code wins:** comp
+  targets are collected into the **function scope** as `Local`, not a comprehension-own
+  scope. It is **effect-identical** for mutation classification (`local.mutation` either
+  way), and the only observable difference — a comp target's name reused outside the
+  comprehension — is impossible in valid Python 3 (targets don't leak) and, in broken code,
+  misresolves toward a false negative, never an FP (charter: FP ≫ FN). The comprehension
+  scope in this bullet is the **target model**, load-bearing only once a consumer must
+  distinguish comp-scope from function-scope, e.g. shared-global identity (#81) or an
+  implicit-capture walk; build it then, not now.)*
 - **TS/JS (`swc`)** — `var` **hoists** to the function scope while `let`/`const` are
   **block-scoped with a TDZ**; closures capture by reference; a namespace import
   (`import * as V`) is an **immutable module namespace** (→ its own suppression, like
