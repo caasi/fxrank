@@ -328,18 +328,54 @@ fn is_mutating_method(name: &str) -> bool {
     )
 }
 
-impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
-    fn visit_local(&mut self, node: &'ast syn::Local) {
-        // Track all bindings introduced by the pattern, including destructuring.
+impl MutationWalker<'_> {
+    /// Seed every binding a pattern introduces into `locals` (and `let_mut` for
+    /// `mut` bindings). Shared by all binding forms (`let`, `for`, `if let`/
+    /// `while let`, `match` arms, closure params) so a write to any of them
+    /// classifies as `local.mutation`, not the captured-binding `hidden.mutation`
+    /// fallback (#55). Flat function-scoped seeding — the Milestone-A scope
+    /// approximation `visit_local` already uses (true lexical scoping is #78).
+    fn seed_pat_locals(&mut self, pat: &syn::Pat) {
         let mut bindings = Vec::new();
-        collect_pat_bindings(&node.pat, &mut bindings);
+        collect_pat_bindings(pat, &mut bindings);
         for (name, is_mut) in bindings {
             self.locals.insert(name.clone());
             if is_mut {
                 self.let_mut.insert(name);
             }
         }
+    }
+}
+
+impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        self.seed_pat_locals(&node.pat);
         syn::visit::visit_local(self, node);
+    }
+
+    // #55: seed the bindings introduced by the other binding forms (previously
+    // only `let` was seeded, so `for`/`if let`/`match`-arm/closure bindings fell
+    // to the captured-binding hidden.mutation FP — ~76× in dogfooding).
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.seed_pat_locals(&node.pat); // `for <pat> in …`
+        syn::visit::visit_expr_for_loop(self, node);
+    }
+
+    fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+        self.seed_pat_locals(&node.pat); // `if let <pat> = …` / `while let <pat> = …`
+        syn::visit::visit_expr_let(self, node);
+    }
+
+    fn visit_arm(&mut self, node: &'ast syn::Arm) {
+        self.seed_pat_locals(&node.pat); // `match` arm (`Ok(mut x) => …`)
+        syn::visit::visit_arm(self, node);
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        for pat in &node.inputs {
+            self.seed_pat_locals(pat); // closure params (`|x| …`)
+        }
+        syn::visit::visit_expr_closure(self, node);
     }
 
     fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
@@ -456,5 +492,55 @@ fn base_ident(expr: &syn::Expr) -> Option<String> {
         syn::Expr::Paren(p) => base_ident(&p.expr),
         syn::Expr::MethodCall(m) => base_ident(&m.receiver),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fxrank_core::effect::EffectKind;
+
+    /// Parse a single `fn` and return the mutation effect kinds in its body.
+    fn mut_kinds(src: &str) -> Vec<EffectKind> {
+        let file = syn::parse_file(src).unwrap();
+        let imports = ImportTable::from_file(&file);
+        let statics = HashSet::new();
+        let item_fn = file
+            .items
+            .iter()
+            .find_map(|it| match it {
+                syn::Item::Fn(f) => Some(f),
+                _ => None,
+            })
+            .expect("expected one fn");
+        detect(&item_fn.block, &item_fn.sig, &statics, &imports)
+            .iter()
+            .map(|e| e.kind)
+            .collect()
+    }
+
+    /// #78/#55: writes to `for` / `if let` / `while let` / `match`-arm / closure
+    /// bindings must classify as `local.mutation`, not the captured-binding
+    /// `hidden.mutation` FP (previously only `let` seeded locals — ~76× in dogfood).
+    #[test]
+    fn binding_forms_seed_locals_not_captured() {
+        let cases = [
+            "fn f(v: Vec<Vec<i32>>) { for mut x in v { x.push(1); } }",
+            "fn f(o: Option<Vec<i32>>) { if let Some(mut x) = o { x.push(1); } }",
+            "fn f(o: Option<Vec<i32>>) { while let Some(mut x) = o { x.push(1); } }",
+            "fn f(r: Result<Vec<i32>, ()>) { match r { Ok(mut x) => x.push(1), _ => {} } }",
+            "fn f() { let c = |mut x: Vec<i32>| x.push(1); let _ = c; }",
+        ];
+        for src in cases {
+            let kinds = mut_kinds(src);
+            assert!(
+                !kinds.contains(&EffectKind::HiddenMutation),
+                "binding form must not be captured hidden.mutation; src={src:?} got {kinds:?}"
+            );
+            assert!(
+                kinds.contains(&EffectKind::LocalMutation),
+                "the mutation should be local.mutation; src={src:?} got {kinds:?}"
+            );
+        }
     }
 }
