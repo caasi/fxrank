@@ -2,10 +2,12 @@
 
 How FxRank's language frontends resolve a **name use inside a unit body** to the
 **binding it denotes** (a param, a local, an import, a module top-level binding, a
-captured enclosing local, an ambient host global, …). This is the **intra-unit** twin
+captured enclosing local, an ambient host global, …). This is the **intra-file** twin
 of the cross-file resolver: `cross-file-resolution-guideline.md` answers *"which unit
 does this call reach?"* over `UnitRecord`s in the core; this doc answers *"which binding
-does this name denote?"* inside one unit, over the frontend's own AST.
+does this name denote?"* within a file, over the frontend's own AST (its scope tree) —
+entirely in the frontend, so its results never reach the core (§*The load-bearing
+invariant*).
 
 This is a **descriptive reference** for the shared cross-language model. It is **mostly a
 target model** — the design spec 078 builds; nothing conforms yet. The **floor today** is
@@ -24,7 +26,7 @@ extends *downward*, and the `CallSiteRef` emitter this doc also feeds).
 
 Every frontend today reduces a name use to a **bare string** and asks flat per-unit sets
 "is this name a local? a param? an import?" — membership tests on file-wide or
-function-wide string sets. This is the **intra-unit analogue of the pre-025 name-based
+function-wide string sets. This is the **within-file analogue of the pre-025 name-based
 cross-file resolver** (match a call by its last path segment), and it has the same two
 failure modes: it **mis-resolves under shadowing** (a param `os` and an imported `os` are
 the same string) and it **leaks across scopes** (a function-local `import x as NAME`
@@ -72,36 +74,48 @@ already imply, so the two docs stay aligned.
 resolver shrinks it to its true meaning (genuinely out of this unit's lexical reach), so
 `captured-binding` stops over-firing (#55).
 
-## The binding-id scheme — intra-unit identity, optionally `canonical_path`-prefixed
+## The binding-id scheme — the unit's `canonical_path` extended below
 
-Resolution is **intra-unit** (§*The load-bearing invariant*), so a binding id only needs to
-be **unique within its unit**: its lexical scope path plus a kind-tagged name.
+Resolution runs over the **file's scope tree** — `module → function/method → block` — in
+the frontend. Every binding lives at some node of that tree; its id is that node's path,
+split at the **unit boundary** into two parts that compose:
 
-```
-binding_id = scope_segments ++ [ "kind:name" ]     # intra-unit — always well-defined
-```
-
-Where the unit *has* a `canonical_path` (the cross-file identity, a `Vec<String>` of FQ
-segments), prefixing it makes the id **globally** unique too — the same identity scheme at
-two granularities, #36's `canonical_path` extended one level down:
-
-```
-full_binding_id = unit.canonical_path ++ scope_segments ++ [ "kind:name" ]   # when canonical_path is non-empty
-```
+- the **unit's `canonical_path`** — the FQ path *of the enclosing unit* (function/method/
+  module-init), already the cross-file identity (a `Vec<String>` ending in the unit's own
+  name, e.g. `["mod","f"]`);
+- the **`scope_segments`** — the path from the unit's body root *down to* the binding,
+  strictly **below** the unit (block ordinals, comprehension/arm/closure markers). A
+  binding at the unit's body root has **empty** `scope_segments`.
 
 ```
-f's param os:                  ["f","param:os"]        full: ["mod","f","param:os"]
-module `import os`:             ["import:os"]           full: ["mod","import:os"]   (scope_segments empty ⇒ module scope)
-module `from cfg import CACHE`: ["from:CACHE"]
-g's `import os as CACHE`:       ["g","import:CACHE"]
-a for-loop binding x in f:      ["f","b3","local:x"]    (b3 = a lexical scope label)
+scope_segments      = path below the unit's body root (empty at the root)     # strictly below the unit
+full_binding_id     = unit.canonical_path ++ scope_segments ++ [ "kind:name" ]
 ```
 
-The global prefix is **optional and often absent**: a Python method / nested `def`, or a
-Rust file with no crate root in scope, has an **empty** `canonical_path` (spec 025-3e's
-degradation). That is fine — the intra-unit id is still well-defined, and #78 never needs
-the global form (nothing crosses the unit boundary). The prefix is a free tie-in to #36
-when available, not a dependency.
+`scope_segments` never repeats the unit's own name — that name lives once, in
+`canonical_path` — so the composition cannot double-count.
+
+```
+                                canonical_path   scope_segs   kind:name        full_binding_id
+f's param os:                   ["mod","f"]      []           "param:os"    →  ["mod","f","param:os"]
+a for-loop binding x in f:      ["mod","f"]      ["b3"]       "local:x"     →  ["mod","f","b3","local:x"]   (b3 = a block label)
+module `import os`:             ["mod"]          []           "import:os"   →  ["mod","import:os"]
+module `from cfg import CACHE`: ["mod"]          []           "from:CACHE"  →  ["mod","from:CACHE"]
+g's `import os as CACHE`:       ["mod","g"]      []           "import:CACHE"→  ["mod","g","import:CACHE"]
+```
+
+Module-level bindings (`import os`, `from cfg import CACHE`) live at **module scope** — the
+module-init unit's `canonical_path` (`["mod"]`) — and are shared by every function-unit in
+the file. A function-local import (`g`'s `import os as CACHE`) lives inside `g`'s unit
+(`["mod","g"]`), **not** module scope — which is exactly why it cannot leak to `f` (see the
+collision corollary).
+
+When the unit's `canonical_path` is **empty** — a Python method / nested `def`, or a Rust
+file with no crate root in scope (spec 025-3e's degradation) — the id is still well-formed
+`scope_segments ++ [ "kind:name" ]`, just **file-relative rather than globally unique**.
+That is fine: #78's results never leave the frontend (§*The load-bearing invariant*), so
+file-relative uniqueness is all resolution needs; the `canonical_path` prefix is a free
+global tie-in to #36 when available, not a dependency.
 
 Conventions:
 
@@ -193,12 +207,17 @@ model each resolver builds over its own AST is not**, and must not be.
 
 This is **exactly the #31 line not to cross.** #31's shared-resolver-over-a-normalized-
 scope-graph was deferred because that scope graph is a premature IR that creeps toward a
-platform; `UnitRecord` exists precisely to keep language detail out of the core. Intra-unit
-resolution needs the full AST and the language's scope rules — so it stays in the frontend,
-where mutation classification already lives. If a future **inter-unit** consumer ever
-genuinely needs a binding id (none does today — mutation is intra-unit, call resolution is
-#36-covered), that is a fresh, separately-justified issue built from real pressure, not a
-field quietly added here.
+platform; `UnitRecord` exists precisely to keep language detail out of the core.
+Resolution runs over the file's scope tree and needs the full AST and the language's scope
+rules — so it stays in the frontend, where mutation classification already lives, and only
+its *results* (the `BindingOrigin`, the scoped `CallSiteRef`) ever leave, consumed before
+the record is emitted. Note this resolution is **intra-file but not intra-unit**: module
+scope is shared across a file's function-units, so a name in `f`'s body can resolve to a
+module-level binding, and the cross-function-collision fix reasons across `f` and `g` at
+once — all still frontend-internal, none of it on the record. If a future consumer in the
+**core** ever genuinely needs a binding id (none does today — resolution is frontend-local,
+call resolution is #36-covered), that is a fresh, separately-justified issue built from
+real pressure, not a field quietly added here.
 
 ## Migration discipline
 
