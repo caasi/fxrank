@@ -288,21 +288,44 @@ impl<'a> MutationWalker<'a> {
         )
     }
 
-    /// #55/D4: `true` when `expr` is a bare ambient web-storage global
-    /// (`localStorage` / `sessionStorage` / `indexedDB`) that the call detector
-    /// already classifies as `net.fs.db` — modulo shadowing, so a param/local of
-    /// the same name still records its real mutation. A mutating-method call on
-    /// such a global is not a mutation of it, so the mutation walker must not emit
-    /// a captured-binding hidden.mutation for it.
+    /// #55/D4: `true` when `expr` is an ambient web-storage global that the call
+    /// detector already classifies as `net.fs.db`, so a mutating-method call on it
+    /// is not a mutation of it and must not emit a captured-binding hidden.mutation.
+    /// Recognizes both the bare form (`sessionStorage`, modulo shadowing by a
+    /// closer local/param so a param of the same name keeps its real mutation) and
+    /// the `window.`/`globalThis.`-qualified form — the read side canonicalizes the
+    /// alias away (`calls.rs::strip_global_object_prefix`), so the mutation side
+    /// must match it or `window.sessionStorage.clear()` double-emits a spurious
+    /// `global.mutation` (base collapses to `window`).
     fn is_web_global_receiver(&self, expr: &Expr) -> bool {
-        matches!(
-            strip_place_wrappers(expr),
-            Expr::Ident(id)
-                if matches!(id.sym.as_ref(), "localStorage" | "sessionStorage" | "indexedDB")
+        match strip_place_wrappers(expr) {
+            // bare `sessionStorage` — shadow-aware.
+            Expr::Ident(id) => {
+                is_web_storage_name(&id.sym)
                     && !self.locals.contains(id.sym.as_ref())
                     && !self.params.contains(id.sym.as_ref())
-        )
+            }
+            // `window.sessionStorage` / `globalThis.indexedDB` — the alias is not
+            // shadow-checked, matching the read-side canonicalization.
+            Expr::Member(MemberExpr {
+                obj,
+                prop: MemberProp::Ident(prop),
+                ..
+            }) => {
+                is_web_storage_name(&prop.sym)
+                    && matches!(
+                        strip_place_wrappers(obj),
+                        Expr::Ident(o) if matches!(o.sym.as_ref(), "window" | "globalThis")
+                    )
+            }
+            _ => false,
+        }
     }
+}
+
+/// The ambient web-storage global names the call detector owns (see `detect/calls.rs`).
+fn is_web_storage_name(name: &str) -> bool {
+    matches!(name, "localStorage" | "sessionStorage" | "indexedDB")
 }
 
 /// The result of escape-classifying a write's base ident.
@@ -1123,13 +1146,19 @@ mod tests {
         for src in [
             "function f() { sessionStorage.clear(); }",
             "function f() { localStorage.clear(); }",
+            // F2: the `window.`/`globalThis.`-qualified forms too — the read side
+            // canonicalizes these, so the mutation side must not double-emit
+            // (base collapses to `window` → spurious global.mutation otherwise).
+            "function f() { window.sessionStorage.clear(); }",
+            "function f() { globalThis.localStorage.clear(); }",
         ] {
             let effects = detect_in_fn(src, "f");
             assert!(
                 effects
                     .iter()
-                    .all(|(e, _)| e.kind != EffectKind::HiddenMutation),
-                "web-global .clear() must not emit hidden.mutation; src={src:?} got {:?}",
+                    .all(|(e, _)| e.kind != EffectKind::HiddenMutation
+                        && e.kind != EffectKind::GlobalMutation),
+                "web-global .clear() must not emit a spurious mutation; src={src:?} got {:?}",
                 effects.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
             );
         }

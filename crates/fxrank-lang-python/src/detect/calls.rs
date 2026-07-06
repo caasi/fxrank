@@ -252,7 +252,9 @@ fn classify_resolved(full: &str) -> Option<(EffectKind, Tier)> {
     // the ranking. Missing a real IO member here is a tolerated false negative;
     // flagging a pure one is the class-corrupting false positive we're removing.
     // `socket` network/DNS ops; the byte-order / address conversions
-    // (`htons`/`inet_aton`/…) are pure and excluded.
+    // (`htons`/`inet_aton`/…) are pure and excluded, as is `gethostname` (a local
+    // libc call returning the configured hostname — no network round-trip, unlike
+    // `gethostbyname`/`getfqdn`).
     if root == "socket"
         && matches!(
             leaf,
@@ -263,7 +265,6 @@ fn classify_resolved(full: &str) -> Option<(EffectKind, Tier)> {
                 | "gethostbyname"
                 | "gethostbyname_ex"
                 | "gethostbyaddr"
-                | "gethostname"
                 | "getfqdn"
                 | "getnameinfo"
         )
@@ -286,16 +287,20 @@ fn classify_resolved(full: &str) -> Option<(EffectKind, Tier)> {
         return Some((NetFsDb, Tier::Path));
     }
     // `aiohttp`: the `ClientSession` boundary and module-level `request` do IO;
-    // `ClientTimeout`/`TCPConnector` are pure config objects.
+    // `ClientTimeout`/`TCPConnector` are pure config objects. `ClientSession` is
+    // KEPT even though it's a lazy pool constructor: dogfood (tw-odc
+    // `check_url_health`) shows it created-and-immediately-used, and the actual
+    // request (`session.head()`/`.get()`) is invisible to `classify_method` — so
+    // `ClientSession()` is the only retained signal for a real network hotspot
+    // (model-diverse review, empirically decided).
     if root == "aiohttp" && matches!(leaf, "ClientSession" | "request") {
         return Some((NetFsDb, Tier::Path));
     }
-    // `sqlalchemy.create_engine`/`create_async_engine` open the DB; `select`/
-    // `Column`/`Table`/`text`/`func.*` build lazy/pure query & schema objects
-    // (`.execute`/`.connect` are receiver-method calls, handled by classify_method).
-    if root == "sqlalchemy" && matches!(leaf, "create_engine" | "create_async_engine") {
-        return Some((NetFsDb, Tier::Path));
-    }
+    // `sqlalchemy` gets no arm: `create_engine`/`create_async_engine` are lazy
+    // (no DBAPI connection until `.connect()`/`.execute()`), have zero dogfood
+    // witnesses, AND the real DB IO IS caught by `classify_method` (`execute`) — so
+    // flagging the factory only preserves a theoretical c7 FP (model-diverse review).
+    // `select`/`Column`/`Table` build pure query/schema objects.
     if root == "shutil"
         && matches!(
             leaf,
@@ -809,9 +814,12 @@ mod tests {
         let fp_cases = [
             "import csv\ndef f(rows):\n    return csv.reader(rows)\n", // fs-pure
             "import socket\ndef f():\n    return socket.htons(80)\n",  // pure byte-order
+            "import socket\ndef f():\n    return socket.gethostname()\n", // local libc, no network
             "import tempfile\ndef f():\n    return tempfile.gettempdir()\n", // ambient read
             "import aiohttp\ndef f():\n    return aiohttp.ClientTimeout(total=1)\n", // config
             "import sqlalchemy\ndef f(t):\n    return sqlalchemy.select(t)\n", // pure query obj
+            // sqlalchemy dropped entirely: create_engine is lazy + .execute() is caught elsewhere.
+            "import sqlalchemy\ndef f(u):\n    return sqlalchemy.create_engine(u)\n",
         ];
         for src in fp_cases {
             let effects = effects_for_src(src);
@@ -824,9 +832,9 @@ mod tests {
 
         let tp_cases = [
             "import socket\ndef f():\n    return socket.socket()\n",
+            "import socket\ndef f(h):\n    return socket.gethostbyname(h)\n", // real DNS
             "import tempfile\ndef f():\n    return tempfile.mkstemp()\n",
-            "import aiohttp\ndef f():\n    return aiohttp.ClientSession()\n",
-            "import sqlalchemy\ndef f(u):\n    return sqlalchemy.create_engine(u)\n",
+            "import aiohttp\ndef f():\n    return aiohttp.ClientSession()\n", // kept: sole network signal
             "import requests\ndef f(u):\n    return requests.get(u)\n", // requests stays whole-package
         ];
         for src in tp_cases {
