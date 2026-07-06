@@ -219,6 +219,15 @@ once — all still frontend-internal, none of it on the record. If a future cons
 call resolution is #36-covered), that is a fresh, separately-justified issue built from
 real pressure, not a field quietly added here.
 
+**Non-goal — cross-unit / cross-file *shared-global* identity.** Recognizing foo's `x` and
+bar's `foo.x` as the *same* global, or coupling functions through a shared mutable global,
+is deliberately **not** #78: #36 resolves cross-file *calls* (not variable identity), and
+#78 is intra-file. That capability — a shared global as a cross-unit dependency node — is
+the sibling axis **#81**, a clean *additive* layer on this finished resolver (a resolved
+`GlobalRead`/`GlobalWrite` ref, #36-shaped), designed-and-deferred until dogfood pressure.
+#78 emits nothing for it now; it is the prerequisite (its `BindingOrigin` is what would
+decide "global vs shadowing param"), not the host.
+
 ## Migration discipline
 
 **Compat-mode first, then labelled intentional deltas** — the spec-008 migration shape.
