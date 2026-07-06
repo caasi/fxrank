@@ -19,10 +19,11 @@ docs + the code**, without reading any spec. Start here:
    authoring checklist: the trait to implement, the crate skeleton, every per-axis
    decision, wiring, and the test bar. It links out to the three guidelines below at the
    points where each decision is made.
-2. Then the three shared models, each governing one axis you must fill a column into:
+2. Then the shared models, each governing one axis you must fill a column into:
    - **[`mutation-classification-guideline.md`](mutation-classification-guideline.md)** — how a write site becomes a mutation effect.
    - **[`corpus-profile-guideline.md`](corpus-profile-guideline.md)** — which files are scanned vs skipped (your `CORPUS_PROFILE`).
    - **[`cross-file-resolution-guideline.md`](cross-file-resolution-guideline.md)** — imports → definitions, the call graph, propagation, and the first-party/third-party boundary.
+   - **[`scope-aware-binding-resolution-guideline.md`](scope-aware-binding-resolution-guideline.md)** — a name use → the binding it denotes, within a unit (feeds the mutation model). *Target model (spec 078); not implemented yet.*
 3. Normative source for scores (no spec needed): `crates/fxrank-core/src/score.rs`
    (weights, discounts, `own_score`, `rank_key`) and the `EffectKind`/`RiskKind`
    vocabularies in `crates/fxrank-core/src/effect.rs`.
@@ -35,13 +36,15 @@ docs + the code**, without reading any spec. Start here:
 | `mutation-classification-guideline.md` | Descriptive model | Write-site → mutation effect, per language |
 | `corpus-profile-guideline.md` | Descriptive model | File selection / skip, per language |
 | `cross-file-resolution-guideline.md` | Descriptive model | Cross-file resolution, call graph, propagation |
+| `scope-aware-binding-resolution-guideline.md` | Descriptive model (target) | Intra-unit name → binding resolution, feeding the mutation model |
 | `008-dogfood-deltas.md` | Historical log | One-time spec-008 before/after observation (not a live model) |
 
-All three descriptive models roughly share one shape — a **shared model**, a per-language
+The descriptive models roughly share one shape — a **shared model**, a per-language
 breakdown (a table in the mutation/corpus guidelines; a richer structure in the cross-file
 one), **Honest per-language differences (intentional)**, and **Per-frontend realization**
 (headings vary slightly) — so a new language is, in each, one new column/bullet plus one
-realization bullet.
+realization bullet. (The scope-aware-binding-resolution model is a **target** for spec 078,
+not yet implemented — it follows the same shape so it slots in when built.)
 
 ## SDD artifacts (`docs/superpowers/`)
 
