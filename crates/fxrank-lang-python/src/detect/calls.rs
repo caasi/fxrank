@@ -237,20 +237,65 @@ fn classify_resolved(full: &str) -> Option<(EffectKind, Tier)> {
     let leaf = full.rsplit('.').next().unwrap_or(full);
 
     // ── net.fs.db (class 7) ──
-    // Roots still classified whole-package. `requests`/`httpx`/`aiohttp` are
-    // IO-dominant at the root. `tempfile`/`csv`/`socket`/`sqlalchemy` are actually
-    // mixed-purity (pure helpers exist — `csv.reader`, `socket.htons`,
-    // `sqlalchemy.select`), but they were NOT in this fix's validated-FP set, so
-    // member-splitting them (like shutil/urllib/sqlite3 below) is deferred to #63.
-    if matches!(root, "tempfile" | "csv" | "socket")
-        || matches!(root, "requests" | "httpx" | "aiohttp" | "sqlalchemy")
-    {
+    // `requests`/`httpx` stay whole-package: their module-level convenience calls
+    // (`requests.get`/`post`/…) are IO-dominant. (`csv` is intentionally absent —
+    // see below.)
+    if matches!(root, "requests" | "httpx") {
         return Some((NetFsDb, Tier::Path));
     }
+    // `csv` is fs-PURE and gets no arm at all: `csv.reader`/`writer`/`DictReader`
+    // operate on an already-open file object or iterable — the module never opens
+    // or touches the filesystem itself (the `open(...)` is scored separately).
+    //
     // Mixed-purity roots (#49): classify by the specific member, not the package
     // root — these packages carry pure members that must not land at c7 and top
     // the ranking. Missing a real IO member here is a tolerated false negative;
     // flagging a pure one is the class-corrupting false positive we're removing.
+    // `socket` network/DNS ops; the byte-order / address conversions
+    // (`htons`/`inet_aton`/…) are pure and excluded.
+    if root == "socket"
+        && matches!(
+            leaf,
+            "socket"
+                | "create_connection"
+                | "create_server"
+                | "getaddrinfo"
+                | "gethostbyname"
+                | "gethostbyname_ex"
+                | "gethostbyaddr"
+                | "gethostname"
+                | "getfqdn"
+                | "getnameinfo"
+        )
+    {
+        return Some((NetFsDb, Tier::Path));
+    }
+    // `tempfile` creators touch the fs; `gettempdir`/`gettempprefix` are ambient reads.
+    if root == "tempfile"
+        && matches!(
+            leaf,
+            "mkstemp"
+                | "mkdtemp"
+                | "mktemp"
+                | "NamedTemporaryFile"
+                | "TemporaryFile"
+                | "TemporaryDirectory"
+                | "SpooledTemporaryFile"
+        )
+    {
+        return Some((NetFsDb, Tier::Path));
+    }
+    // `aiohttp`: the `ClientSession` boundary and module-level `request` do IO;
+    // `ClientTimeout`/`TCPConnector` are pure config objects.
+    if root == "aiohttp" && matches!(leaf, "ClientSession" | "request") {
+        return Some((NetFsDb, Tier::Path));
+    }
+    // `sqlalchemy.create_engine`/`create_async_engine` open the DB; `select`/
+    // `Column`/`Table`/`text`/`func.*` build lazy/pure query & schema objects
+    // (`.execute`/`.connect` are receiver-method calls, handled by classify_method).
+    if root == "sqlalchemy" && matches!(leaf, "create_engine" | "create_async_engine") {
+        return Some((NetFsDb, Tier::Path));
+    }
     if root == "shutil"
         && matches!(
             leaf,
@@ -747,6 +792,48 @@ mod tests {
             assert!(
                 effects.iter().any(|e| e.kind == NetFsDb && e.class == 7),
                 "genuine IO member must flag net.fs.db c7; src={src:?} got {:?}",
+                effects
+                    .iter()
+                    .map(|e| (e.kind, e.class))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Member-precision sweep for the remaining mixed-purity roots (D1 deferrals,
+    /// dogfood-confirmed): `csv` is dropped (fs-pure); `socket`/`tempfile`/
+    /// `aiohttp`/`sqlalchemy` classify by member. Pure members must not land at c7;
+    /// genuine IO members must stay c7. `requests`/`httpx` stay whole-package.
+    #[test]
+    fn mixed_purity_roots_classify_by_member() {
+        let fp_cases = [
+            "import csv\ndef f(rows):\n    return csv.reader(rows)\n", // fs-pure
+            "import socket\ndef f():\n    return socket.htons(80)\n",  // pure byte-order
+            "import tempfile\ndef f():\n    return tempfile.gettempdir()\n", // ambient read
+            "import aiohttp\ndef f():\n    return aiohttp.ClientTimeout(total=1)\n", // config
+            "import sqlalchemy\ndef f(t):\n    return sqlalchemy.select(t)\n", // pure query obj
+        ];
+        for src in fp_cases {
+            let effects = effects_for_src(src);
+            assert!(
+                !effects.iter().any(|e| e.kind == NetFsDb),
+                "pure member must not be net.fs.db; src={src:?} got {:?}",
+                effects.iter().map(|e| e.kind).collect::<Vec<_>>()
+            );
+        }
+
+        let tp_cases = [
+            "import socket\ndef f():\n    return socket.socket()\n",
+            "import tempfile\ndef f():\n    return tempfile.mkstemp()\n",
+            "import aiohttp\ndef f():\n    return aiohttp.ClientSession()\n",
+            "import sqlalchemy\ndef f(u):\n    return sqlalchemy.create_engine(u)\n",
+            "import requests\ndef f(u):\n    return requests.get(u)\n", // requests stays whole-package
+        ];
+        for src in tp_cases {
+            let effects = effects_for_src(src);
+            assert!(
+                effects.iter().any(|e| e.kind == NetFsDb && e.class == 7),
+                "genuine IO member must be net.fs.db c7; src={src:?} got {:?}",
                 effects
                     .iter()
                     .map(|e| (e.kind, e.class))
