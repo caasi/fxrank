@@ -1105,4 +1105,61 @@ mod tests {
             );
         }
     }
+
+    /// #55/Task 8: a `match`-case capture (`case [name, *args]:`) binds `args`
+    /// as a function-local — mutating it must be LocalMutation(contained), not
+    /// a captured-binding hidden.mutation (the function-scope builder's
+    /// prescan previously never walked `MatchPattern`s at all).
+    #[test]
+    fn match_capture_is_local_not_captured() {
+        let src = "def f(cmd):\n    match cmd:\n        case [name, *args]:\n            args.append(1)\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            pairs
+                .iter()
+                .any(|(e, c)| e.kind == EffectKind::LocalMutation && *c)
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|(e, _)| e.kind == EffectKind::HiddenMutation)
+        );
+    }
+
+    /// #55/Task 8: a walrus `:=` target binds a function-local wherever it
+    /// appears (here, inside an `if` test) — mutating it must be
+    /// LocalMutation(contained), not captured-binding.
+    #[test]
+    fn walrus_target_is_local_not_captured() {
+        let src = "def f(xs):\n    if (buf := list(xs)):\n        buf.append(1)\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            pairs
+                .iter()
+                .any(|(e, c)| e.kind == EffectKind::LocalMutation && *c)
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|(e, _)| e.kind == EffectKind::HiddenMutation)
+        );
+    }
+
+    /// #55/Task 8: a comprehension `for` target binds a function-local (this
+    /// task collects it into the FUNCTION scope, not a comprehension-own scope
+    /// — a deliberate simplification, see `scope.rs`'s `prescan_comp_for` doc
+    /// comment) — mutating it inside the comprehension must not fall to
+    /// captured-binding.
+    #[test]
+    fn comprehension_target_mutation_is_local_not_captured() {
+        let src = "def f(rows):\n    return [r.sort() or r for r in rows]\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            !pairs
+                .iter()
+                .any(|(e, _)| e.kind == EffectKind::HiddenMutation),
+            "comprehension target `r` must resolve locally, got {:?}",
+            pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
+        );
+    }
 }

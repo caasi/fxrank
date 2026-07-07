@@ -6,8 +6,9 @@ use std::collections::{HashMap, HashSet};
 
 use libcst_native::{
     AssignTargetExpression, BaseSlice, ClassDef, CompFor, CompoundStatement, DelTargetExpression,
-    DictElement, Element, Expression, FormattedStringContent, FunctionDef, ImportNames, Module,
-    OrElse, Parameters, SmallStatement, StarArg, Statement, Suite, YieldValue,
+    DictElement, Element, Expression, FormattedStringContent, FunctionDef, ImportNames,
+    MatchPattern, MatchSequence, Module, OrElse, Parameters, SmallStatement, StarArg,
+    StarrableMatchSequenceElement, Statement, Suite, YieldValue,
 };
 
 use crate::functions::FnBody;
@@ -899,6 +900,7 @@ fn prescan_compound(
             }
         }
         CompoundStatement::If(i) => {
+            prescan_expr(&i.test, locals);
             prescan_suite(&i.body, globals, nonlocals, locals, imports, seed_defs);
             if let Some(orelse) = &i.orelse {
                 prescan_orelse(orelse, globals, nonlocals, locals, imports, seed_defs);
@@ -906,12 +908,14 @@ fn prescan_compound(
         }
         CompoundStatement::For(f) => {
             crate::imports::collect_target_names(&f.target, locals);
+            prescan_expr(&f.iter, locals);
             prescan_suite(&f.body, globals, nonlocals, locals, imports, seed_defs);
             if let Some(orelse) = &f.orelse {
                 prescan_suite(&orelse.body, globals, nonlocals, locals, imports, seed_defs);
             }
         }
         CompoundStatement::While(w) => {
+            prescan_expr(&w.test, locals);
             prescan_suite(&w.body, globals, nonlocals, locals, imports, seed_defs);
             if let Some(orelse) = &w.orelse {
                 prescan_suite(&orelse.body, globals, nonlocals, locals, imports, seed_defs);
@@ -949,14 +953,26 @@ fn prescan_compound(
         }
         CompoundStatement::With(w) => {
             for item in &w.items {
+                prescan_expr(&item.item, locals);
                 if let Some(asname) = &item.asname {
                     crate::imports::collect_target_names(&asname.name, locals);
                 }
             }
             prescan_suite(&w.body, globals, nonlocals, locals, imports, seed_defs);
         }
+        // #55/Task 8: a `case` pattern's CAPTURES (`case [name, *args]:`,
+        // `case Foo() as b:`, …) bind function-locals — collected via
+        // `collect_match_pattern_locals` (see its doc comment for which
+        // pattern forms bind vs. which are values-to-compare-against). The
+        // subject and each guard are ordinary expressions and may themselves
+        // hold a walrus target.
         CompoundStatement::Match(m) => {
+            prescan_expr(&m.subject, locals);
             for case in &m.cases {
+                collect_match_pattern_locals(&case.pattern, locals);
+                if let Some(guard) = &case.guard {
+                    prescan_expr(guard, locals);
+                }
                 prescan_suite(&case.body, globals, nonlocals, locals, imports, seed_defs);
             }
         }
@@ -974,6 +990,7 @@ fn prescan_orelse(
 ) {
     match orelse {
         OrElse::Elif(elif) => {
+            prescan_expr(&elif.test, locals);
             prescan_suite(&elif.body, globals, nonlocals, locals, imports, seed_defs);
             if let Some(inner) = &elif.orelse {
                 prescan_orelse(inner, globals, nonlocals, locals, imports, seed_defs);
@@ -1008,13 +1025,43 @@ fn prescan_small(
             for target in &a.targets {
                 crate::imports::collect_target_names(&target.target, locals);
             }
+            prescan_expr(&a.value, locals);
         }
         SmallStatement::AnnAssign(a) => {
             crate::imports::collect_target_names(&a.target, locals);
+            if let Some(v) = &a.value {
+                prescan_expr(v, locals);
+            }
         }
         SmallStatement::AugAssign(a) => {
             if let AssignTargetExpression::Name(n) = &a.target {
                 locals.insert(n.value.to_owned());
+            }
+            prescan_expr(&a.value, locals);
+        }
+        // #55/Task 8: these four never bound anything themselves, but their
+        // expression(s) may hold a walrus target or a comprehension — the
+        // ORIGINAL `prescan_small` never walked into ANY expression at all
+        // (only assign/for/with targets), so these fell through to the `_`
+        // catch-all below and their walrus/comprehension names were missed.
+        SmallStatement::Return(r) => {
+            if let Some(v) = &r.value {
+                prescan_expr(v, locals);
+            }
+        }
+        SmallStatement::Expr(e) => prescan_expr(&e.value, locals),
+        SmallStatement::Raise(r) => {
+            if let Some(exc) = &r.exc {
+                prescan_expr(exc, locals);
+            }
+            if let Some(from) = &r.cause {
+                prescan_expr(&from.item, locals);
+            }
+        }
+        SmallStatement::Assert(a) => {
+            prescan_expr(&a.test, locals);
+            if let Some(msg) = &a.msg {
+                prescan_expr(msg, locals);
             }
         }
         // `import a[.b.c][ as x]` — a plain import binds a MODULE (see
@@ -1050,6 +1097,269 @@ fn prescan_small(
             }
         }
         _ => {}
+    }
+}
+
+// ─── #55/Task 8: match-case captures, walrus targets, comprehension targets ──
+//
+// Three binding forms the ORIGINAL `prescan_*` above never collected, so
+// their names fell to `Unresolved` -> `hidden.mutation "captured-binding"`
+// (false positives). All three are collected here into the SAME function
+// scope as `Local` — the same simple mechanism as the existing assign/for/
+// with collection above, deliberately NOT a comprehension-own scope (see the
+// module-level `ScopeTree` doc comment and the #78 plan for why a comprehension-
+// own scope was ruled out: the comprehension boundary is known only to the
+// shared `detect/mod.rs` walker, not to this frontend-internal builder, and an
+// own-scope split would be EFFECT-IDENTICAL — `local.mutation` either way —
+// so it isn't worth the `EffectSink`/driver surgery it would need).
+
+/// Every name a `match`-case pattern BINDS (captures) — recurse through
+/// sequence/mapping/class/`as`/`or`/`*rest`/`**rest` patterns. A `MatchValue`
+/// (dotted-name/literal comparison, e.g. `case Color.RED:`) and a
+/// `MatchSingleton` (`None`/`True`/`False`) bind nothing — they are VALUES
+/// being compared against, not capture targets (mirrors the grammar's
+/// `capture_pattern` — a bare name — vs. `value_pattern` — a dotted name).
+/// A wildcard `_` is `MatchAs { name: None, .. }` — also not a binding.
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn collect_match_pattern_locals(pattern: &MatchPattern, locals: &mut HashSet<String>) {
+    match pattern {
+        MatchPattern::Value(_) | MatchPattern::Singleton(_) => {}
+        MatchPattern::Sequence(seq) => match seq {
+            MatchSequence::MatchList(l) => {
+                for el in &l.patterns {
+                    collect_starrable_match_element(el, locals);
+                }
+            }
+            MatchSequence::MatchTuple(t) => {
+                for el in &t.patterns {
+                    collect_starrable_match_element(el, locals);
+                }
+            }
+        },
+        MatchPattern::Mapping(m) => {
+            for el in &m.elements {
+                collect_match_pattern_locals(&el.pattern, locals);
+            }
+            if let Some(rest) = &m.rest {
+                locals.insert(rest.value.to_owned());
+            }
+        }
+        MatchPattern::Class(c) => {
+            for el in &c.patterns {
+                collect_match_pattern_locals(&el.value, locals);
+            }
+            for kwd in &c.kwds {
+                collect_match_pattern_locals(&kwd.pattern, locals);
+            }
+        }
+        MatchPattern::As(as_pat) => {
+            if let Some(inner) = &as_pat.pattern {
+                collect_match_pattern_locals(inner, locals);
+            }
+            if let Some(name) = &as_pat.name {
+                locals.insert(name.value.to_owned());
+            }
+        }
+        MatchPattern::Or(or_pat) => {
+            for el in &or_pat.patterns {
+                collect_match_pattern_locals(&el.pattern, locals);
+            }
+        }
+    }
+}
+
+/// A sequence-pattern element (`case [a, *rest]:`) is either a plain
+/// sub-pattern or a starred capture (`*rest`/`*_`).
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn collect_starrable_match_element(
+    el: &StarrableMatchSequenceElement,
+    locals: &mut HashSet<String>,
+) {
+    match el {
+        StarrableMatchSequenceElement::Simple(s) => collect_match_pattern_locals(&s.value, locals),
+        StarrableMatchSequenceElement::Starred(s) => {
+            if let Some(name) = &s.name {
+                locals.insert(name.value.to_owned());
+            }
+        }
+    }
+}
+
+/// Walk `expr` collecting walrus (`NamedExpr`) targets and comprehension
+/// `for` targets — the two forms `prescan_small`/`prescan_compound` above
+/// need an expression-level walk for (neither is a statement-level target).
+/// Recurses into every expression variant that can hold a nested walrus or
+/// comprehension — same shape as `build_in_expr` below, EXCEPT a `Lambda`
+/// body is not descended into: a lambda is its OWN function scope, so a
+/// walrus inside it binds there, not in this (enclosing) scope.
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn prescan_expr(expr: &Expression, locals: &mut HashSet<String>) {
+    match expr {
+        Expression::Lambda(_) => {} // own scope — not descended into, see doc comment above
+        Expression::BinaryOperation(b) => {
+            prescan_expr(&b.left, locals);
+            prescan_expr(&b.right, locals);
+        }
+        Expression::BooleanOperation(b) => {
+            prescan_expr(&b.left, locals);
+            prescan_expr(&b.right, locals);
+        }
+        Expression::UnaryOperation(u) => prescan_expr(&u.expression, locals),
+        Expression::Comparison(c) => {
+            prescan_expr(&c.left, locals);
+            for comp in &c.comparisons {
+                prescan_expr(&comp.comparator, locals);
+            }
+        }
+        Expression::IfExp(i) => {
+            prescan_expr(&i.test, locals);
+            prescan_expr(&i.body, locals);
+            prescan_expr(&i.orelse, locals);
+        }
+        Expression::Call(c) => {
+            prescan_expr(&c.func, locals);
+            for arg in &c.args {
+                prescan_expr(&arg.value, locals);
+            }
+        }
+        Expression::Attribute(a) => prescan_expr(&a.value, locals),
+        Expression::Subscript(s) => {
+            prescan_expr(&s.value, locals);
+            for element in &s.slice {
+                prescan_base_slice(&element.slice, locals);
+            }
+        }
+        Expression::Tuple(t) => {
+            for el in &t.elements {
+                prescan_element(el, locals);
+            }
+        }
+        Expression::List(l) => {
+            for el in &l.elements {
+                prescan_element(el, locals);
+            }
+        }
+        Expression::Set(s) => {
+            for el in &s.elements {
+                prescan_element(el, locals);
+            }
+        }
+        Expression::Dict(d) => {
+            for el in &d.elements {
+                match el {
+                    DictElement::Simple { key, value, .. } => {
+                        prescan_expr(key, locals);
+                        prescan_expr(value, locals);
+                    }
+                    DictElement::Starred(s) => prescan_expr(&s.value, locals),
+                }
+            }
+        }
+        // Comprehension `for` targets (#55/Task 8): bind into THIS function
+        // scope as `Local` (deliberately not a comprehension-own scope, see
+        // this section's header comment).
+        Expression::ListComp(l) => {
+            prescan_comp_for(&l.for_in, locals);
+            prescan_expr(&l.elt, locals);
+        }
+        Expression::SetComp(s) => {
+            prescan_comp_for(&s.for_in, locals);
+            prescan_expr(&s.elt, locals);
+        }
+        Expression::GeneratorExp(g) => {
+            prescan_comp_for(&g.for_in, locals);
+            prescan_expr(&g.elt, locals);
+        }
+        Expression::DictComp(d) => {
+            prescan_comp_for(&d.for_in, locals);
+            prescan_expr(&d.key, locals);
+            prescan_expr(&d.value, locals);
+        }
+        Expression::FormattedString(fs) => prescan_fstring_parts(&fs.parts, locals),
+        Expression::Yield(y) => {
+            if let Some(v) = &y.value {
+                match &**v {
+                    YieldValue::Expression(e) => prescan_expr(e, locals),
+                    YieldValue::From(f) => prescan_expr(&f.item, locals),
+                }
+            }
+        }
+        Expression::Await(a) => prescan_expr(&a.expression, locals),
+        // Walrus (#55/Task 8): the target is always a bare `Name` (the only
+        // syntax Python's grammar allows for `:=`) — binds into THIS function
+        // scope as `Local`, wherever the expression appears (a condition, a
+        // comprehension, …).
+        Expression::NamedExpr(n) => {
+            if let Expression::Name(name) = &*n.target {
+                locals.insert(name.value.to_owned());
+            }
+            prescan_expr(&n.value, locals);
+        }
+        Expression::StarredElement(s) => prescan_expr(&s.value, locals),
+
+        // Leaf expressions (Name, Ellipsis, Integer, Float, Imaginary,
+        // SimpleString, ConcatenatedString, TemplatedString) hold no nested
+        // walrus/comprehension.
+        _ => {}
+    }
+}
+
+/// A comprehension's `for … in …[ if …]` clause chain (list/set/dict/
+/// generator all share this shape) — the target binds a function-`Local`;
+/// `iter` and each `if` may themselves hold a nested walrus/comprehension.
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn prescan_comp_for(comp: &CompFor, locals: &mut HashSet<String>) {
+    crate::imports::collect_target_names(&comp.target, locals);
+    prescan_expr(&comp.iter, locals);
+    for cond in &comp.ifs {
+        prescan_expr(&cond.test, locals);
+    }
+    if let Some(inner) = &comp.inner_for_in {
+        prescan_comp_for(inner, locals);
+    }
+}
+
+/// A destructuring/collection-literal element (`[a, *rest]`) — mirrors
+/// `build_in_element` below.
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn prescan_element(el: &Element, locals: &mut HashSet<String>) {
+    match el {
+        Element::Simple { value, .. } => prescan_expr(value, locals),
+        Element::Starred(s) => prescan_expr(&s.value, locals),
+    }
+}
+
+/// A subscript slice (`x[a:b:c]` or `x[i]`) — mirrors `build_in_base_slice`
+/// below.
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn prescan_base_slice(slice: &BaseSlice, locals: &mut HashSet<String>) {
+    match slice {
+        BaseSlice::Index(i) => prescan_expr(&i.value, locals),
+        BaseSlice::Slice(s) => {
+            if let Some(lower) = &s.lower {
+                prescan_expr(lower, locals);
+            }
+            if let Some(upper) = &s.upper {
+                prescan_expr(upper, locals);
+            }
+            if let Some(step) = &s.step {
+                prescan_expr(step, locals);
+            }
+        }
+    }
+}
+
+/// An f-string's embedded `{expr}` parts — mirrors `build_in_fstring_parts`
+/// below.
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn prescan_fstring_parts(parts: &[FormattedStringContent], locals: &mut HashSet<String>) {
+    for part in parts {
+        if let FormattedStringContent::Expression(e) = part {
+            prescan_expr(&e.expression, locals);
+            if let Some(spec) = &e.format_spec {
+                prescan_fstring_parts(spec, locals);
+            }
+        }
     }
 }
 
