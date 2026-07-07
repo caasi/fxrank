@@ -50,7 +50,7 @@ use super::expr::render_expr;
 use super::{EffectSink, walk_own_body};
 use crate::functions::{FnBody, FnUnit};
 use crate::imports::Imports;
-use crate::scope::{ScopeId, ScopeTree};
+use crate::scope::{BindingOrigin, ScopeId, ScopeTree};
 use crate::source::{SpanIndex, anchor_of_subslice};
 
 /// Detect mutation effects in `unit`'s own body, with escape analysis.
@@ -384,21 +384,26 @@ struct MutSink<'a> {
     /// File-wide import table — lets the cascade resolve an import-rooted write (F5)
     /// and distinguish a captured opaque binding (F1) from a known module.
     imports: &'a Imports,
-    /// Module top-level binding names (assign targets + def/class). A write whose
-    /// root is one of these — and is not a local/param/global-decl/import — is
-    /// module-shared state, escalated to `global.mutation` (the #29 analog).
+    /// Module top-level binding names (assign targets + def/class). Formerly
+    /// consulted directly by `classify_and_push`'s F2-analog arm; that check
+    /// now goes through `scope.resolve(..).0 == BindingOrigin::ModuleBinding`
+    /// instead (the `ScopeTree`'s module scope is seeded from this same set —
+    /// see `ScopeTree::build`). Kept as a `detect()` param/field — not yet
+    /// read directly — since no consumer needs it removed.
+    #[allow(dead_code)]
+    // superseded by scope.resolve's ModuleBinding arm; kept for signature stability
     module_bindings: &'a HashSet<String>,
     /// True when analyzing `__init__` (so `self.attr = …` is local init).
     is_init: bool,
-    /// The file's scope tree (spec 078). Not yet consulted by classification —
-    /// wired in by this task so a later task can switch `classify_and_push`/
-    /// `on_call`/`on_assign_target` over to `scope.resolve(unit_scope, name)`.
-    #[allow(dead_code)] // consulted by a later task; only `unit_scope` is used by this one
+    /// The file's scope tree (spec 078). Consulted by `classify_and_push` and
+    /// `on_assign_target`'s bare-name global/nonlocal gate via
+    /// `scope.resolve(unit_scope, name)`. `on_call` (Task 6) still reads the
+    /// flat `params`/`locals`/`globals`/`nonlocals` fields above — those stay
+    /// until that consumer is ported too.
     scope: &'a ScopeTree,
     /// `unit.symbol`'s own `Function` scope in `scope`, computed once via
-    /// `scope.unit_scope_of(unit)`. Every future resolve() call in this sink
-    /// starts here (there is no per-use-site cursor — see the guideline).
-    #[allow(dead_code)] // consulted by a later task
+    /// `scope.unit_scope_of(unit)`. Every `resolve()` call in this sink starts
+    /// here (there is no per-use-site cursor — see the guideline).
     unit_scope: ScopeId,
     span: &'a SpanIndex<'a>,
     effects: Vec<(Effect, bool)>,
@@ -503,7 +508,10 @@ impl EffectSink for MutSink<'_> {
             // Plain `=` to a bare name declared `global`/`nonlocal` is an escaping
             // rebind, not a local binding — emit. A true local binding emits nothing.
             AssignTargetExpression::Name(n)
-                if self.globals.contains(n.value) || self.nonlocals.contains(n.value) =>
+                if matches!(
+                    self.scope.resolve(self.unit_scope, n.value).0,
+                    BindingOrigin::Global | BindingOrigin::EnclosingCaptured
+                ) =>
             {
                 let name = n.value.to_owned();
                 let (line, col) = name_line_col(n, self.span);
@@ -546,100 +554,109 @@ impl MutSink<'_> {
             return;
         }
 
-        // Global declaration: `global x` → `GlobalMutation`. Include the write
-        // expression in evidence so the report is traceable to the actual write site.
-        if self.globals.contains(&root) {
-            self.push(
-                EffectKind::GlobalMutation,
-                Tier::Exact,
-                line,
-                col,
-                format!("global {root} ({evidence})"),
-                false,
-            );
-            return;
-        }
+        // Resolve the root name via the scope tree, starting at this unit's own
+        // scope. Each arm below reproduces one case of the flat cascade this
+        // replaces (F5 imports, F2-analog module_bindings, F1 captured-fallback —
+        // see the origin→effect table in the spec 078 Task 5 brief), byte-identical.
+        match self.scope.resolve(self.unit_scope, &root).0 {
+            // Global declaration: `global x` → `GlobalMutation`. Include the write
+            // expression in evidence so the report is traceable to the write site.
+            BindingOrigin::Global => {
+                self.push(
+                    EffectKind::GlobalMutation,
+                    Tier::Exact,
+                    line,
+                    col,
+                    format!("global {root} ({evidence})"),
+                    false,
+                );
+            }
 
-        // Nonlocal declaration: `nonlocal x` → `ThisMutation` (escaping outer scope).
-        // Include the write expression for the same traceability reason.
-        if self.nonlocals.contains(&root) {
-            self.push(
-                EffectKind::ThisMutation,
-                Tier::Exact,
-                line,
-                col,
-                format!("nonlocal {root} ({evidence})"),
-                false,
-            );
-            return;
-        }
+            // Nonlocal declaration: `nonlocal x` → `ThisMutation` (escaping outer
+            // scope). Include the write expression for the same reason.
+            BindingOrigin::EnclosingCaptured => {
+                self.push(
+                    EffectKind::ThisMutation,
+                    Tier::Exact,
+                    line,
+                    col,
+                    format!("nonlocal {root} ({evidence})"),
+                    false,
+                );
+            }
 
-        // Parameter mutation: root is a param name (but NOT `self`, handled above).
-        if self.params.contains(&root) {
-            self.push(
-                EffectKind::ParamMutation,
-                Tier::Heuristic,
-                line,
-                col,
-                evidence,
-                false,
-            );
-            return;
-        }
+            // Parameter mutation: root is a param name (but NOT `self`, handled above).
+            BindingOrigin::Param => {
+                self.push(
+                    EffectKind::ParamMutation,
+                    Tier::Heuristic,
+                    line,
+                    col,
+                    evidence,
+                    false,
+                );
+            }
 
-        // Local binding mutation: root is locally assigned (and not global/nonlocal).
-        if self.locals.contains(&root) {
-            self.push(
-                EffectKind::LocalMutation,
-                Tier::Exact,
-                line,
-                col,
-                evidence,
-                true,
-            );
-            return;
-        }
+            // Local binding mutation: root is locally assigned (and not global/nonlocal).
+            BindingOrigin::Local => {
+                self.push(
+                    EffectKind::LocalMutation,
+                    Tier::Exact,
+                    line,
+                    col,
+                    evidence,
+                    true,
+                );
+            }
 
-        // F5: root resolves through the ImportTable → module-level state (the imported
-        // module/name) escaping the function. global.mutation (class 6, Heuristic),
-        // contained=false. A same-named LOCAL already won above.
-        if self.imports.resolve(&root).is_some() {
-            self.push(
-                EffectKind::GlobalMutation,
-                Tier::Heuristic,
-                line,
-                col,
-                format!("{evidence} (imported `{root}`)"),
-                false,
-            );
-            return;
-        }
+            // F5: root resolves through the import table → module-level state (the
+            // imported module/name) escaping the function. global.mutation (class 6,
+            // Heuristic), contained=false. A same-named LOCAL/param/global/nonlocal
+            // already won above (resolve's nearest-binding precedence).
+            BindingOrigin::ModuleImport | BindingOrigin::FromImport => {
+                self.push(
+                    EffectKind::GlobalMutation,
+                    Tier::Heuristic,
+                    line,
+                    col,
+                    format!("{evidence} (imported `{root}`)"),
+                    false,
+                );
+            }
 
-        // F2 analog (Python #29): root is a MODULE top-level binding (a
-        // module-level name / def / class) whose contents are mutated
-        // (subscript/attr/method) — module-shared state used for cross-function /
-        // cross-module communication → global.mutation (class 6, Heuristic). A
-        // bare rebind without `global` is a LOCAL (Python semantics) and already
-        // won above; an explicit `global x` rebind already hit the globals arm.
-        // So this catches exactly the content-mutation-of-module-container case.
-        if self.module_bindings.contains(&root) {
-            self.push(
-                EffectKind::GlobalMutation,
-                Tier::Heuristic,
-                line,
-                col,
-                format!("{evidence} (module-level `{root}`)"),
-                false,
-            );
-            return;
-        }
+            // F2 analog (Python #29): root is a MODULE top-level binding (a
+            // module-level name / def / class) whose contents are mutated
+            // (subscript/attr/method) — module-shared state used for cross-function /
+            // cross-module communication → global.mutation (class 6, Heuristic). A
+            // bare rebind without `global` is a LOCAL (Python semantics) and already
+            // won above; an explicit `global x` rebind already hit the Global arm.
+            // So this catches exactly the content-mutation-of-module-container case.
+            BindingOrigin::ModuleBinding => {
+                self.push(
+                    EffectKind::GlobalMutation,
+                    Tier::Heuristic,
+                    line,
+                    col,
+                    format!("{evidence} (module-level `{root}`)"),
+                    false,
+                );
+            }
 
-        // F1: the root resolves to NONE of self/global/nonlocal/param/local/import/
-        // module-binding — a captured outer (enclosing-function) binding we cannot
-        // bound syntactically → hidden.mutation (class 3, hidden:true,
-        // contained:false), subreason "captured-binding". Mirrors the TS `captured`
-        // hidden case (Milestone A left it un-emitted).
-        self.push_hidden(line, col, evidence, "captured-binding");
+            // F1: the root resolves to NONE of self/global/nonlocal/param/local/import/
+            // module-binding — a captured outer (enclosing-function) binding we cannot
+            // bound syntactically → hidden.mutation (class 3, hidden:true,
+            // contained:false), subreason "captured-binding". Mirrors the TS `captured`
+            // hidden case (Milestone A left it un-emitted).
+            BindingOrigin::Unresolved => {
+                self.push_hidden(line, col, evidence, "captured-binding");
+            }
+
+            // Never constructed by the Python resolver (host-global ambient IO is a
+            // later frontend's concern) — fold into the same fallback as Unresolved.
+            BindingOrigin::HostGlobalIo => {
+                unreachable!("Python resolver never emits HostGlobalIo")
+            }
+        }
     }
 
     /// Push a `HiddenMutation` (`hidden:true` + a `subreason`), always escaping
@@ -1334,5 +1351,75 @@ mod tests {
             !pairs.iter().any(|(e, _)| e.kind == GlobalMutation),
             "destructured local must not escalate to GlobalMutation"
         );
+    }
+
+    /// Characterization pin (spec 078 Task 5): the resolver-based path must
+    /// agree with today's flat-set cascade for one representative write per
+    /// `BindingOrigin`. Passes on the pre-reroute flat code (characterizing
+    /// existing behavior) and must keep passing after `classify_and_push`/
+    /// `on_assign_target` are rerouted onto `ScopeTree::resolve`.
+    #[test]
+    fn classify_origins_match_flat_behavior() {
+        // one representative write per origin; assert exact (kind, contained)
+        let cases: &[(&str, &str, EffectKind, bool)] = &[
+            (
+                "import os\ndef f():\n    global g\n    g = 1\n",
+                "f",
+                EffectKind::GlobalMutation,
+                false,
+            ), // Global (rebind under `global`, via on_assign_target)
+            (
+                "def outer():\n    n = []\n    def f():\n        nonlocal n\n        n.append(1)\n",
+                "f",
+                EffectKind::ThisMutation,
+                false,
+            ), // EnclosingCaptured (nonlocal)
+            (
+                "def f(p):\n    p.append(1)\n",
+                "f",
+                EffectKind::ParamMutation,
+                false,
+            ), // Param
+            (
+                "def f():\n    x = []\n    x.append(1)\n",
+                "f",
+                EffectKind::LocalMutation,
+                true,
+            ), // Local
+            (
+                "import config\ndef f():\n    config.settings.append(1)\n",
+                "f",
+                EffectKind::GlobalMutation,
+                false,
+            ), // ModuleImport (attribute receiver, not on_call-suppressed)
+            (
+                "from cfg import CACHE\ndef f():\n    CACHE.append(1)\n",
+                "f",
+                EffectKind::GlobalMutation,
+                false,
+            ), // FromImport
+            (
+                "STORE = {}\ndef f():\n    STORE['k'] = 1\n",
+                "f",
+                EffectKind::GlobalMutation,
+                false,
+            ), // ModuleBinding
+            (
+                "def f():\n    captured.append(1)\n",
+                "f",
+                EffectKind::HiddenMutation,
+                false,
+            ), // Unresolved -> captured-binding
+        ];
+        for (src, sym, kind, contained) in cases {
+            let pairs = detect_src(src, sym);
+            assert!(
+                pairs
+                    .iter()
+                    .any(|(e, c)| e.kind == *kind && *c == *contained),
+                "src {src:?}: expected {kind:?} contained={contained}, got {:?}",
+                pairs.iter().map(|(e, c)| (e.kind, *c)).collect::<Vec<_>>()
+            );
+        }
     }
 }
