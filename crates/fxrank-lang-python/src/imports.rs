@@ -122,15 +122,6 @@ impl Imports {
     pub fn has_dynamic(&self) -> bool {
         self.dynamic
     }
-
-    /// Iterate every local name introduced by an import statement anywhere in
-    /// the file (the `table` keys). Used by `scope::ScopeTree::build` to
-    /// overlay the file-wide import table onto the module scope, since
-    /// `table` itself is private.
-    #[allow(dead_code)] // ScopeTree isn't wired into the mutation detector yet (spec 078, Task 2)
-    pub(crate) fn iter_local_names(&self) -> impl Iterator<Item = &str> {
-        self.table.keys().map(|s| s.as_str())
-    }
 }
 
 // ─── file-wide statement traversal ────────────────────────────────────────────
@@ -346,7 +337,11 @@ fn collect_small(
 /// Convert a `NameOrAttribute` node to its dot-joined string representation.
 ///
 /// `Name("os")` → `"os"`, `Attribute(Name("a"), Name("b"))` → `"a.b"`.
-fn noa_to_string(noa: &NameOrAttribute) -> String {
+///
+/// `pub(crate)`: also used by `scope.rs`'s top-level/function-body import
+/// collectors (spec 078, #78), so both places parse the same import forms
+/// identically instead of duplicating this logic.
+pub(crate) fn noa_to_string(noa: &NameOrAttribute) -> String {
     match noa {
         NameOrAttribute::N(n) => n.value.to_owned(),
         NameOrAttribute::A(a) => {
@@ -378,7 +373,9 @@ fn collect_attr_parts_expr(expr: &Expression, out: &mut Vec<String>) {
 /// An import `asname` is always a plain `Name` (`import a as b.c` is a syntax
 /// error), so only the `Name` arm is reachable; all other forms fall back to an
 /// empty string.
-fn ate_to_string(ate: &AssignTargetExpression) -> String {
+///
+/// `pub(crate)`: shared with `scope.rs` (see `noa_to_string`).
+pub(crate) fn ate_to_string(ate: &AssignTargetExpression) -> String {
     match ate {
         AssignTargetExpression::Name(n) => n.value.to_owned(),
         _ => String::new(),
@@ -388,7 +385,9 @@ fn ate_to_string(ate: &AssignTargetExpression) -> String {
 /// Return the first dot-component of a dotted path string.
 ///
 /// `"a.b.c"` → `"a"`, `"os"` → `"os"`.
-fn root_component(path: &str) -> String {
+///
+/// `pub(crate)`: shared with `scope.rs` (see `noa_to_string`).
+pub(crate) fn root_component(path: &str) -> String {
     path.split('.').next().unwrap_or(path).to_owned()
 }
 

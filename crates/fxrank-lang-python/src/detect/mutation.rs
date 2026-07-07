@@ -938,29 +938,27 @@ mod tests {
         );
     }
 
-    /// Characterization test — ACCEPTED LIMITATION, not desired behavior (#78).
-    ///
-    /// `Imports` is a single file-wide, flat table (a documented over-approximation:
-    /// an import in one function resolves same-named calls in another). So a
-    /// function-local `import x as NAME` in one function marks `NAME` a module for
-    /// the WHOLE file, and the #50 suppression then drops another function's
-    /// `NAME.<mut>()` — turning the flat table's pre-existing mis-resolution from a
-    /// *mis-classified* mutation into a *dropped* one. The precise fix is
-    /// scope-aware import resolution (deferred, #78 / spec 025 §13a); when it lands,
-    /// this test should flip to assert `GlobalMutation`. Pinned here so the
-    /// behavior change is deliberate, not silent. The trigger is contrived (the
-    /// same short name bound as a module alias in one function and a `from`-imported
-    /// mutable at module scope).
+    /// #78: g's function-local `import os as CACHE` no longer suppresses f's
+    /// CACHE mutation. Scope-aware import resolution (this task) closes the
+    /// cross-function collision the flat/file-wide `Imports` table used to
+    /// cause: module scope now holds only TOP-LEVEL imports, and a
+    /// function-body import binds only that function's own scope — so `g`'s
+    /// local `import os as CACHE` never reaches module scope, and `f`'s
+    /// `CACHE` resolves through module scope to the top-level
+    /// `from cfg import CACHE` (`FromImport`, not `on_call`-suppressed) —
+    /// `GlobalMutation`. Was pinned as an accepted limitation before this fix
+    /// (see git history); this is an intentional, deliberate signal recovery.
     #[test]
-    fn cross_function_flat_import_collision_drops_signal_accepted_limitation() {
+    fn cross_function_import_does_not_leak_across_functions() {
         let src = "from cfg import CACHE\n\
                    def f():\n    CACHE.append(1)\n\
                    def g():\n    import os as CACHE\n";
         let pairs = detect_src(src, "f");
         assert!(
-            !pairs.iter().any(|(e, _)| e.kind == GlobalMutation),
-            "accepted limitation (#78): `g`'s local `import os as CACHE` pollutes the \
-             file-wide table so `f`'s CACHE.append() is currently dropped; got: {:?}",
+            pairs
+                .iter()
+                .any(|(e, c)| e.kind == EffectKind::GlobalMutation && !*c),
+            "f's CACHE (module-level from-import) must be GlobalMutation, got {:?}",
             pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
         );
     }

@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 
 use libcst_native::{
     AssignTargetExpression, BaseSlice, ClassDef, CompFor, CompoundStatement, DelTargetExpression,
-    DictElement, Element, Expression, FormattedStringContent, FunctionDef, Module, OrElse,
-    Parameters, SmallStatement, StarArg, Statement, Suite, YieldValue,
+    DictElement, Element, Expression, FormattedStringContent, FunctionDef, ImportNames, Module,
+    OrElse, Parameters, SmallStatement, StarArg, Statement, Suite, YieldValue,
 };
 
 use crate::functions::FnBody;
@@ -102,8 +102,11 @@ pub(crate) struct ScopeTree {
 }
 
 impl ScopeTree {
-    /// Build the scope tree from a parsed `Module`, its file-wide `Imports`
-    /// table, and its module-level `module_bindings`.
+    /// Build the scope tree from a parsed `Module`, its module-level
+    /// `module_bindings`, and the module's own imports (collected from
+    /// `module` directly — see below; the `_imports` parameter is unused for
+    /// that purpose, kept only so callers' arity is unchanged, same as
+    /// `detect::mutation::detect`'s `_imports`/`_module_bindings`).
     ///
     /// Module-scope construction order is load-bearing and byte-identical to
     /// the flat lookups it replaces: every `module_bindings` name is inserted
@@ -111,23 +114,34 @@ impl ScopeTree {
     /// / `FromImport` — imports **overwrite** any same-named `ModuleBinding`,
     /// reproducing the existing mutation cascade's "imports (F5) checked
     /// before module_bindings (F7)" precedence.
+    ///
+    /// # Per-function import scoping (#78)
+    ///
+    /// Unlike the flat `Imports` table (file-wide: a function-local `import x`
+    /// resolves same-named uses in every OTHER function too — an intentional
+    /// over-approximation there, see `imports.rs`'s doc comment), module scope
+    /// here holds **only top-level imports** — statements directly in
+    /// `module.body`, or nested inside top-level control flow (`if`/`for`/
+    /// `while`/`try`/`with`/`match`, none of which are Python scopes), but NOT
+    /// inside a `def`/`async def`/`lambda` or `class` body. A function-body
+    /// import is instead collected into that function's OWN scope (see
+    /// `build_funcdef`) — it binds locally and never reaches module scope, so
+    /// it can no longer collide with another function's same-named binding.
+    ///
+    /// A **class-body** import (`class C: import os`) is collected into
+    /// neither: a class body is not a lexical scope Python methods see (see
+    /// `build_classdef`), so a class-body import was never a legitimate
+    /// binding oracle for a method's mutations — dropping it here is a small
+    /// bundled correctness gain, not merely a compat concession.
     #[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
     pub(crate) fn build(
         module: &Module,
-        imports: &Imports,
+        _imports: &Imports,
         module_bindings: &HashSet<String>,
     ) -> Self {
         let mut bindings = HashMap::new();
         for name in module_bindings {
             bindings.insert(name.clone(), BindingOrigin::ModuleBinding);
-        }
-        for name in imports.iter_local_names() {
-            let origin = if imports.is_module_import(name) {
-                BindingOrigin::ModuleImport
-            } else {
-                BindingOrigin::FromImport
-            };
-            bindings.insert(name.to_owned(), origin);
         }
         let module_scope = Scope {
             kind: ScopeKind::Module,
@@ -150,17 +164,34 @@ impl ScopeTree {
         // level, but handle them uniformly for safety. M parents to scope 0, so
         // a name M misses (e.g. a top-level `class C` or an import) still
         // resolves through scope 0's `ModuleBinding`/`ModuleImport`/`FromImport`.
+        //
+        // This SAME walk — same shape as `prescan_*`'s "recurse into control
+        // flow, stop at nested def/class" traversal — also collects the
+        // module's TOP-LEVEL imports (`m_imports`), which is exactly the set
+        // scope 0 (the module BINDING scope) needs to overlay as
+        // `ModuleImport`/`FromImport` (#78): M itself does not store them (a
+        // name M misses for imports falls through to scope 0 via the parent
+        // chain, unchanged from before this task).
         let mut m_globals = HashSet::new();
         let mut m_nonlocals = HashSet::new();
         let mut m_locals = HashSet::new();
+        let mut m_imports = HashMap::new();
         for stmt in &module.body {
             prescan_stmt(
                 stmt,
                 &mut m_globals,
                 &mut m_nonlocals,
                 &mut m_locals,
+                &mut m_imports,
                 false, // seed_defs=false: top-level def/class names are ModuleBindings
             );
+        }
+        // Overlay the top-level imports onto scope 0 — imports overwrite any
+        // same-named `ModuleBinding`, same precedence as before this task.
+        for (name, origin) in &m_imports {
+            tree.scopes[module_scope_id]
+                .bindings
+                .insert(name.clone(), *origin);
         }
         let mut m_bindings = HashMap::new();
         for name in m_locals {
@@ -723,13 +754,31 @@ fn build_funcdef(tree: &mut ScopeTree, cur: ScopeId, f: &FunctionDef) {
     // precedence (global > nonlocal > param > local): locals first, then
     // params, then nonlocals, then globals last so later inserts win on a
     // same-named clash.
+    //
+    // #78: `prescan_suite`'s traversal also collects this function's OWN
+    // top-level `import`/`from … import` statements (own-body attribution —
+    // it does not descend into a nested def/class, same as locals/globals/
+    // nonlocals). A local import binds at the same "local" precedence tier —
+    // inserted alongside `locals`, before params/nonlocals/globals — so it
+    // never reaches module scope and never leaks to another function.
     let mut bindings = HashMap::new();
     let mut globals = HashSet::new();
     let mut nonlocals = HashSet::new();
     let mut locals = HashSet::new();
-    prescan_suite(&f.body, &mut globals, &mut nonlocals, &mut locals, true);
+    let mut imports = HashMap::new();
+    prescan_suite(
+        &f.body,
+        &mut globals,
+        &mut nonlocals,
+        &mut locals,
+        &mut imports,
+        true,
+    );
     for name in locals {
         bindings.insert(name, BindingOrigin::Local);
+    }
+    for (name, origin) in imports {
+        bindings.insert(name, origin);
     }
     insert_param_bindings(&mut bindings, &f.params);
     for name in nonlocals {
@@ -764,34 +813,38 @@ fn build_classdef(tree: &mut ScopeTree, cur: ScopeId, c: &ClassDef) {
     build_in_suite(tree, cur, &c.body);
 }
 
-// ─── pre-scan: global/nonlocal declarations + local bindings ─────────────────
+// ─── pre-scan: global/nonlocal declarations + local bindings + imports ───────
 //
 // A faithful replica of `detect::mutation::prescan_body`/`prescan_suite`/
 // `prescan_stmt`/`prescan_compound`/`prescan_orelse`/`prescan_small` — see
 // that module's doc comments for the full binding-form rationale (assign/
 // annassign/augassign-Name targets, `for`/`with as`/`except as`/`except* as`,
 // nested def/class names when `seed_defs`). The originals in `mutation.rs`
-// STAY there (Phase 2 byte-identity depends on them populating the flat
-// fields until a later task deletes them) — this is a parallel collector,
-// not a relocation.
-
+// were removed once Task 6 finished threading `ScopeTree` through the
+// detector — this is a parallel collector, not a relocation, and (#78) now
+// collects one thing the mutation.rs original never did: `import`/
+// `from … import` statements in the SAME "own-body attribution" shape (never
+// descending into a nested def/class body) — used both for a function's own
+// local imports (`build_funcdef`) and, via the module-level call in
+// `ScopeTree::build`, for the module's top-level-only imports.
 #[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn prescan_suite(
     suite: &Suite,
     globals: &mut HashSet<String>,
     nonlocals: &mut HashSet<String>,
     locals: &mut HashSet<String>,
+    imports: &mut HashMap<String, BindingOrigin>,
     seed_defs: bool,
 ) {
     match suite {
         Suite::IndentedBlock(b) => {
             for stmt in &b.body {
-                prescan_stmt(stmt, globals, nonlocals, locals, seed_defs);
+                prescan_stmt(stmt, globals, nonlocals, locals, imports, seed_defs);
             }
         }
         Suite::SimpleStatementSuite(s) => {
             for small in &s.body {
-                prescan_small(small, globals, nonlocals, locals);
+                prescan_small(small, globals, nonlocals, locals, imports);
             }
         }
     }
@@ -803,15 +856,18 @@ fn prescan_stmt(
     globals: &mut HashSet<String>,
     nonlocals: &mut HashSet<String>,
     locals: &mut HashSet<String>,
+    imports: &mut HashMap<String, BindingOrigin>,
     seed_defs: bool,
 ) {
     match stmt {
         Statement::Simple(line) => {
             for small in &line.body {
-                prescan_small(small, globals, nonlocals, locals);
+                prescan_small(small, globals, nonlocals, locals, imports);
             }
         }
-        Statement::Compound(c) => prescan_compound(c, globals, nonlocals, locals, seed_defs),
+        Statement::Compound(c) => {
+            prescan_compound(c, globals, nonlocals, locals, imports, seed_defs)
+        }
     }
 }
 
@@ -821,13 +877,17 @@ fn prescan_compound(
     globals: &mut HashSet<String>,
     nonlocals: &mut HashSet<String>,
     locals: &mut HashSet<String>,
+    imports: &mut HashMap<String, BindingOrigin>,
     seed_defs: bool,
 ) {
     match compound {
-        // Nested def/class: do NOT descend (own-body attribution), but in a FUNCTION
-        // body the def/class *name* is a local binding of the enclosing function
-        // (refs #55); `seed_defs` gates this (false for the `<module>` unit, which
-        // this collector never scans — see the module note above).
+        // Nested def/class: do NOT descend (own-body attribution — this is
+        // exactly why a nested def's local import, or ANY class-body import,
+        // never reaches this level's `imports` accumulator, #78), but in a
+        // FUNCTION body the def/class *name* is a local binding of the
+        // enclosing function (refs #55); `seed_defs` gates this (false for
+        // the `<module>` unit, which this collector never scans — see the
+        // module note above).
         CompoundStatement::FunctionDef(f) => {
             if seed_defs {
                 locals.insert(f.name.value.to_owned());
@@ -839,52 +899,52 @@ fn prescan_compound(
             }
         }
         CompoundStatement::If(i) => {
-            prescan_suite(&i.body, globals, nonlocals, locals, seed_defs);
+            prescan_suite(&i.body, globals, nonlocals, locals, imports, seed_defs);
             if let Some(orelse) = &i.orelse {
-                prescan_orelse(orelse, globals, nonlocals, locals, seed_defs);
+                prescan_orelse(orelse, globals, nonlocals, locals, imports, seed_defs);
             }
         }
         CompoundStatement::For(f) => {
             crate::imports::collect_target_names(&f.target, locals);
-            prescan_suite(&f.body, globals, nonlocals, locals, seed_defs);
+            prescan_suite(&f.body, globals, nonlocals, locals, imports, seed_defs);
             if let Some(orelse) = &f.orelse {
-                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
+                prescan_suite(&orelse.body, globals, nonlocals, locals, imports, seed_defs);
             }
         }
         CompoundStatement::While(w) => {
-            prescan_suite(&w.body, globals, nonlocals, locals, seed_defs);
+            prescan_suite(&w.body, globals, nonlocals, locals, imports, seed_defs);
             if let Some(orelse) = &w.orelse {
-                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
+                prescan_suite(&orelse.body, globals, nonlocals, locals, imports, seed_defs);
             }
         }
         CompoundStatement::Try(t) => {
-            prescan_suite(&t.body, globals, nonlocals, locals, seed_defs);
+            prescan_suite(&t.body, globals, nonlocals, locals, imports, seed_defs);
             for h in &t.handlers {
                 if let Some(asname) = &h.name {
                     crate::imports::collect_target_names(&asname.name, locals);
                 }
-                prescan_suite(&h.body, globals, nonlocals, locals, seed_defs);
+                prescan_suite(&h.body, globals, nonlocals, locals, imports, seed_defs);
             }
             if let Some(orelse) = &t.orelse {
-                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
+                prescan_suite(&orelse.body, globals, nonlocals, locals, imports, seed_defs);
             }
             if let Some(fin) = &t.finalbody {
-                prescan_suite(&fin.body, globals, nonlocals, locals, seed_defs);
+                prescan_suite(&fin.body, globals, nonlocals, locals, imports, seed_defs);
             }
         }
         CompoundStatement::TryStar(t) => {
-            prescan_suite(&t.body, globals, nonlocals, locals, seed_defs);
+            prescan_suite(&t.body, globals, nonlocals, locals, imports, seed_defs);
             for h in &t.handlers {
                 if let Some(asname) = &h.name {
                     crate::imports::collect_target_names(&asname.name, locals);
                 }
-                prescan_suite(&h.body, globals, nonlocals, locals, seed_defs);
+                prescan_suite(&h.body, globals, nonlocals, locals, imports, seed_defs);
             }
             if let Some(orelse) = &t.orelse {
-                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
+                prescan_suite(&orelse.body, globals, nonlocals, locals, imports, seed_defs);
             }
             if let Some(fin) = &t.finalbody {
-                prescan_suite(&fin.body, globals, nonlocals, locals, seed_defs);
+                prescan_suite(&fin.body, globals, nonlocals, locals, imports, seed_defs);
             }
         }
         CompoundStatement::With(w) => {
@@ -893,11 +953,11 @@ fn prescan_compound(
                     crate::imports::collect_target_names(&asname.name, locals);
                 }
             }
-            prescan_suite(&w.body, globals, nonlocals, locals, seed_defs);
+            prescan_suite(&w.body, globals, nonlocals, locals, imports, seed_defs);
         }
         CompoundStatement::Match(m) => {
             for case in &m.cases {
-                prescan_suite(&case.body, globals, nonlocals, locals, seed_defs);
+                prescan_suite(&case.body, globals, nonlocals, locals, imports, seed_defs);
             }
         }
     }
@@ -909,17 +969,18 @@ fn prescan_orelse(
     globals: &mut HashSet<String>,
     nonlocals: &mut HashSet<String>,
     locals: &mut HashSet<String>,
+    imports: &mut HashMap<String, BindingOrigin>,
     seed_defs: bool,
 ) {
     match orelse {
         OrElse::Elif(elif) => {
-            prescan_suite(&elif.body, globals, nonlocals, locals, seed_defs);
+            prescan_suite(&elif.body, globals, nonlocals, locals, imports, seed_defs);
             if let Some(inner) = &elif.orelse {
-                prescan_orelse(inner, globals, nonlocals, locals, seed_defs);
+                prescan_orelse(inner, globals, nonlocals, locals, imports, seed_defs);
             }
         }
         OrElse::Else(e) => {
-            prescan_suite(&e.body, globals, nonlocals, locals, seed_defs);
+            prescan_suite(&e.body, globals, nonlocals, locals, imports, seed_defs);
         }
     }
 }
@@ -930,6 +991,7 @@ fn prescan_small(
     globals: &mut HashSet<String>,
     nonlocals: &mut HashSet<String>,
     locals: &mut HashSet<String>,
+    imports: &mut HashMap<String, BindingOrigin>,
 ) {
     match small {
         SmallStatement::Global(g) => {
@@ -955,6 +1017,38 @@ fn prescan_small(
                 locals.insert(n.value.to_owned());
             }
         }
+        // `import a[.b.c][ as x]` — a plain import binds a MODULE (see
+        // `imports.rs`'s `is_module_import` doc): mirrors that module's
+        // `collect_small` local-key derivation exactly (shared helpers), so
+        // both places agree on what a bare `import a.b.c` or an aliased
+        // import binds locally.
+        SmallStatement::Import(imp) => {
+            for alias in &imp.names {
+                let path = crate::imports::noa_to_string(&alias.name);
+                let local = if let Some(asname) = &alias.asname {
+                    crate::imports::ate_to_string(&asname.name)
+                } else {
+                    crate::imports::root_component(&path)
+                };
+                imports.insert(local, BindingOrigin::ModuleImport);
+            }
+        }
+        // `from m import n[ as p]` — binds an arbitrary member, not a module
+        // (may be mutable, #50) — `from m import *` is skipped (unknowable
+        // local names), same as `imports.rs`'s `collect_small`.
+        SmallStatement::ImportFrom(from) => {
+            let ImportNames::Aliases(aliases) = &from.names else {
+                return;
+            };
+            for alias in aliases {
+                let local = if let Some(asname) = &alias.asname {
+                    crate::imports::ate_to_string(&asname.name)
+                } else {
+                    crate::imports::noa_to_string(&alias.name)
+                };
+                imports.insert(local, BindingOrigin::FromImport);
+            }
+        }
         _ => {}
     }
 }
@@ -971,13 +1065,58 @@ mod tests {
     }
 
     #[test]
-    fn module_scope_collects_module_bindings_and_file_wide_imports() {
+    fn module_scope_collects_module_bindings_and_top_level_imports() {
         let t = build_str("import os\nfrom cfg import CACHE\nx = 0\n");
         let m = t.module_scope();
         assert_eq!(t.resolve(m, "os").0, BindingOrigin::ModuleImport);
         assert_eq!(t.resolve(m, "CACHE").0, BindingOrigin::FromImport);
         assert_eq!(t.resolve(m, "x").0, BindingOrigin::ModuleBinding);
         assert_eq!(t.resolve(m, "nope").0, BindingOrigin::Unresolved);
+    }
+
+    /// #78: a function-local import binds ONLY that function's own scope — it
+    /// must never reach module scope (so it can't collide with another
+    /// function's same-named binding, the bug this task closes).
+    #[test]
+    fn function_local_import_does_not_leak_to_module_scope() {
+        let t = build_str("def g():\n    import os as CACHE\n    CACHE\n");
+        let g = t.scope_of_name("g");
+        assert_eq!(t.resolve(g, "CACHE").0, BindingOrigin::ModuleImport);
+        // Module scope never saw `g`'s local import at all.
+        assert_eq!(
+            t.resolve(t.module_scope(), "CACHE").0,
+            BindingOrigin::Unresolved
+        );
+    }
+
+    /// #78: the collision itself — a top-level `from`-import and an unrelated
+    /// function's own same-named local import must resolve independently.
+    #[test]
+    fn sibling_functions_do_not_share_local_import_bindings() {
+        let t = build_str(
+            "from cfg import CACHE\ndef f():\n    CACHE\ndef g():\n    import os as CACHE\n",
+        );
+        let f = t.scope_of_name("f");
+        let g = t.scope_of_name("g");
+        // f never declared its own CACHE, so it walks up to module scope's
+        // top-level from-import — unpolluted by g's local import.
+        assert_eq!(t.resolve(f, "CACHE").0, BindingOrigin::FromImport);
+        // g's own local import shadows the module-level from-import.
+        assert_eq!(t.resolve(g, "CACHE").0, BindingOrigin::ModuleImport);
+    }
+
+    /// #78: a class-body import is not a lexical scope Python methods see
+    /// (class scope isn't in a method's lexical chain) — it must not reach
+    /// module scope, and (since a class body isn't a `Function` scope either)
+    /// it isn't collected anywhere at all. Small bundled correctness gain,
+    /// not merely compat (per the guideline).
+    #[test]
+    fn class_body_import_does_not_reach_module_scope() {
+        let t = build_str("class C:\n    import os\n");
+        assert_eq!(
+            t.resolve(t.module_scope(), "os").0,
+            BindingOrigin::Unresolved
+        );
     }
 
     #[test]
