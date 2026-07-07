@@ -346,8 +346,10 @@ impl MutSink<'_> {
                 self.push_hidden(line, col, evidence, "captured-binding");
             }
 
-            // Never constructed by the Python resolver (host-global ambient IO is a
-            // later frontend's concern) — fold into the same fallback as Unresolved.
+            // Never constructed by the Python resolver (host-global ambient IO is
+            // a TS-only concern, see `scope.rs`'s `BindingOrigin::HostGlobalIo`
+            // doc) — panics loudly rather than silently folding into Unresolved,
+            // so a resolver change that starts emitting it here is caught fast.
             BindingOrigin::HostGlobalIo => {
                 unreachable!("Python resolver never emits HostGlobalIo")
             }

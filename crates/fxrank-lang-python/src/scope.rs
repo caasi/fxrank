@@ -23,7 +23,11 @@ pub(crate) enum BindingOrigin {
     ModuleBinding,
     Global,
     EnclosingCaptured,
-    #[allow(dead_code)] // not constructed until a later task (ambient IO host globals)
+    // Never constructed by the Python frontend: ambient/host globals are a
+    // TS-only concern (Python builtins stay `Unresolved`, see the #78 plan's
+    // Task 5 note) — kept only so `BindingOrigin`'s vocabulary stays shared
+    // across frontends (`mutation.rs`'s classifier `unreachable!()`s on it).
+    #[allow(dead_code)]
     HostGlobalIo,
     Unresolved,
 }
@@ -134,7 +138,6 @@ impl ScopeTree {
     /// `build_classdef`), so a class-body import was never a legitimate
     /// binding oracle for a method's mutations — dropping it here is a small
     /// bundled correctness gain, not merely a compat concession.
-    #[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
     pub(crate) fn build(
         module: &Module,
         _imports: &Imports,
@@ -229,7 +232,6 @@ impl ScopeTree {
 
     /// Push a new `Function` scope (a `def`/`async def`/`lambda`), parented to
     /// `parent`, and return its id. Internal builder helper.
-    #[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
     fn push_function_scope(
         &mut self,
         parent: ScopeId,
@@ -257,7 +259,6 @@ impl ScopeTree {
     /// written generally so it stays correct if a sub-function scope (e.g. a
     /// comprehension scope, #55/Task 8) is ever inserted between a use and its
     /// enclosing function.
-    #[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
     pub(crate) fn resolve(&self, from_scope: ScopeId, name: &str) -> (BindingOrigin, BindingId) {
         let mut scope = from_scope;
         loop {
@@ -290,7 +291,6 @@ impl ScopeTree {
     /// by this task lives at its scope's body root, so `scope_segments` is
     /// always empty; a later task that pushes sub-scopes below a function
     /// (comprehensions, Task 8) is what would give it real segments.
-    #[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
     fn binding_id_for(&self, name: &str, origin: BindingOrigin) -> BindingId {
         BindingId {
             scope_segments: Vec::new(),
@@ -308,7 +308,6 @@ impl ScopeTree {
     /// non-module unit's body pointer. `unit_scope_of` and `ScopeTree::build`
     /// must be run over the **same** parsed `Module` reference for the
     /// pointers to coincide (see `functions.rs`'s single-borrowed-pass doc).
-    #[allow(dead_code)] // wired in by Task 4
     pub(crate) fn unit_scope_of(&self, unit: &crate::functions::FnUnit) -> ScopeId {
         let ptr = match &unit.body {
             FnBody::Module(_) => return self.module_unit_scope,
@@ -367,7 +366,6 @@ impl ScopeTree {
 // instead of collecting `FnUnit`s, and does not need line/col/anchors (scope
 // identity is body-pointer, not position).
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_in_statement(tree: &mut ScopeTree, cur: ScopeId, stmt: &Statement) {
     match stmt {
         Statement::Simple(line) => {
@@ -379,7 +377,6 @@ fn build_in_statement(tree: &mut ScopeTree, cur: ScopeId, stmt: &Statement) {
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_in_compound(tree: &mut ScopeTree, cur: ScopeId, compound: &CompoundStatement) {
     match compound {
         CompoundStatement::FunctionDef(f) => build_funcdef(tree, cur, f),
@@ -444,7 +441,6 @@ fn build_in_compound(tree: &mut ScopeTree, cur: ScopeId, compound: &CompoundStat
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_in_orelse(tree: &mut ScopeTree, cur: ScopeId, orelse: &OrElse) {
     match orelse {
         OrElse::Elif(elif) => {
@@ -458,7 +454,6 @@ fn build_in_orelse(tree: &mut ScopeTree, cur: ScopeId, orelse: &OrElse) {
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_in_suite(tree: &mut ScopeTree, cur: ScopeId, suite: &Suite) {
     match suite {
         Suite::IndentedBlock(b) => {
@@ -474,7 +469,6 @@ fn build_in_suite(tree: &mut ScopeTree, cur: ScopeId, suite: &Suite) {
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_in_small(tree: &mut ScopeTree, cur: ScopeId, small: &SmallStatement) {
     match small {
         SmallStatement::Assign(a) => build_in_expr(tree, cur, &a.value),
@@ -509,7 +503,6 @@ fn build_in_small(tree: &mut ScopeTree, cur: ScopeId, small: &SmallStatement) {
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_in_del_target(tree: &mut ScopeTree, cur: ScopeId, target: &DelTargetExpression) {
     match target {
         DelTargetExpression::Attribute(a) => build_in_expr(tree, cur, &a.value),
@@ -533,7 +526,6 @@ fn build_in_del_target(tree: &mut ScopeTree, cur: ScopeId, target: &DelTargetExp
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_in_element(tree: &mut ScopeTree, cur: ScopeId, el: &Element) {
     match el {
         Element::Simple { value, .. } => build_in_expr(tree, cur, value),
@@ -541,7 +533,6 @@ fn build_in_element(tree: &mut ScopeTree, cur: ScopeId, el: &Element) {
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_in_base_slice(tree: &mut ScopeTree, cur: ScopeId, slice: &BaseSlice) {
     match slice {
         BaseSlice::Index(i) => build_in_expr(tree, cur, &i.value),
@@ -559,7 +550,6 @@ fn build_in_base_slice(tree: &mut ScopeTree, cur: ScopeId, slice: &BaseSlice) {
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_in_comp_for(tree: &mut ScopeTree, cur: ScopeId, comp: &CompFor) {
     build_in_expr(tree, cur, &comp.iter);
     for cond in &comp.ifs {
@@ -570,7 +560,6 @@ fn build_in_comp_for(tree: &mut ScopeTree, cur: ScopeId, comp: &CompFor) {
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_in_fstring_parts(tree: &mut ScopeTree, cur: ScopeId, parts: &[FormattedStringContent]) {
     for part in parts {
         if let FormattedStringContent::Expression(e) = part {
@@ -582,7 +571,6 @@ fn build_in_fstring_parts(tree: &mut ScopeTree, cur: ScopeId, parts: &[Formatted
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_in_expr(tree: &mut ScopeTree, cur: ScopeId, expr: &Expression) {
     match expr {
         Expression::Lambda(l) => {
@@ -688,13 +676,17 @@ fn build_in_expr(tree: &mut ScopeTree, cur: ScopeId, expr: &Expression) {
 
         // Leaf expressions (Name, Ellipsis, Integer, Float, Imaginary,
         // SimpleString, ConcatenatedString, TemplatedString) contain no lambdas.
+        // NOTE (FN-only, #55): this also means a lambda nested inside an
+        // f-string that is itself one piece of a `ConcatenatedString` (e.g.
+        // `"a" f"{(lambda: 1)}"`) does not get its own scope here —
+        // `ConcatenatedString`'s parts aren't walked, only a bare
+        // `FormattedString` is (see `prescan_expr`'s mirrored note).
         _ => {}
     }
 }
 
 /// Lambda/def parameter DEFAULT expressions evaluate in the enclosing scope,
 /// at def-time, and may themselves contain lambdas.
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_in_params(tree: &mut ScopeTree, cur: ScopeId, params: &Parameters) {
     let positional = params
         .posonly_params
@@ -721,7 +713,6 @@ fn build_in_params(tree: &mut ScopeTree, cur: ScopeId, params: &Parameters) {
 /// Insert every parameter name in `params` as `Param` — positional-only,
 /// regular, keyword-only, `*args`, `**kwargs`. Mirrors
 /// `detect::mutation::collect_param_names`.
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn insert_param_bindings(bindings: &mut HashMap<String, BindingOrigin>, params: &Parameters) {
     let all = params
         .posonly_params
@@ -739,7 +730,6 @@ fn insert_param_bindings(bindings: &mut HashMap<String, BindingOrigin>, params: 
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_funcdef(tree: &mut ScopeTree, cur: ScopeId, f: &FunctionDef) {
     // Decorators and parameter defaults evaluate in the ENCLOSING scope, at
     // def-time — before the new Function scope even exists.
@@ -796,7 +786,6 @@ fn build_funcdef(tree: &mut ScopeTree, cur: ScopeId, f: &FunctionDef) {
     build_in_suite(tree, scope, &f.body);
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn build_classdef(tree: &mut ScopeTree, cur: ScopeId, c: &ClassDef) {
     // Classes are NOT a scope in this model (Python methods don't see the
     // class body as an enclosing scope): decorators, base-class args/keywords,
@@ -828,7 +817,6 @@ fn build_classdef(tree: &mut ScopeTree, cur: ScopeId, c: &ClassDef) {
 // descending into a nested def/class body) — used both for a function's own
 // local imports (`build_funcdef`) and, via the module-level call in
 // `ScopeTree::build`, for the module's top-level-only imports.
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn prescan_suite(
     suite: &Suite,
     globals: &mut HashSet<String>,
@@ -851,7 +839,6 @@ fn prescan_suite(
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn prescan_stmt(
     stmt: &Statement,
     globals: &mut HashSet<String>,
@@ -872,7 +859,6 @@ fn prescan_stmt(
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn prescan_compound(
     compound: &CompoundStatement,
     globals: &mut HashSet<String>,
@@ -889,6 +875,12 @@ fn prescan_compound(
         // enclosing function (refs #55); `seed_defs` gates this (false for
         // the `<module>` unit, which this collector never scans — see the
         // module note above).
+        //
+        // NOTE (FN-only, #55): a walrus in a `def`/lambda PARAMETER DEFAULT
+        // (e.g. `def f(x=(y := 1)): ...`) evaluates in this enclosing scope at
+        // def-time, but neither this arm nor `build_in_params` collects it as
+        // a `Local` here — it falls through to `Unresolved`. Narrow,
+        // false-negative-only per the FP≫FN charter.
         CompoundStatement::FunctionDef(f) => {
             if seed_defs {
                 locals.insert(f.name.value.to_owned());
@@ -979,7 +971,6 @@ fn prescan_compound(
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn prescan_orelse(
     orelse: &OrElse,
     globals: &mut HashSet<String>,
@@ -1002,7 +993,6 @@ fn prescan_orelse(
     }
 }
 
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn prescan_small(
     small: &SmallStatement,
     globals: &mut HashSet<String>,
@@ -1120,7 +1110,6 @@ fn prescan_small(
 /// being compared against, not capture targets (mirrors the grammar's
 /// `capture_pattern` — a bare name — vs. `value_pattern` — a dotted name).
 /// A wildcard `_` is `MatchAs { name: None, .. }` — also not a binding.
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn collect_match_pattern_locals(pattern: &MatchPattern, locals: &mut HashSet<String>) {
     match pattern {
         MatchPattern::Value(_) | MatchPattern::Singleton(_) => {}
@@ -1170,7 +1159,6 @@ fn collect_match_pattern_locals(pattern: &MatchPattern, locals: &mut HashSet<Str
 
 /// A sequence-pattern element (`case [a, *rest]:`) is either a plain
 /// sub-pattern or a starred capture (`*rest`/`*_`).
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn collect_starrable_match_element(
     el: &StarrableMatchSequenceElement,
     locals: &mut HashSet<String>,
@@ -1192,7 +1180,6 @@ fn collect_starrable_match_element(
 /// comprehension — same shape as `build_in_expr` below, EXCEPT a `Lambda`
 /// body is not descended into: a lambda is its OWN function scope, so a
 /// walrus inside it binds there, not in this (enclosing) scope.
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn prescan_expr(expr: &Expression, locals: &mut HashSet<String>) {
     match expr {
         Expression::Lambda(_) => {} // own scope — not descended into, see doc comment above
@@ -1299,7 +1286,13 @@ fn prescan_expr(expr: &Expression, locals: &mut HashSet<String>) {
 
         // Leaf expressions (Name, Ellipsis, Integer, Float, Imaginary,
         // SimpleString, ConcatenatedString, TemplatedString) hold no nested
-        // walrus/comprehension.
+        // walrus/comprehension. NOTE (FN-only, #55): a walrus/comprehension
+        // nested inside an f-string that is itself one piece of a
+        // `ConcatenatedString` (e.g. `"a" f"{(x:=1)}"`) is NOT descended into
+        // here — `ConcatenatedString`'s parts aren't walked, only a bare
+        // `FormattedString` is. Mirrors the pre-existing `build_in_expr` gap
+        // below (same leaf list, same reason); narrow, false-negative-only
+        // per the FP≫FN charter.
         _ => {}
     }
 }
@@ -1307,7 +1300,6 @@ fn prescan_expr(expr: &Expression, locals: &mut HashSet<String>) {
 /// A comprehension's `for … in …[ if …]` clause chain (list/set/dict/
 /// generator all share this shape) — the target binds a function-`Local`;
 /// `iter` and each `if` may themselves hold a nested walrus/comprehension.
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn prescan_comp_for(comp: &CompFor, locals: &mut HashSet<String>) {
     crate::imports::collect_target_names(&comp.target, locals);
     prescan_expr(&comp.iter, locals);
@@ -1321,7 +1313,6 @@ fn prescan_comp_for(comp: &CompFor, locals: &mut HashSet<String>) {
 
 /// A destructuring/collection-literal element (`[a, *rest]`) — mirrors
 /// `build_in_element` below.
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn prescan_element(el: &Element, locals: &mut HashSet<String>) {
     match el {
         Element::Simple { value, .. } => prescan_expr(value, locals),
@@ -1331,7 +1322,6 @@ fn prescan_element(el: &Element, locals: &mut HashSet<String>) {
 
 /// A subscript slice (`x[a:b:c]` or `x[i]`) — mirrors `build_in_base_slice`
 /// below.
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn prescan_base_slice(slice: &BaseSlice, locals: &mut HashSet<String>) {
     match slice {
         BaseSlice::Index(i) => prescan_expr(&i.value, locals),
@@ -1351,7 +1341,6 @@ fn prescan_base_slice(slice: &BaseSlice, locals: &mut HashSet<String>) {
 
 /// An f-string's embedded `{expr}` parts — mirrors `build_in_fstring_parts`
 /// below.
-#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
 fn prescan_fstring_parts(parts: &[FormattedStringContent], locals: &mut HashSet<String>) {
     for part in parts {
         if let FormattedStringContent::Expression(e) = part {
