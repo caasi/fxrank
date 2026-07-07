@@ -104,6 +104,11 @@ pub(crate) struct ScopeTree {
     /// The `Function` scope modeling the `<module>` unit's own body. Found by
     /// `unit_scope_of`'s `FnBody::Module` arm (no body-pointer match needed).
     module_unit_scope: ScopeId,
+    /// `body_ptr` → `ScopeId` for O(1) `unit_scope_of`. Built once at the end of
+    /// `build` from the `Function` scopes' `body_ptr`s; a duplicate insert there
+    /// is a loud build-time failure (pointer identity broke), so a lookup only has
+    /// to handle the miss case.
+    body_index: HashMap<usize, ScopeId>,
 }
 
 impl ScopeTree {
@@ -156,7 +161,8 @@ impl ScopeTree {
         };
         let mut tree = Self {
             scopes: vec![module_scope],
-            module_unit_scope: 0, // fixed up immediately below
+            module_unit_scope: 0,       // fixed up immediately below
+            body_index: HashMap::new(), // populated after all scopes are built
         };
         let module_scope_id = tree.module_scope();
 
@@ -222,6 +228,23 @@ impl ScopeTree {
         for stmt in &module.body {
             build_in_statement(&mut tree, module_scope_id, stmt);
         }
+
+        // Index the `Function` scopes by body pointer for O(1) `unit_scope_of`.
+        // A duplicate `body_ptr` means pointer identity between `functions::collect`
+        // and `scope::build` broke — fail loud here (all builds), so a later lookup
+        // can never silently resolve to an arbitrary scope.
+        let mut body_index = HashMap::with_capacity(tree.scopes.len());
+        for (id, scope) in tree.scopes.iter().enumerate() {
+            if let Some(ptr) = scope.body_ptr {
+                if body_index.insert(ptr, id).is_some() {
+                    panic!(
+                        "ScopeTree::build: duplicate body pointer {ptr:#x} — pointer identity \
+                         between functions::collect and scope::build broke"
+                    );
+                }
+            }
+        }
+        tree.body_index = body_index;
         tree
     }
 
@@ -314,27 +337,17 @@ impl ScopeTree {
             FnBody::Suite(suite) => (*suite) as *const Suite as usize,
             FnBody::Expr(expr) => (*expr) as *const Expression as usize,
         };
-        let mut found: Option<ScopeId> = None;
-        let mut hits = 0usize;
-        for (id, scope) in self.scopes.iter().enumerate() {
-            if scope.body_ptr == Some(ptr) {
-                hits += 1;
-                found = Some(id);
-            }
-        }
-        // Fail loud in ALL builds (not just debug): both a miss (hits == 0) and a
-        // duplicate (hits > 1) mean pointer identity between functions::collect and
-        // scope::build broke, and either would otherwise mis-resolve every binding in
-        // the unit. This runs once per unit (not per name-resolution), so the release
-        // check is negligible.
-        if hits != 1 {
+        // O(1) lookup. Duplicates were already rejected at build time, so only the
+        // miss case remains — and it stays loud in all builds (a miss means pointer
+        // identity between functions::collect and scope::build broke, which would
+        // otherwise mis-resolve every binding in the unit).
+        *self.body_index.get(&ptr).unwrap_or_else(|| {
             panic!(
-                "unit_scope_of: expected exactly one scope for unit `{}` (body pointer {ptr:#x}), \
-                 found {hits} — pointer identity between functions::collect and scope::build broke",
-                unit.symbol,
-            );
-        }
-        found.expect("hits == 1 guarantees exactly one matching scope")
+                "unit_scope_of: no scope found for unit `{}` (body pointer {ptr:#x}) — \
+                 pointer identity between functions::collect and scope::build broke",
+                unit.symbol
+            )
+        })
     }
 
     /// Test helper: the module-unit scope M (models the `<module>` unit's own

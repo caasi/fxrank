@@ -9,13 +9,16 @@ does this name denote?"* within a file, over the frontend's own AST (its scope t
 entirely in the frontend, so its results never reach the core (§*The load-bearing
 invariant*).
 
-This is a **descriptive reference** for the shared cross-language model. It is **mostly a
-target model** — the design spec 078 builds; nothing conforms yet. The **floor today** is
-the flat per-unit binding *sets* (`locals`/`params`/`globals`/… and the file-wide
-`Imports` table) documented in `mutation-classification-guideline.md` *(Shared model)*,
-plus the interim Rust binding-form seeding on branch `feat/078-scope-resolution`. It is
-not a contract; nothing is required to conform, and where this disagrees with the code,
-the code wins — but during 078 this file and the code are written together.
+This is a **descriptive reference** for the shared cross-language model. It began as a
+**target model** (the design spec 078 builds); the **Python frontend now conforms** —
+078 landed for Python (`crates/fxrank-lang-python/src/scope.rs`, with the mutation detector
+ported onto `ScopeTree::resolve`) — while **TS and Rust remain targets**. The **floor for
+the not-yet-migrated frontends** is the flat per-unit binding *sets* (`locals`/`params`/
+`globals`/… and the file-wide `Imports` table) documented in
+`mutation-classification-guideline.md` *(Shared model)*, plus the interim Rust binding-form
+seeding on branch `feat/078-scope-resolution`. It is not a contract; nothing is required to
+conform, and where this disagrees with the code, the code wins — but during 078 this file
+and the code are written together.
 
 Related shared-model docs: `mutation-classification-guideline.md` (this doc feeds it —
 resolution produces the `BindingOrigin` that guideline's cascade maps to an effect);
