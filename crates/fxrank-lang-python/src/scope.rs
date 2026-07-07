@@ -4,12 +4,16 @@
 
 use std::collections::{HashMap, HashSet};
 
-use libcst_native::Module;
+use libcst_native::{
+    AssignTargetExpression, BaseSlice, ClassDef, CompFor, CompoundStatement, DelTargetExpression,
+    DictElement, Element, Expression, FormattedStringContent, FunctionDef, Module, OrElse,
+    Parameters, SmallStatement, StarArg, Statement, Suite, YieldValue,
+};
 
+use crate::functions::FnBody;
 use crate::imports::Imports;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // not yet wired into the mutation detector (spec 078, Task 2)
 pub(crate) enum BindingOrigin {
     Param,
     Local,
@@ -18,12 +22,12 @@ pub(crate) enum BindingOrigin {
     ModuleBinding,
     Global,
     EnclosingCaptured,
+    #[allow(dead_code)] // not constructed until a later task (ambient IO host globals)
     HostGlobalIo,
     Unresolved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // not yet wired into the mutation detector (spec 078, Task 2)
 pub(crate) struct BindingId {
     pub scope_segments: Vec<String>,
     pub kind_name: String,
@@ -32,7 +36,6 @@ pub(crate) struct BindingId {
 /// The `"kind:"` prefix used in a `BindingId.kind_name`, per the guideline's
 /// binding-id scheme (kind-tagged names keep same-name/different-origin
 /// bindings distinct even within one scope).
-#[allow(dead_code)] // not yet wired into the mutation detector (spec 078, Task 2)
 fn kind_prefix(origin: BindingOrigin) -> &'static str {
     match origin {
         BindingOrigin::Param => "param",
@@ -47,11 +50,11 @@ fn kind_prefix(origin: BindingOrigin) -> &'static str {
     }
 }
 
-/// A scope-tree node: the module scope, or (from a later task on) a
-/// function/method scope. `body_ptr` and `name` are `None` for the module
-/// scope; a function scope fills both (`body_ptr` for `unit_scope_of`,
-/// `name` for `scope_of_name`/`BindingId` construction).
-#[allow(dead_code)] // fields consumed starting from the Task 3/4 parent walk
+/// A scope-tree node: the module scope, or a function/lambda scope.
+/// `body_ptr` and `name` are `None` for the module scope; a function scope
+/// fills both (`body_ptr` for `unit_scope_of`, `name` for
+/// `scope_of_name`/`BindingId` construction — `None` for a lambda, which has
+/// no def-name).
 struct Scope {
     kind: ScopeKind,
     /// The enclosing scope; `None` for the module scope (the tree root).
@@ -61,6 +64,9 @@ struct Scope {
     body_ptr: Option<usize>,
     /// The def name, used by `scope_of_name`/`BindingId` construction.
     /// `None` for the module scope.
+    // Read only by `scope_of_name`, a #[cfg(test)] helper, until BindingId's
+    // scope_segments consume it.
+    #[allow(dead_code)]
     name: Option<String>,
     bindings: HashMap<String, BindingOrigin>,
 }
@@ -68,19 +74,31 @@ struct Scope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScopeKind {
     Module,
-    #[allow(dead_code)] // Function is not constructed until the Task 4 function-scope pass
     Function,
 }
 
-#[allow(dead_code)] // not yet wired into the mutation detector (spec 078, Task 2)
 pub(crate) type ScopeId = usize;
 
-/// The file's scope tree — `module → function/method → block` (spec 078).
-/// This task builds only the module scope (id 0); later tasks add one scope
-/// per function/method def and generalize `resolve` to the parent walk.
-#[allow(dead_code)] // not yet wired into the mutation detector (spec 078, Task 2)
+/// The file's scope tree — `module → function/method` (spec 078; comprehensions
+/// are not their own scope yet, see #55/Task 8). The module BINDING scope is
+/// always id `0`; every `def`/`async def`/`lambda` gets its own `Function`
+/// scope, parented to its lexical enclosing scope (a class body is not a scope —
+/// methods parent directly to their enclosing function/module scope).
+///
+/// One extra `Function` scope — the **module-unit scope** (`module_unit_scope`)
+/// — models the synthetic `<module>` unit's OWN body. It is distinct from the
+/// module binding scope (id 0): scope 0 serves every OTHER unit (a module-level
+/// `x = {}` is a `ModuleBinding` to a function that references it), while the
+/// module-unit scope serves the `<module>` unit itself (its top-level
+/// assign/`for`/`with` targets are its own `Local`s — byte-identical to the
+/// flat model's per-unit `locals` for `FnBody::Module`, `seed_defs = false`).
+/// The same module-level name legitimately resolves to different origins for
+/// the two roles, so one scope cannot serve both.
 pub(crate) struct ScopeTree {
     scopes: Vec<Scope>,
+    /// The `Function` scope modeling the `<module>` unit's own body. Found by
+    /// `unit_scope_of`'s `FnBody::Module` arm (no body-pointer match needed).
+    module_unit_scope: ScopeId,
 }
 
 impl ScopeTree {
@@ -93,9 +111,9 @@ impl ScopeTree {
     /// / `FromImport` — imports **overwrite** any same-named `ModuleBinding`,
     /// reproducing the existing mutation cascade's "imports (F5) checked
     /// before module_bindings (F7)" precedence.
-    #[allow(dead_code)] // until Phase-2 consumers land
+    #[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
     pub(crate) fn build(
-        _module: &Module,
+        module: &Module,
         imports: &Imports,
         module_bindings: &HashSet<String>,
     ) -> Self {
@@ -118,44 +136,826 @@ impl ScopeTree {
             name: None,
             bindings,
         };
-        Self {
+        let mut tree = Self {
             scopes: vec![module_scope],
+            module_unit_scope: 0, // fixed up immediately below
+        };
+        let module_scope_id = tree.module_scope();
+
+        // The module-unit scope M: models the `<module>` unit's OWN body.
+        // Prescan `module.body` with `seed_defs = false` (a top-level def/class
+        // name is a `ModuleBinding` to this unit, NOT a local — mirrors
+        // `mutation.rs::prescan_body`'s `FnBody::Module` arm) and insert its
+        // `locals` as `Local`. Params/globals/nonlocals are empty at module
+        // level, but handle them uniformly for safety. M parents to scope 0, so
+        // a name M misses (e.g. a top-level `class C` or an import) still
+        // resolves through scope 0's `ModuleBinding`/`ModuleImport`/`FromImport`.
+        let mut m_globals = HashSet::new();
+        let mut m_nonlocals = HashSet::new();
+        let mut m_locals = HashSet::new();
+        for stmt in &module.body {
+            prescan_stmt(
+                stmt,
+                &mut m_globals,
+                &mut m_nonlocals,
+                &mut m_locals,
+                false, // seed_defs=false: top-level def/class names are ModuleBindings
+            );
         }
+        let mut m_bindings = HashMap::new();
+        for name in m_locals {
+            m_bindings.insert(name, BindingOrigin::Local);
+        }
+        for name in m_nonlocals {
+            m_bindings.insert(name, BindingOrigin::EnclosingCaptured);
+        }
+        for name in m_globals {
+            m_bindings.insert(name, BindingOrigin::Global);
+        }
+        tree.module_unit_scope = tree.scopes.len();
+        tree.scopes.push(Scope {
+            kind: ScopeKind::Function,
+            parent: Some(module_scope_id),
+            body_ptr: None, // found via unit_scope_of's FnBody::Module arm, not by pointer
+            name: None,
+            bindings: m_bindings,
+        });
+
+        // Real `def`/`async def`/`lambda` scopes parent to the module BINDING
+        // scope (id 0), NOT to M — a function referencing a module-level `x`
+        // must see it as `ModuleBinding`, exactly as the flat model does.
+        for stmt in &module.body {
+            build_in_statement(&mut tree, module_scope_id, stmt);
+        }
+        tree
     }
 
-    /// The module scope's id — always `0`.
-    #[allow(dead_code)] // until Phase-2 consumers land
+    /// The module binding scope's id — always `0`.
     pub(crate) fn module_scope(&self) -> ScopeId {
         0
     }
 
-    /// Resolve `name` in `scope`.
+    /// Push a new `Function` scope (a `def`/`async def`/`lambda`), parented to
+    /// `parent`, and return its id. Internal builder helper.
+    #[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+    fn push_function_scope(
+        &mut self,
+        parent: ScopeId,
+        body_ptr: usize,
+        name: Option<String>,
+        bindings: HashMap<String, BindingOrigin>,
+    ) -> ScopeId {
+        let id = self.scopes.len();
+        self.scopes.push(Scope {
+            kind: ScopeKind::Function,
+            parent: Some(parent),
+            body_ptr: Some(body_ptr),
+            name,
+            bindings,
+        });
+        id
+    }
+
+    /// Resolve `name` starting at `from_scope`: check `from_scope`, then follow
+    /// `parent` up to **and including** the nearest enclosing `Function` scope,
+    /// then check `module_scope()`; first match wins, else `Unresolved`.
     ///
-    /// Provisional: this task only checks `scope`'s own bindings map, then
-    /// falls back to `Unresolved`. Task 3 generalizes this to the
-    /// nearest-enclosing parent walk described in the guideline's
-    /// resolution rule.
-    #[allow(dead_code)] // until Phase-2 consumers land
-    pub(crate) fn resolve(&self, scope: ScopeId, name: &str) -> (BindingOrigin, BindingId) {
-        match self.scopes[scope].bindings.get(name) {
-            Some(&origin) => {
-                let kind_name = format!("{}:{name}", kind_prefix(origin));
-                (
-                    origin,
-                    BindingId {
-                        scope_segments: Vec::new(),
-                        kind_name,
-                    },
-                )
+    /// Today every scope is either `Module` or `Function` (no block scopes), so
+    /// this is effectively `from_scope → module_scope()` — but the walk is
+    /// written generally so it stays correct if a sub-function scope (e.g. a
+    /// comprehension scope, #55/Task 8) is ever inserted between a use and its
+    /// enclosing function.
+    #[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+    pub(crate) fn resolve(&self, from_scope: ScopeId, name: &str) -> (BindingOrigin, BindingId) {
+        let mut scope = from_scope;
+        loop {
+            if let Some(&origin) = self.scopes[scope].bindings.get(name) {
+                return (origin, self.binding_id_for(name, origin));
             }
-            None => (
-                BindingOrigin::Unresolved,
-                BindingId {
-                    scope_segments: Vec::new(),
-                    kind_name: format!("{}:{name}", kind_prefix(BindingOrigin::Unresolved)),
-                },
-            ),
+            if self.scopes[scope].kind == ScopeKind::Function {
+                // Just checked (and missed) the nearest enclosing function scope —
+                // do not keep walking parents; jump straight to module scope below.
+                break;
+            }
+            match self.scopes[scope].parent {
+                Some(parent) => scope = parent,
+                None => break, // scope is the module scope (already checked above)
+            }
         }
+        if scope != self.module_scope()
+            && let Some(&origin) = self.scopes[self.module_scope()].bindings.get(name)
+        {
+            return (origin, self.binding_id_for(name, origin));
+        }
+        (
+            BindingOrigin::Unresolved,
+            self.binding_id_for(name, BindingOrigin::Unresolved),
+        )
+    }
+
+    /// `BindingId` construction is frontend-internal and not byte-asserted by
+    /// any consumer (§ guideline's binding-id scheme). Every binding produced
+    /// by this task lives at its scope's body root, so `scope_segments` is
+    /// always empty; a later task that pushes sub-scopes below a function
+    /// (comprehensions, Task 8) is what would give it real segments.
+    #[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+    fn binding_id_for(&self, name: &str, origin: BindingOrigin) -> BindingId {
+        BindingId {
+            scope_segments: Vec::new(),
+            kind_name: format!("{}:{name}", kind_prefix(origin)),
+        }
+    }
+
+    /// Map `unit` to its `Function` scope by **body-node pointer identity**
+    /// (never `(line, col)` — see the guideline's rationale). The synthetic
+    /// `<module>` unit maps to the **module-unit scope** (`module_unit_scope`),
+    /// NOT the module binding scope (id 0) — the `<module>` unit's own top-level
+    /// assign/`for`/`with` targets are its `Local`s, which live in M.
+    ///
+    /// A miss is loud, never silent: exactly one scope must match a
+    /// non-module unit's body pointer. `unit_scope_of` and `ScopeTree::build`
+    /// must be run over the **same** parsed `Module` reference for the
+    /// pointers to coincide (see `functions.rs`'s single-borrowed-pass doc).
+    #[allow(dead_code)] // wired in by Task 4
+    pub(crate) fn unit_scope_of(&self, unit: &crate::functions::FnUnit) -> ScopeId {
+        let ptr = match &unit.body {
+            FnBody::Module(_) => return self.module_unit_scope,
+            FnBody::Suite(suite) => (*suite) as *const Suite as usize,
+            FnBody::Expr(expr) => (*expr) as *const Expression as usize,
+        };
+        let mut found: Option<ScopeId> = None;
+        let mut hits = 0usize;
+        for (id, scope) in self.scopes.iter().enumerate() {
+            if scope.body_ptr == Some(ptr) {
+                hits += 1;
+                found = Some(id);
+            }
+        }
+        debug_assert_eq!(
+            hits, 1,
+            "unit_scope_of: expected exactly one scope for unit `{}` (body pointer {ptr:#x}), \
+             found {hits} — pointer identity between functions::collect and scope::build broke",
+            unit.symbol,
+        );
+        found.unwrap_or_else(|| {
+            panic!(
+                "unit_scope_of: no scope found for unit `{}` (body pointer {ptr:#x}) — \
+                 pointer identity between functions::collect and scope::build broke",
+                unit.symbol
+            )
+        })
+    }
+
+    /// Test helper: the module-unit scope M (models the `<module>` unit's own
+    /// body). Production code reaches it via `unit_scope_of`'s `FnBody::Module`
+    /// arm; tests use this accessor since they have no `FnUnit` to hand.
+    #[cfg(test)]
+    fn module_unit_scope(&self) -> ScopeId {
+        self.module_unit_scope
+    }
+
+    /// Test helper: find the `Function` scope whose recorded def-name equals
+    /// `name`. Production code never resolves a scope by name — only by
+    /// body-pointer (`unit_scope_of`).
+    #[cfg(test)]
+    fn scope_of_name(&self, name: &str) -> ScopeId {
+        self.scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function && s.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no function scope named `{name}`"))
+    }
+}
+
+// ─── function/lambda scope construction ──────────────────────────────────────
+//
+// Walks the module looking for every `def`/`async def`/`lambda`, pushing a
+// `Function` scope for each, parented to its LEXICAL enclosing scope (a class
+// body is not a scope boundary — see `build_classdef`). Mirrors the traversal
+// shape of `functions::collect`, but tracks a `ScopeId` "current scope" cursor
+// instead of collecting `FnUnit`s, and does not need line/col/anchors (scope
+// identity is body-pointer, not position).
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_in_statement(tree: &mut ScopeTree, cur: ScopeId, stmt: &Statement) {
+    match stmt {
+        Statement::Simple(line) => {
+            for small in &line.body {
+                build_in_small(tree, cur, small);
+            }
+        }
+        Statement::Compound(c) => build_in_compound(tree, cur, c),
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_in_compound(tree: &mut ScopeTree, cur: ScopeId, compound: &CompoundStatement) {
+    match compound {
+        CompoundStatement::FunctionDef(f) => build_funcdef(tree, cur, f),
+        CompoundStatement::ClassDef(c) => build_classdef(tree, cur, c),
+        CompoundStatement::If(i) => {
+            build_in_expr(tree, cur, &i.test);
+            build_in_suite(tree, cur, &i.body);
+            if let Some(orelse) = &i.orelse {
+                build_in_orelse(tree, cur, orelse);
+            }
+        }
+        CompoundStatement::For(f) => {
+            build_in_expr(tree, cur, &f.iter);
+            build_in_suite(tree, cur, &f.body);
+            if let Some(orelse) = &f.orelse {
+                build_in_suite(tree, cur, &orelse.body);
+            }
+        }
+        CompoundStatement::While(w) => {
+            build_in_expr(tree, cur, &w.test);
+            build_in_suite(tree, cur, &w.body);
+            if let Some(orelse) = &w.orelse {
+                build_in_suite(tree, cur, &orelse.body);
+            }
+        }
+        CompoundStatement::Try(t) => {
+            build_in_suite(tree, cur, &t.body);
+            for h in &t.handlers {
+                build_in_suite(tree, cur, &h.body);
+            }
+            if let Some(orelse) = &t.orelse {
+                build_in_suite(tree, cur, &orelse.body);
+            }
+            if let Some(fin) = &t.finalbody {
+                build_in_suite(tree, cur, &fin.body);
+            }
+        }
+        CompoundStatement::TryStar(t) => {
+            build_in_suite(tree, cur, &t.body);
+            for h in &t.handlers {
+                build_in_suite(tree, cur, &h.body);
+            }
+            if let Some(orelse) = &t.orelse {
+                build_in_suite(tree, cur, &orelse.body);
+            }
+            if let Some(fin) = &t.finalbody {
+                build_in_suite(tree, cur, &fin.body);
+            }
+        }
+        CompoundStatement::With(w) => {
+            for item in &w.items {
+                build_in_expr(tree, cur, &item.item);
+            }
+            build_in_suite(tree, cur, &w.body);
+        }
+        CompoundStatement::Match(m) => {
+            build_in_expr(tree, cur, &m.subject);
+            for case in &m.cases {
+                build_in_suite(tree, cur, &case.body);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_in_orelse(tree: &mut ScopeTree, cur: ScopeId, orelse: &OrElse) {
+    match orelse {
+        OrElse::Elif(elif) => {
+            build_in_expr(tree, cur, &elif.test);
+            build_in_suite(tree, cur, &elif.body);
+            if let Some(inner) = &elif.orelse {
+                build_in_orelse(tree, cur, inner);
+            }
+        }
+        OrElse::Else(e) => build_in_suite(tree, cur, &e.body),
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_in_suite(tree: &mut ScopeTree, cur: ScopeId, suite: &Suite) {
+    match suite {
+        Suite::IndentedBlock(b) => {
+            for stmt in &b.body {
+                build_in_statement(tree, cur, stmt);
+            }
+        }
+        Suite::SimpleStatementSuite(s) => {
+            for small in &s.body {
+                build_in_small(tree, cur, small);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_in_small(tree: &mut ScopeTree, cur: ScopeId, small: &SmallStatement) {
+    match small {
+        SmallStatement::Assign(a) => build_in_expr(tree, cur, &a.value),
+        SmallStatement::AnnAssign(a) => {
+            if let Some(v) = &a.value {
+                build_in_expr(tree, cur, v);
+            }
+        }
+        SmallStatement::AugAssign(a) => build_in_expr(tree, cur, &a.value),
+        SmallStatement::Return(r) => {
+            if let Some(v) = &r.value {
+                build_in_expr(tree, cur, v);
+            }
+        }
+        SmallStatement::Expr(e) => build_in_expr(tree, cur, &e.value),
+        SmallStatement::Raise(r) => {
+            if let Some(exc) = &r.exc {
+                build_in_expr(tree, cur, exc);
+            }
+            if let Some(from) = &r.cause {
+                build_in_expr(tree, cur, &from.item);
+            }
+        }
+        SmallStatement::Assert(a) => {
+            build_in_expr(tree, cur, &a.test);
+            if let Some(msg) = &a.msg {
+                build_in_expr(tree, cur, msg);
+            }
+        }
+        SmallStatement::Del(d) => build_in_del_target(tree, cur, &d.target),
+        _ => {}
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_in_del_target(tree: &mut ScopeTree, cur: ScopeId, target: &DelTargetExpression) {
+    match target {
+        DelTargetExpression::Attribute(a) => build_in_expr(tree, cur, &a.value),
+        DelTargetExpression::Subscript(s) => {
+            build_in_expr(tree, cur, &s.value);
+            for element in &s.slice {
+                build_in_base_slice(tree, cur, &element.slice);
+            }
+        }
+        DelTargetExpression::Tuple(t) => {
+            for el in &t.elements {
+                build_in_element(tree, cur, el);
+            }
+        }
+        DelTargetExpression::List(l) => {
+            for el in &l.elements {
+                build_in_element(tree, cur, el);
+            }
+        }
+        DelTargetExpression::Name(_) => {}
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_in_element(tree: &mut ScopeTree, cur: ScopeId, el: &Element) {
+    match el {
+        Element::Simple { value, .. } => build_in_expr(tree, cur, value),
+        Element::Starred(s) => build_in_expr(tree, cur, &s.value),
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_in_base_slice(tree: &mut ScopeTree, cur: ScopeId, slice: &BaseSlice) {
+    match slice {
+        BaseSlice::Index(i) => build_in_expr(tree, cur, &i.value),
+        BaseSlice::Slice(s) => {
+            if let Some(lower) = &s.lower {
+                build_in_expr(tree, cur, lower);
+            }
+            if let Some(upper) = &s.upper {
+                build_in_expr(tree, cur, upper);
+            }
+            if let Some(step) = &s.step {
+                build_in_expr(tree, cur, step);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_in_comp_for(tree: &mut ScopeTree, cur: ScopeId, comp: &CompFor) {
+    build_in_expr(tree, cur, &comp.iter);
+    for cond in &comp.ifs {
+        build_in_expr(tree, cur, &cond.test);
+    }
+    if let Some(inner) = &comp.inner_for_in {
+        build_in_comp_for(tree, cur, inner);
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_in_fstring_parts(tree: &mut ScopeTree, cur: ScopeId, parts: &[FormattedStringContent]) {
+    for part in parts {
+        if let FormattedStringContent::Expression(e) = part {
+            build_in_expr(tree, cur, &e.expression);
+            if let Some(spec) = &e.format_spec {
+                build_in_fstring_parts(tree, cur, spec);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_in_expr(tree: &mut ScopeTree, cur: ScopeId, expr: &Expression) {
+    match expr {
+        Expression::Lambda(l) => {
+            // A lambda's own scope: params → Param. No suite to prescan (a
+            // lambda body is a single expression, never a statement list).
+            let mut bindings = HashMap::new();
+            insert_param_bindings(&mut bindings, &l.params);
+            let body_ptr = (&*l.body) as *const Expression as usize;
+            let lambda_scope = tree.push_function_scope(cur, body_ptr, None, bindings);
+            // Parameter defaults evaluate in the ENCLOSING scope, def-time.
+            build_in_params(tree, cur, &l.params);
+            // The body is evaluated lazily, in the lambda's OWN scope.
+            build_in_expr(tree, lambda_scope, &l.body);
+        }
+        Expression::BinaryOperation(b) => {
+            build_in_expr(tree, cur, &b.left);
+            build_in_expr(tree, cur, &b.right);
+        }
+        Expression::BooleanOperation(b) => {
+            build_in_expr(tree, cur, &b.left);
+            build_in_expr(tree, cur, &b.right);
+        }
+        Expression::UnaryOperation(u) => build_in_expr(tree, cur, &u.expression),
+        Expression::Comparison(c) => {
+            build_in_expr(tree, cur, &c.left);
+            for comp in &c.comparisons {
+                build_in_expr(tree, cur, &comp.comparator);
+            }
+        }
+        Expression::IfExp(i) => {
+            build_in_expr(tree, cur, &i.test);
+            build_in_expr(tree, cur, &i.body);
+            build_in_expr(tree, cur, &i.orelse);
+        }
+        Expression::Call(c) => {
+            build_in_expr(tree, cur, &c.func);
+            for arg in &c.args {
+                build_in_expr(tree, cur, &arg.value);
+            }
+        }
+        Expression::Attribute(a) => build_in_expr(tree, cur, &a.value),
+        Expression::Subscript(s) => {
+            build_in_expr(tree, cur, &s.value);
+            for element in &s.slice {
+                build_in_base_slice(tree, cur, &element.slice);
+            }
+        }
+        Expression::Tuple(t) => {
+            for el in &t.elements {
+                build_in_element(tree, cur, el);
+            }
+        }
+        Expression::List(l) => {
+            for el in &l.elements {
+                build_in_element(tree, cur, el);
+            }
+        }
+        Expression::Set(s) => {
+            for el in &s.elements {
+                build_in_element(tree, cur, el);
+            }
+        }
+        Expression::Dict(d) => {
+            for el in &d.elements {
+                match el {
+                    DictElement::Simple { key, value, .. } => {
+                        build_in_expr(tree, cur, key);
+                        build_in_expr(tree, cur, value);
+                    }
+                    DictElement::Starred(s) => build_in_expr(tree, cur, &s.value),
+                }
+            }
+        }
+        Expression::ListComp(l) => {
+            build_in_expr(tree, cur, &l.elt);
+            build_in_comp_for(tree, cur, &l.for_in);
+        }
+        Expression::SetComp(s) => {
+            build_in_expr(tree, cur, &s.elt);
+            build_in_comp_for(tree, cur, &s.for_in);
+        }
+        Expression::GeneratorExp(g) => {
+            build_in_expr(tree, cur, &g.elt);
+            build_in_comp_for(tree, cur, &g.for_in);
+        }
+        Expression::DictComp(d) => {
+            build_in_expr(tree, cur, &d.key);
+            build_in_expr(tree, cur, &d.value);
+            build_in_comp_for(tree, cur, &d.for_in);
+        }
+        Expression::FormattedString(fs) => build_in_fstring_parts(tree, cur, &fs.parts),
+        Expression::Yield(y) => {
+            if let Some(v) = &y.value {
+                match &**v {
+                    YieldValue::Expression(e) => build_in_expr(tree, cur, e),
+                    YieldValue::From(f) => build_in_expr(tree, cur, &f.item),
+                }
+            }
+        }
+        Expression::Await(a) => build_in_expr(tree, cur, &a.expression),
+        Expression::NamedExpr(n) => build_in_expr(tree, cur, &n.value),
+        Expression::StarredElement(s) => build_in_expr(tree, cur, &s.value),
+
+        // Leaf expressions (Name, Ellipsis, Integer, Float, Imaginary,
+        // SimpleString, ConcatenatedString, TemplatedString) contain no lambdas.
+        _ => {}
+    }
+}
+
+/// Lambda/def parameter DEFAULT expressions evaluate in the enclosing scope,
+/// at def-time, and may themselves contain lambdas.
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_in_params(tree: &mut ScopeTree, cur: ScopeId, params: &Parameters) {
+    let positional = params
+        .posonly_params
+        .iter()
+        .chain(&params.params)
+        .chain(&params.kwonly_params);
+    for p in positional {
+        if let Some(default) = &p.default {
+            build_in_expr(tree, cur, default);
+        }
+    }
+    if let Some(StarArg::Param(p)) = &params.star_arg
+        && let Some(default) = &p.default
+    {
+        build_in_expr(tree, cur, default);
+    }
+    if let Some(p) = &params.star_kwarg
+        && let Some(default) = &p.default
+    {
+        build_in_expr(tree, cur, default);
+    }
+}
+
+/// Insert every parameter name in `params` as `Param` — positional-only,
+/// regular, keyword-only, `*args`, `**kwargs`. Mirrors
+/// `detect::mutation::collect_param_names`.
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn insert_param_bindings(bindings: &mut HashMap<String, BindingOrigin>, params: &Parameters) {
+    let all = params
+        .posonly_params
+        .iter()
+        .chain(&params.params)
+        .chain(&params.kwonly_params);
+    for p in all {
+        bindings.insert(p.name.value.to_owned(), BindingOrigin::Param);
+    }
+    if let Some(StarArg::Param(p)) = &params.star_arg {
+        bindings.insert(p.name.value.to_owned(), BindingOrigin::Param);
+    }
+    if let Some(p) = &params.star_kwarg {
+        bindings.insert(p.name.value.to_owned(), BindingOrigin::Param);
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_funcdef(tree: &mut ScopeTree, cur: ScopeId, f: &FunctionDef) {
+    // Decorators and parameter defaults evaluate in the ENCLOSING scope, at
+    // def-time — before the new Function scope even exists.
+    for dec in &f.decorators {
+        build_in_expr(tree, cur, &dec.decorator);
+    }
+    build_in_params(tree, cur, &f.params);
+
+    // This def's own Function scope: params, then the prescan-replicated
+    // locals/globals/nonlocals (see the prescan_* functions below — a faithful
+    // port of `detect::mutation::prescan_*`, kept in lock-step so both collect
+    // the same names). Insertion order matches `classify_and_push`'s
+    // precedence (global > nonlocal > param > local): locals first, then
+    // params, then nonlocals, then globals last so later inserts win on a
+    // same-named clash.
+    let mut bindings = HashMap::new();
+    let mut globals = HashSet::new();
+    let mut nonlocals = HashSet::new();
+    let mut locals = HashSet::new();
+    prescan_suite(&f.body, &mut globals, &mut nonlocals, &mut locals, true);
+    for name in locals {
+        bindings.insert(name, BindingOrigin::Local);
+    }
+    insert_param_bindings(&mut bindings, &f.params);
+    for name in nonlocals {
+        bindings.insert(name, BindingOrigin::EnclosingCaptured);
+    }
+    for name in globals {
+        bindings.insert(name, BindingOrigin::Global);
+    }
+
+    let body_ptr = (&f.body) as *const Suite as usize;
+    let scope = tree.push_function_scope(cur, body_ptr, Some(f.name.value.to_owned()), bindings);
+
+    // Recurse into the body — in the NEW scope — for nested defs/classes/lambdas.
+    build_in_suite(tree, scope, &f.body);
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn build_classdef(tree: &mut ScopeTree, cur: ScopeId, c: &ClassDef) {
+    // Classes are NOT a scope in this model (Python methods don't see the
+    // class body as an enclosing scope): decorators, base-class args/keywords,
+    // and the body all resolve in the ENCLOSING function/module scope. Methods
+    // defined inside therefore parent directly to `cur`, skipping the class.
+    for dec in &c.decorators {
+        build_in_expr(tree, cur, &dec.decorator);
+    }
+    for base in &c.bases {
+        build_in_expr(tree, cur, &base.value);
+    }
+    for kw in &c.keywords {
+        build_in_expr(tree, cur, &kw.value);
+    }
+    build_in_suite(tree, cur, &c.body);
+}
+
+// ─── pre-scan: global/nonlocal declarations + local bindings ─────────────────
+//
+// A faithful replica of `detect::mutation::prescan_body`/`prescan_suite`/
+// `prescan_stmt`/`prescan_compound`/`prescan_orelse`/`prescan_small` — see
+// that module's doc comments for the full binding-form rationale (assign/
+// annassign/augassign-Name targets, `for`/`with as`/`except as`/`except* as`,
+// nested def/class names when `seed_defs`). The originals in `mutation.rs`
+// STAY there (Phase 2 byte-identity depends on them populating the flat
+// fields until a later task deletes them) — this is a parallel collector,
+// not a relocation.
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn prescan_suite(
+    suite: &Suite,
+    globals: &mut HashSet<String>,
+    nonlocals: &mut HashSet<String>,
+    locals: &mut HashSet<String>,
+    seed_defs: bool,
+) {
+    match suite {
+        Suite::IndentedBlock(b) => {
+            for stmt in &b.body {
+                prescan_stmt(stmt, globals, nonlocals, locals, seed_defs);
+            }
+        }
+        Suite::SimpleStatementSuite(s) => {
+            for small in &s.body {
+                prescan_small(small, globals, nonlocals, locals);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn prescan_stmt(
+    stmt: &Statement,
+    globals: &mut HashSet<String>,
+    nonlocals: &mut HashSet<String>,
+    locals: &mut HashSet<String>,
+    seed_defs: bool,
+) {
+    match stmt {
+        Statement::Simple(line) => {
+            for small in &line.body {
+                prescan_small(small, globals, nonlocals, locals);
+            }
+        }
+        Statement::Compound(c) => prescan_compound(c, globals, nonlocals, locals, seed_defs),
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn prescan_compound(
+    compound: &CompoundStatement,
+    globals: &mut HashSet<String>,
+    nonlocals: &mut HashSet<String>,
+    locals: &mut HashSet<String>,
+    seed_defs: bool,
+) {
+    match compound {
+        // Nested def/class: do NOT descend (own-body attribution), but in a FUNCTION
+        // body the def/class *name* is a local binding of the enclosing function
+        // (refs #55); `seed_defs` gates this (false for the `<module>` unit, which
+        // this collector never scans — see the module note above).
+        CompoundStatement::FunctionDef(f) => {
+            if seed_defs {
+                locals.insert(f.name.value.to_owned());
+            }
+        }
+        CompoundStatement::ClassDef(c) => {
+            if seed_defs {
+                locals.insert(c.name.value.to_owned());
+            }
+        }
+        CompoundStatement::If(i) => {
+            prescan_suite(&i.body, globals, nonlocals, locals, seed_defs);
+            if let Some(orelse) = &i.orelse {
+                prescan_orelse(orelse, globals, nonlocals, locals, seed_defs);
+            }
+        }
+        CompoundStatement::For(f) => {
+            crate::imports::collect_target_names(&f.target, locals);
+            prescan_suite(&f.body, globals, nonlocals, locals, seed_defs);
+            if let Some(orelse) = &f.orelse {
+                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
+            }
+        }
+        CompoundStatement::While(w) => {
+            prescan_suite(&w.body, globals, nonlocals, locals, seed_defs);
+            if let Some(orelse) = &w.orelse {
+                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
+            }
+        }
+        CompoundStatement::Try(t) => {
+            prescan_suite(&t.body, globals, nonlocals, locals, seed_defs);
+            for h in &t.handlers {
+                if let Some(asname) = &h.name {
+                    crate::imports::collect_target_names(&asname.name, locals);
+                }
+                prescan_suite(&h.body, globals, nonlocals, locals, seed_defs);
+            }
+            if let Some(orelse) = &t.orelse {
+                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
+            }
+            if let Some(fin) = &t.finalbody {
+                prescan_suite(&fin.body, globals, nonlocals, locals, seed_defs);
+            }
+        }
+        CompoundStatement::TryStar(t) => {
+            prescan_suite(&t.body, globals, nonlocals, locals, seed_defs);
+            for h in &t.handlers {
+                if let Some(asname) = &h.name {
+                    crate::imports::collect_target_names(&asname.name, locals);
+                }
+                prescan_suite(&h.body, globals, nonlocals, locals, seed_defs);
+            }
+            if let Some(orelse) = &t.orelse {
+                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
+            }
+            if let Some(fin) = &t.finalbody {
+                prescan_suite(&fin.body, globals, nonlocals, locals, seed_defs);
+            }
+        }
+        CompoundStatement::With(w) => {
+            for item in &w.items {
+                if let Some(asname) = &item.asname {
+                    crate::imports::collect_target_names(&asname.name, locals);
+                }
+            }
+            prescan_suite(&w.body, globals, nonlocals, locals, seed_defs);
+        }
+        CompoundStatement::Match(m) => {
+            for case in &m.cases {
+                prescan_suite(&case.body, globals, nonlocals, locals, seed_defs);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn prescan_orelse(
+    orelse: &OrElse,
+    globals: &mut HashSet<String>,
+    nonlocals: &mut HashSet<String>,
+    locals: &mut HashSet<String>,
+    seed_defs: bool,
+) {
+    match orelse {
+        OrElse::Elif(elif) => {
+            prescan_suite(&elif.body, globals, nonlocals, locals, seed_defs);
+            if let Some(inner) = &elif.orelse {
+                prescan_orelse(inner, globals, nonlocals, locals, seed_defs);
+            }
+        }
+        OrElse::Else(e) => {
+            prescan_suite(&e.body, globals, nonlocals, locals, seed_defs);
+        }
+    }
+}
+
+#[allow(dead_code)] // only exercised by this module's own tests until Task 4 wires resolve()/unit_scope_of into the mutation detector
+fn prescan_small(
+    small: &SmallStatement,
+    globals: &mut HashSet<String>,
+    nonlocals: &mut HashSet<String>,
+    locals: &mut HashSet<String>,
+) {
+    match small {
+        SmallStatement::Global(g) => {
+            for item in &g.names {
+                globals.insert(item.name.value.to_owned());
+            }
+        }
+        SmallStatement::Nonlocal(n) => {
+            for item in &n.names {
+                nonlocals.insert(item.name.value.to_owned());
+            }
+        }
+        SmallStatement::Assign(a) => {
+            for target in &a.targets {
+                crate::imports::collect_target_names(&target.target, locals);
+            }
+        }
+        SmallStatement::AnnAssign(a) => {
+            crate::imports::collect_target_names(&a.target, locals);
+        }
+        SmallStatement::AugAssign(a) => {
+            if let AssignTargetExpression::Name(n) = &a.target {
+                locals.insert(n.value.to_owned());
+            }
+        }
+        _ => {}
     }
 }
 
@@ -178,6 +978,68 @@ mod tests {
         assert_eq!(t.resolve(m, "CACHE").0, BindingOrigin::FromImport);
         assert_eq!(t.resolve(m, "x").0, BindingOrigin::ModuleBinding);
         assert_eq!(t.resolve(m, "nope").0, BindingOrigin::Unresolved);
+    }
+
+    #[test]
+    fn function_scope_params_locals_and_decls() {
+        let t = build_str(
+            "import os\ndef f(p):\n    global g\n    x = 1\n    for i in p:\n        i\n    p; x; g; os\n",
+        );
+        let f = t.scope_of_name("f");
+        assert_eq!(t.resolve(f, "p").0, BindingOrigin::Param);
+        assert_eq!(t.resolve(f, "x").0, BindingOrigin::Local);
+        assert_eq!(t.resolve(f, "i").0, BindingOrigin::Local); // for-target is function-local
+        assert_eq!(t.resolve(f, "g").0, BindingOrigin::Global);
+        assert_eq!(t.resolve(f, "os").0, BindingOrigin::ModuleImport); // walks to module
+    }
+
+    #[test]
+    fn nonlocal_is_enclosing_captured() {
+        // `nonlocal` needs a real enclosing binding; test it with proper nesting.
+        let t = build_str("def outer():\n    n = 0\n    def f():\n        nonlocal n\n        n\n");
+        let f = t.scope_of_name("f");
+        assert_eq!(t.resolve(f, "n").0, BindingOrigin::EnclosingCaptured); // declared capture
+    }
+
+    #[test]
+    fn param_shadows_module_import() {
+        let t = build_str("import os\ndef f(os):\n    os\n");
+        let f = t.scope_of_name("f");
+        assert_eq!(t.resolve(f, "os").0, BindingOrigin::Param); // nearest-enclosing beats the import
+    }
+
+    #[test]
+    fn implicit_capture_is_unresolved_not_local() {
+        // Non-goal boundary: inner's use of outer's local resolves to Unresolved
+        // (function->module walk skips ancestor functions) — byte-identical with the flat model.
+        let t = build_str("def outer():\n    x = []\n    def inner():\n        x.append(1)\n");
+        let inner = t.scope_of_name("inner");
+        assert_eq!(t.resolve(inner, "x").0, BindingOrigin::Unresolved);
+    }
+
+    #[test]
+    fn module_unit_top_level_assign_is_local() {
+        // Byte-identity with the flat `<module>` unit: a top-level assign target
+        // is the module UNIT's own local (LocalMutation/contained), while the
+        // same name is a ModuleBinding to every OTHER unit. A top-level class
+        // name is a ModuleBinding to the module unit too (seed_defs=false).
+        let t = build_str("x = {}\nclass C: pass\n");
+        let m = t.module_unit_scope();
+        assert_eq!(t.resolve(m, "x").0, BindingOrigin::Local); // module unit's own local
+        assert_eq!(
+            t.resolve(t.module_scope(), "x").0,
+            BindingOrigin::ModuleBinding // what a function sees for the same name
+        );
+        assert_eq!(t.resolve(m, "C").0, BindingOrigin::ModuleBinding); // class name not seeded
+    }
+
+    #[test]
+    fn module_unit_top_level_for_target_is_local() {
+        // A top-level `for i in xs:` target is a function-local of the module
+        // unit — matches the flat model's `prescan_body(FnBody::Module)` locals.
+        let t = build_str("xs = []\nfor i in xs:\n    i.append(1)\n");
+        let m = t.module_unit_scope();
+        assert_eq!(t.resolve(m, "i").0, BindingOrigin::Local);
     }
 
     #[test]
