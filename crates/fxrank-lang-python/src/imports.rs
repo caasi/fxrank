@@ -122,6 +122,15 @@ impl Imports {
     pub fn has_dynamic(&self) -> bool {
         self.dynamic
     }
+
+    /// Iterate every local name introduced by an import statement anywhere in
+    /// the file (the `table` keys). Used by `scope::ScopeTree::build` to
+    /// overlay the file-wide import table onto the module scope, since
+    /// `table` itself is private.
+    #[allow(dead_code)] // ScopeTree isn't wired into the mutation detector yet (spec 078, Task 2)
+    pub(crate) fn iter_local_names(&self) -> impl Iterator<Item = &str> {
+        self.table.keys().map(|s| s.as_str())
+    }
 }
 
 // ─── file-wide statement traversal ────────────────────────────────────────────
