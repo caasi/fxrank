@@ -322,19 +322,19 @@ impl ScopeTree {
                 found = Some(id);
             }
         }
-        debug_assert_eq!(
-            hits, 1,
-            "unit_scope_of: expected exactly one scope for unit `{}` (body pointer {ptr:#x}), \
-             found {hits} — pointer identity between functions::collect and scope::build broke",
-            unit.symbol,
-        );
-        found.unwrap_or_else(|| {
+        // Fail loud in ALL builds (not just debug): both a miss (hits == 0) and a
+        // duplicate (hits > 1) mean pointer identity between functions::collect and
+        // scope::build broke, and either would otherwise mis-resolve every binding in
+        // the unit. This runs once per unit (not per name-resolution), so the release
+        // check is negligible.
+        if hits != 1 {
             panic!(
-                "unit_scope_of: no scope found for unit `{}` (body pointer {ptr:#x}) — \
-                 pointer identity between functions::collect and scope::build broke",
-                unit.symbol
-            )
-        })
+                "unit_scope_of: expected exactly one scope for unit `{}` (body pointer {ptr:#x}), \
+                 found {hits} — pointer identity between functions::collect and scope::build broke",
+                unit.symbol,
+            );
+        }
+        found.expect("hits == 1 guarantees exactly one matching scope")
     }
 
     /// Test helper: the module-unit scope M (models the `<module>` unit's own
