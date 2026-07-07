@@ -741,17 +741,22 @@ fn build_funcdef(tree: &mut ScopeTree, cur: ScopeId, f: &FunctionDef) {
     // This def's own Function scope: params, then the prescan-replicated
     // locals/globals/nonlocals (see the prescan_* functions below — a faithful
     // port of `detect::mutation::prescan_*`, kept in lock-step so both collect
-    // the same names). Insertion order matches `classify_and_push`'s
-    // precedence (global > nonlocal > param > local): locals first, then
-    // params, then nonlocals, then globals last so later inserts win on a
-    // same-named clash.
+    // the same names). Insertion order matches the flat cascade's precedence
+    // (`classify_and_push`: globals > nonlocals > params > locals > imports,
+    // F5) — with last-write-wins `HashMap::insert`, that means insertion order
+    // LOW→HIGH precedence: imports first, then locals, then params, then
+    // nonlocals, then globals last, so a higher-precedence same-named binding
+    // always overwrites a lower one.
     //
     // #78: `prescan_suite`'s traversal also collects this function's OWN
     // top-level `import`/`from … import` statements (own-body attribution —
     // it does not descend into a nested def/class, same as locals/globals/
-    // nonlocals). A local import binds at the same "local" precedence tier —
-    // inserted alongside `locals`, before params/nonlocals/globals — so it
-    // never reaches module scope and never leaks to another function.
+    // nonlocals). A local import binds this function's own scope (never
+    // reaching module scope, never leaking to another function) — but it is
+    // the LOWEST-precedence binding in that scope: a same-named local
+    // reassignment (`import os\nos = {}`), param, nonlocal, or global in the
+    // same function must win over it, matching F5 being checked after locals
+    // in the flat cascade. So imports are inserted FIRST here, before locals.
     let mut bindings = HashMap::new();
     let mut globals = HashSet::new();
     let mut nonlocals = HashSet::new();
@@ -765,11 +770,11 @@ fn build_funcdef(tree: &mut ScopeTree, cur: ScopeId, f: &FunctionDef) {
         &mut imports,
         true,
     );
-    for name in locals {
-        bindings.insert(name, BindingOrigin::Local);
-    }
     for (name, origin) in imports {
         bindings.insert(name, origin);
+    }
+    for name in locals {
+        bindings.insert(name, BindingOrigin::Local);
     }
     insert_param_bindings(&mut bindings, &f.params);
     for name in nonlocals {

@@ -12,17 +12,26 @@ use fxrank_core::frontend::{Frontend, SourceFile};
 use fxrank_core::model::{Report, Scope};
 use fxrank_lang_python::PythonFrontend;
 
-fn analyze_dogfood(include_tests: bool) -> Report {
-    let path = format!("{}/tests/fixtures/dogfood.py", env!("CARGO_MANIFEST_DIR"));
-    let text = std::fs::read_to_string(&path).expect("dogfood.py fixture exists");
+/// Analyze `tests/fixtures/<name>.py` end-to-end (`PythonFrontend` → `Report::build`),
+/// reporting it under the logical path `"<name>.py"` (not the real
+/// `tests/fixtures/<name>.py`) so the `tests/` segment of the real filesystem
+/// path does not trigger the path-based test-file skip. Shared by every
+/// fixture-driven snapshot test in this file — `analyze_dogfood` is a thin
+/// wrapper kept for its existing call site's readability.
+fn analyze_fixture(name: &str, include_tests: bool) -> Report {
+    let logical_path = format!("{name}.py");
+    let path = format!(
+        "{}/tests/fixtures/{logical_path}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{logical_path} fixture must exist: {e}"));
     let output = PythonFrontend { include_tests }.analyze(&[SourceFile {
-        // Report under a neutral logical path so the `tests/` segment of the
-        // real filesystem path does not trigger the path-based skip rule.
-        path: "dogfood.py".into(),
+        path: logical_path.clone(),
         text,
     }]);
     let scope = Scope {
-        input: "dogfood.py".into(),
+        input: logical_path.clone(),
         files: 1,
         // Derive parsed from the frontend output so a future parse regression on
         // the fixture is reflected, rather than hard-coding success.
@@ -34,6 +43,10 @@ fn analyze_dogfood(include_tests: bool) -> Report {
         external_reaches: vec![],
     };
     Report::build(scope, output.functions, output.diagnostics, None)
+}
+
+fn analyze_dogfood(include_tests: bool) -> Report {
+    analyze_fixture("dogfood", include_tests)
 }
 
 /// Build a stable JSON summary of a single hotspot (omits `line`/`id` which
@@ -327,4 +340,72 @@ fn method_body_effect_stays_on_method_unit_not_module() {
             .map(|e| e.kind.wire())
             .collect::<Vec<_>>()
     );
+}
+
+// ── #78 final-review SHOULD-FIX: delta snapshot-coverage fixtures ──────────
+//
+// Task 7 (cross-function import collision) and Task 8 (match/walrus/
+// comprehension captures) each moved 0 snapshots in the #78 migration because
+// the dogfood corpus doesn't exercise either shape. Pin each delta with its
+// own small fixture + snapshot, independent of `dogfood_report`.
+
+/// #78 Task 7: a top-level `from`-import and an unrelated function's own
+/// same-named function-local `import … as …` resolve independently — `f`'s
+/// `CACHE.append(1)` recovers as `global.mutation`, unaffected by `g`'s local
+/// alias (see `tests/fixtures/import_collision.py`).
+#[test]
+fn snapshot_import_collision() {
+    let report = analyze_fixture("import_collision", false);
+
+    let f = find_fn(&report, "f");
+    assert!(
+        f.effects.iter().any(|e| e.kind.wire() == "global.mutation"),
+        "f's CACHE.append(1) must recover as global.mutation, got: {:?}",
+        f.effects.iter().map(|e| e.kind.wire()).collect::<Vec<_>>()
+    );
+    assert!(
+        !f.effects.iter().any(|e| e.hidden),
+        "f must have no hidden effects (the collision this fixture guards \
+         against used to suppress/mis-shadow f's CACHE), got: {:?}",
+        f.effects
+    );
+
+    let snapshot = serde_json::json!({
+        "hotspots": report.hotspots.iter().map(summarize).collect::<Vec<_>>(),
+    });
+    insta::assert_json_snapshot!("import_collision_report", snapshot);
+}
+
+/// #78/#55 Task 8: match-case captures, walrus targets, and comprehension
+/// `for` targets are function-locals — every mutating use in
+/// `tests/fixtures/match_walrus_comprehension.py` must show as a plain
+/// `local.mutation`, never `hidden.mutation`/"captured-binding".
+#[test]
+fn snapshot_match_walrus_comprehension() {
+    let report = analyze_fixture("match_walrus_comprehension", false);
+
+    let h = find_fn(&report, "h");
+    assert!(
+        !h.effects.iter().any(|e| e.hidden),
+        "h must have no hidden.mutation effects (match/walrus/comprehension \
+         captures must resolve as locals), got: {:?}",
+        h.effects
+    );
+    let local_mutations = h
+        .effects
+        .iter()
+        .filter(|e| e.kind.wire() == "local.mutation")
+        .count();
+    assert_eq!(
+        local_mutations,
+        3,
+        "h must show 3 local.mutation effects (match-capture args.append, \
+         walrus buf.append, comprehension r.sort()), got: {:?}",
+        h.effects.iter().map(|e| e.kind.wire()).collect::<Vec<_>>()
+    );
+
+    let snapshot = serde_json::json!({
+        "hotspots": report.hotspots.iter().map(summarize).collect::<Vec<_>>(),
+    });
+    insta::assert_json_snapshot!("match_walrus_comprehension_report", snapshot);
 }

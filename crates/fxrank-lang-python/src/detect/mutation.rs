@@ -983,6 +983,31 @@ mod tests {
         );
     }
 
+    /// #78 final-review MUST-FIX: a function-local import reassigned to a local
+    /// in the SAME function must resolve as `Local`, not `ModuleImport`. The
+    /// flat cascade checks `locals` BEFORE `imports` (F5), so `build_funcdef`'s
+    /// insertion order must make locals win — imports are the lowest-precedence
+    /// function-scope binding (inserted before locals/params/nonlocals/globals).
+    #[test]
+    fn function_local_import_reassigned_is_local_not_global() {
+        // Flat cascade checks locals before imports (F5); a name both imported AND
+        // locally reassigned in the same function is a Local, not a module import.
+        let src = "def f():\n    import os\n    os = {}\n    os['k'] = 1\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            pairs
+                .iter()
+                .any(|(e, c)| e.kind == EffectKind::LocalMutation && *c),
+            "os['k']=1 must be LocalMutation/contained, got {:?}",
+            pairs.iter().map(|(e, c)| (e.kind, *c)).collect::<Vec<_>>()
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|(e, _)| e.kind == EffectKind::GlobalMutation)
+        );
+    }
+
     /// Prescan fix (for/with-as/except-as): a name introduced by a `for` loop target
     /// in a function body is a Python local for the WHOLE function (PEP 3104). A
     /// module binding of the same name must be shadowed by the for-target local.
