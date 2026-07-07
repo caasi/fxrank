@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use crate::coverage;
 use crate::functions::{FnBody, FnUnit};
 use crate::imports::Imports;
+use crate::scope::ScopeTree;
 use crate::source::SpanIndex;
 use fxrank_core::confidence::function_confidence;
 use fxrank_core::effect::{RiskFeature, RiskKind, Tier};
@@ -997,6 +998,7 @@ fn gather(
     path: &str,
     imports: &Imports,
     module_bindings: &HashSet<String>,
+    scope: &ScopeTree,
     span: &SpanIndex,
 ) -> GatherOutput {
     let mut effects = calls::detect(unit, imports, span);
@@ -1013,7 +1015,7 @@ fn gather(
     } else {
         cov.boundary
     };
-    let mut_pairs = mutation::detect(unit, imports, module_bindings, span);
+    let mut_pairs = mutation::detect(unit, imports, module_bindings, scope, span);
     effects.extend(mut_pairs.into_iter().map(|(mut e, contained)| {
         // Wire the tuple's containment bool onto the Effect so propagation logic
         // (`Effect::escapes()`) sees the real value (not the default `false` stub).
@@ -1076,16 +1078,17 @@ fn gather(
 ///    are unresolved awaited calls), and `await_count` / `async_boundary`.
 ///
 /// Adding a detector is a one-line addition to the gather step (in [`gather`]).
-pub fn analyze_unit(
+pub(crate) fn analyze_unit(
     unit: &FnUnit,
     path: &str,
     imports: &Imports,
     module_bindings: &HashSet<String>,
+    scope: &ScopeTree,
     span: &SpanIndex,
 ) -> Hotspot {
     // ── gather ───────────────────────────────────────────────────────────────
     let (effects, risks, await_count, async_boundary, unknown_decorator) =
-        gather(unit, path, imports, module_bindings, span);
+        gather(unit, path, imports, module_bindings, scope, span);
 
     // ── fold ─────────────────────────────────────────────────────────────────
     let weights: Vec<u32> = effects.iter().map(|e| e.weight).collect();
@@ -1160,11 +1163,12 @@ fn symbol_segments(symbol: &str) -> Option<Vec<String>> {
 /// effects/risks (unlike TS, which absorbs React signals and so must copy from the
 /// final Hotspot). If you add a post-gather step here, switch to copying from the
 /// Hotspot or the record's own-body will drift from it.
-pub fn build_record(
+pub(crate) fn build_record(
     unit: &FnUnit,
     path: &str,
     imports: &Imports,
     module_bindings: &HashSet<String>,
+    scope: &ScopeTree,
     span: &SpanIndex,
     module_map: &crate::module_map::PyModuleMap,
 ) -> fxrank_core::record::UnitRecord {
@@ -1172,7 +1176,7 @@ pub fn build_record(
     // `unknown_decorator` is a confidence-only signal; records carry no
     // confidence field, so we discard it here.
     let (effects, risks, await_count, async_boundary, _unknown_decorator) =
-        gather(unit, path, imports, module_bindings, span);
+        gather(unit, path, imports, module_bindings, scope, span);
 
     // ── canonical_path ─────────────────────────────────────────────────────
     // Only a module-level def is importable as `module.<name>`. Methods/nested
@@ -1235,6 +1239,7 @@ mod tests {
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = ScopeTree::build(&module, &imports, &module_bindings);
         let span = SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = crate::functions::collect(&module, &src, &span, &anchors);
@@ -1246,6 +1251,7 @@ mod tests {
                     &format!("tests/fixtures/{name}.py"),
                     &imports,
                     &module_bindings,
+                    &scope,
                     &span,
                 )
             })
@@ -1357,11 +1363,12 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = ScopeTree::build(&module, &imports, &module_bindings);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).unwrap();
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
         let f = units.iter().find(|u| u.symbol == "f").unwrap();
-        let h = analyze_unit(f, "x.py", &imports, &module_bindings, &span);
+        let h = analyze_unit(f, "x.py", &imports, &module_bindings, &scope, &span);
         assert!(
             h.await_count >= 1,
             "await in subscript index must count, got await_count={}",
@@ -1379,11 +1386,12 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = ScopeTree::build(&module, &imports, &module_bindings);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).unwrap();
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
         let f = units.iter().find(|u| u.symbol == "f").unwrap();
-        let h = analyze_unit(f, "x.py", &imports, &module_bindings, &span);
+        let h = analyze_unit(f, "x.py", &imports, &module_bindings, &scope, &span);
         assert!(
             h.await_count >= 1,
             "await in an assignment-target subscript index must count, got await_count={}",
@@ -1623,11 +1631,12 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = ScopeTree::build(&module, &imports, &module_bindings);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
         let unit = units.iter().find(|u| u.symbol == "f").unwrap();
-        let h = analyze_unit(unit, "x.py", &imports, &module_bindings, &span);
+        let h = analyze_unit(unit, "x.py", &imports, &module_bindings, &scope, &span);
         assert!(
             h.effects.iter().any(|e| e.kind.wire() == "net.fs.db"),
             "requests.get(u) inside f-string format_spec must emit net.fs.db; got: {:?}",
@@ -1643,11 +1652,12 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = ScopeTree::build(&module, &imports, &module_bindings);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
         let outer = units.iter().find(|u| u.symbol == "f").unwrap();
-        let h = analyze_unit(outer, "x.py", &imports, &module_bindings, &span);
+        let h = analyze_unit(outer, "x.py", &imports, &module_bindings, &scope, &span);
         assert!(
             h.await_count >= 1,
             "await inside f-string format_spec must count; got await_count={}",
@@ -1667,11 +1677,12 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = ScopeTree::build(&module, &imports, &module_bindings);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
         let unit = units.iter().find(|u| u.symbol == "f").unwrap();
-        let h = analyze_unit(unit, "x.py", &imports, &module_bindings, &span);
+        let h = analyze_unit(unit, "x.py", &imports, &module_bindings, &scope, &span);
         assert!(
             h.risk_features
                 .iter()
@@ -1701,6 +1712,7 @@ mod tests {
         let module = libcst_native::parse_module(contained_src, None).unwrap();
         let imports = Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = ScopeTree::build(&module, &imports, &module_bindings);
         let span = SpanIndex::new(contained_src);
         let anchors = crate::source::lambda_anchors(contained_src).expect("tokenize");
         let (units, _) = crate::functions::collect(&module, contained_src, &span, &anchors);
@@ -1708,7 +1720,7 @@ mod tests {
             .iter()
             .find(|u| u.symbol == "builds_local")
             .expect("builds_local not found");
-        let h = analyze_unit(unit, "test.py", &imports, &module_bindings, &span);
+        let h = analyze_unit(unit, "test.py", &imports, &module_bindings, &scope, &span);
         let local_mut = h
             .effects
             .iter()
@@ -1730,6 +1742,7 @@ mod tests {
         let module2 = libcst_native::parse_module(escaping_src, None).unwrap();
         let imports2 = Imports::build(&module2);
         let module_bindings2 = crate::imports::module_bindings(&module2);
+        let scope2 = ScopeTree::build(&module2, &imports2, &module_bindings2);
         let span2 = SpanIndex::new(escaping_src);
         let anchors2 = crate::source::lambda_anchors(escaping_src).expect("tokenize");
         let (units2, _) = crate::functions::collect(&module2, escaping_src, &span2, &anchors2);
@@ -1737,7 +1750,14 @@ mod tests {
             .iter()
             .find(|u| u.symbol == "uses_global")
             .expect("uses_global not found");
-        let h2 = analyze_unit(unit2, "test.py", &imports2, &module_bindings2, &span2);
+        let h2 = analyze_unit(
+            unit2,
+            "test.py",
+            &imports2,
+            &module_bindings2,
+            &scope2,
+            &span2,
+        );
         let global_mut = h2
             .effects
             .iter()
@@ -1768,6 +1788,7 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = ScopeTree::build(&module, &imports, &module_bindings);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
@@ -1779,7 +1800,15 @@ mod tests {
             path: "test.py".into(),
             text: String::new(),
         }]);
-        let rec = build_record(unit, "test.py", &imports, &module_bindings, &span, &mmap);
+        let rec = build_record(
+            unit,
+            "test.py",
+            &imports,
+            &module_bindings,
+            &scope,
+            &span,
+            &mmap,
+        );
 
         assert_eq!(rec.symbol, "writer");
         assert!(
@@ -1816,6 +1845,7 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = ScopeTree::build(&module, &imports, &module_bindings);
         let span = SpanIndex::new(src);
         let unit = crate::functions::module_init_unit(&module)?;
         Some(analyze_unit(
@@ -1823,6 +1853,7 @@ mod tests {
             "test.py",
             &imports,
             &module_bindings,
+            &scope,
             &span,
         ))
     }
@@ -1887,6 +1918,7 @@ mod tests {
         let anchors = crate::source::lambda_anchors(src).expect("tokenize");
         let imports = Imports::build(&module2);
         let module_bindings = crate::imports::module_bindings(&module2);
+        let scope2 = ScopeTree::build(&module2, &imports, &module_bindings);
         let (units, _) = crate::functions::collect(&module2, src, &span, &anchors);
         let impure_h = analyze_unit(
             units
@@ -1896,6 +1928,7 @@ mod tests {
             "test.py",
             &imports,
             &module_bindings,
+            &scope2,
             &span,
         );
         assert!(
@@ -2016,6 +2049,7 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = ScopeTree::build(&module, &imports, &module_bindings);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
@@ -2028,6 +2062,7 @@ mod tests {
             "pkg/util.py",
             &imports,
             &module_bindings,
+            &scope,
             &span,
             &mmap,
         );
@@ -2059,6 +2094,7 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = ScopeTree::build(&module, &imports, &module_bindings);
         let span = SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
@@ -2075,6 +2111,7 @@ mod tests {
             "pkg/util.py",
             &imports,
             &module_bindings,
+            &scope,
             &span,
             &mmap,
         );

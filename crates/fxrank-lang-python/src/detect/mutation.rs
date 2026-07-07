@@ -50,6 +50,7 @@ use super::expr::render_expr;
 use super::{EffectSink, walk_own_body};
 use crate::functions::{FnBody, FnUnit};
 use crate::imports::Imports;
+use crate::scope::{ScopeId, ScopeTree};
 use crate::source::{SpanIndex, anchor_of_subslice};
 
 /// Detect mutation effects in `unit`'s own body, with escape analysis.
@@ -59,10 +60,16 @@ use crate::source::{SpanIndex, anchor_of_subslice};
 /// constructor init); `false` means it escapes.
 ///
 /// Task 9 consumes the `contained` flags to apply boundary-containment discounts.
-pub fn detect(
+///
+/// `scope` is threaded through so `MutSink` can compute `unit_scope` — the
+/// unit's own `Function` scope in the file's `ScopeTree` (spec 078). This is
+/// pure wiring: nothing in classification consults `scope`/`unit_scope` yet
+/// (a later task does), so behavior is unchanged.
+pub(crate) fn detect(
     unit: &FnUnit,
     imports: &Imports,
     module_bindings: &HashSet<String>,
+    scope: &ScopeTree,
     span: &SpanIndex,
 ) -> Vec<(Effect, bool)> {
     // ── Step 1: collect param names from the unit's signature ────────────────
@@ -76,6 +83,7 @@ pub fn detect(
 
     // ── Step 3: classify writes via the EffectSink driver ────────────────────
     let is_init = unit.symbol == "__init__";
+    let unit_scope = scope.unit_scope_of(unit);
     let mut sink = MutSink {
         params: &params,
         globals: &globals,
@@ -84,6 +92,8 @@ pub fn detect(
         imports,
         module_bindings,
         is_init,
+        scope,
+        unit_scope,
         span,
         effects: Vec::new(),
     };
@@ -380,6 +390,16 @@ struct MutSink<'a> {
     module_bindings: &'a HashSet<String>,
     /// True when analyzing `__init__` (so `self.attr = …` is local init).
     is_init: bool,
+    /// The file's scope tree (spec 078). Not yet consulted by classification —
+    /// wired in by this task so a later task can switch `classify_and_push`/
+    /// `on_call`/`on_assign_target` over to `scope.resolve(unit_scope, name)`.
+    #[allow(dead_code)] // consulted by a later task; only `unit_scope` is used by this one
+    scope: &'a ScopeTree,
+    /// `unit.symbol`'s own `Function` scope in `scope`, computed once via
+    /// `scope.unit_scope_of(unit)`. Every future resolve() call in this sink
+    /// starts here (there is no per-use-site cursor — see the guideline).
+    #[allow(dead_code)] // consulted by a later task
+    unit_scope: ScopeId,
     span: &'a SpanIndex<'a>,
     effects: Vec<(Effect, bool)>,
 }
@@ -752,12 +772,13 @@ mod tests {
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let mut out: HashMap<String, Vec<(EffectKind, bool)>> = HashMap::new();
         for unit in &units {
-            let pairs = detect(unit, &imports, &module_bindings, &span);
+            let pairs = detect(unit, &imports, &module_bindings, &scope, &span);
             out.insert(
                 unit.symbol.clone(),
                 pairs.iter().map(|(e, c)| (e.kind, *c)).collect(),
@@ -772,12 +793,13 @@ mod tests {
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let mut out: HashMap<String, Vec<(EffectKind, bool, String)>> = HashMap::new();
         for unit in &units {
-            let pairs = detect(unit, &imports, &module_bindings, &span);
+            let pairs = detect(unit, &imports, &module_bindings, &scope, &span);
             out.insert(
                 unit.symbol.clone(),
                 pairs
@@ -902,6 +924,9 @@ mod tests {
         let src = "x\n";
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
+        let module_bindings = HashSet::new();
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
+        let unit_scope = scope.module_scope();
         let span = crate::source::SpanIndex::new(src);
         let mut sink = MutSink {
             params: &params,
@@ -909,8 +934,10 @@ mod tests {
             nonlocals: &nonlocals,
             locals: &locals,
             imports: &imports,
-            module_bindings: &HashSet::new(),
+            module_bindings: &module_bindings,
             is_init: false,
+            scope: &scope,
+            unit_scope,
             span: &span,
             effects: Vec::new(),
         };
@@ -932,16 +959,35 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
         let span = crate::source::SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, src, &span, &anchors);
         let f = units.iter().find(|u| u.symbol == "f").unwrap();
-        let pairs = detect(f, &imports, &module_bindings, &span);
+        let pairs = detect(f, &imports, &module_bindings, &scope, &span);
         assert!(
             pairs.iter().any(|(e, _)| e.kind == ParamMutation),
             "lst.append where lst is a param → ParamMutation, got: {:?}",
             pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
         );
+    }
+
+    /// Task 4 (#78): `detect` accepts a `&ScopeTree` and still finds the same
+    /// param-mutation effect — the compile-level proof that threading the scope
+    /// tree through is pure wiring (no behavior change).
+    #[test]
+    fn detect_accepts_scope_tree() {
+        let src = "def f(lst):\n    lst.append(1)\n";
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
+        let mb = crate::imports::module_bindings(&module);
+        let tree = crate::scope::ScopeTree::build(&module, &imports, &mb);
+        let span = crate::source::SpanIndex::new(src);
+        let anchors = crate::source::lambda_anchors(src).unwrap();
+        let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
+        let f = units.iter().find(|u| u.symbol == "f").unwrap();
+        let pairs = detect(f, &imports, &mb, &tree, &span);
+        assert!(pairs.iter().any(|(e, _)| e.kind == ParamMutation));
     }
 
     /// F5: a write whose root resolves through the ImportTable is module-level state
@@ -1003,13 +1049,15 @@ mod tests {
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
         let span = crate::source::SpanIndex::new(&src);
         let unit =
             crate::functions::module_init_unit(&module).expect("module has executable top-level");
-        let effs: Vec<(EffectKind, bool)> = detect(&unit, &imports, &module_bindings, &span)
-            .iter()
-            .map(|(e, c)| (e.kind, *c))
-            .collect();
+        let effs: Vec<(EffectKind, bool)> =
+            detect(&unit, &imports, &module_bindings, &scope, &span)
+                .iter()
+                .map(|(e, c)| (e.kind, *c))
+                .collect();
         assert!(
             effs.contains(&(GlobalMutation, false)),
             "module-level `def.attr = …` must be GlobalMutation(false), got: {effs:?}"
@@ -1030,11 +1078,12 @@ mod tests {
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let inner = units.iter().find(|u| u.symbol == "inner").unwrap();
-        let pairs = detect(inner, &imports, &module_bindings, &span);
+        let pairs = detect(inner, &imports, &module_bindings, &scope, &span);
         let hidden = pairs
             .iter()
             .find(|(e, _)| e.kind == HiddenMutation)
@@ -1074,6 +1123,7 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
         let span = crate::source::SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, src, &span, &anchors);
@@ -1081,7 +1131,7 @@ mod tests {
             .iter()
             .find(|u| u.symbol == fn_name)
             .expect("unit not found");
-        detect(unit, &imports, &module_bindings, &span)
+        detect(unit, &imports, &module_bindings, &scope, &span)
     }
 
     #[test]

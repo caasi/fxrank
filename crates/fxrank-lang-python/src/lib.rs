@@ -84,6 +84,11 @@ impl Frontend for PythonFrontend {
                     // are both alive. `analyze_unit` emits owned `Hotspot`s.
                     let imports = imports::Imports::build(&module);
                     let module_bindings = crate::imports::module_bindings(&module);
+                    // Build the file's scope tree once, over this SAME `module` —
+                    // `ScopeTree::unit_scope_of`'s body-pointer match (spec 078)
+                    // requires it to be built from the identical `&Module` that
+                    // `functions::collect` walks below, so the pointers coincide.
+                    let scope = scope::ScopeTree::build(&module, &imports, &module_bindings);
                     // Build SpanIndex once per file; pass it into both `collect`
                     // (for lambda-anchor line/col) and `analyze_unit` (for effect
                     // line resolution) — no duplicate O(n) line-start indexing.
@@ -160,6 +165,7 @@ impl Frontend for PythonFrontend {
                                     &file.path,
                                     &imports,
                                     &module_bindings,
+                                    &scope,
                                     &span,
                                 ));
                                 output.records.push(detect::build_record(
@@ -167,6 +173,7 @@ impl Frontend for PythonFrontend {
                                     &file.path,
                                     &imports,
                                     &module_bindings,
+                                    &scope,
                                     &span,
                                     &module_map,
                                 ));
@@ -192,6 +199,7 @@ impl Frontend for PythonFrontend {
                                 &file.path,
                                 &imports,
                                 &module_bindings,
+                                &scope,
                                 &span,
                             );
                             if !h.effects.is_empty() {
@@ -200,6 +208,7 @@ impl Frontend for PythonFrontend {
                                     &file.path,
                                     &imports,
                                     &module_bindings,
+                                    &scope,
                                     &span,
                                     &module_map,
                                 );
