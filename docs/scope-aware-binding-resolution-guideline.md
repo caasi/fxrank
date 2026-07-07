@@ -184,13 +184,22 @@ model each resolver builds over its own AST is not**, and must not be.
   captures, walrus `:=`, and comprehension targets — **uncollected residuals** in the flat
   code — are collected in 078's Python step. **Deliberate divergence, code wins:** comp
   targets are collected into the **function scope** as `Local`, not a comprehension-own
-  scope. It is **effect-identical** for mutation classification (`local.mutation` either
-  way), and the only observable difference — a comp target's name reused outside the
-  comprehension — is impossible in valid Python 3 (targets don't leak) and, in broken code,
-  misresolves toward a false negative, never an FP (charter: FP ≫ FN). The comprehension
-  scope in this bullet is the **target model**, load-bearing only once a consumer must
-  distinguish comp-scope from function-scope, e.g. shared-global identity (#81) or an
-  implicit-capture walk; build it then, not now.)*
+  scope. For the mutation of a comp target *inside* its own comprehension (the common,
+  motivating case) this is `local.mutation` either way — effect-identical. The **cost** of
+  the simplification: because the comp target now lives in the whole function's scope, it
+  **shadows a same-named outer binding for uses elsewhere in the function**. A Python-3 comp
+  target does not leak, but its *name* can independently denote a module import / global
+  used elsewhere in the same function — e.g. `import os; def f(): _=[os for os in mods]; os.remove(p)`
+  — where the flat model resolves the trailing `os` to the module import (suppressed) but
+  this model resolves it to `Local` → a spurious `local.mutation` (a real **FP**); the
+  `CACHE = {}; _=[CACHE for CACHE in xs]; CACHE['k']=1` shape instead downgrades a
+  `global.mutation` to `local.mutation` (an FN). Both are **class-1 / contained** (the
+  lowest-weight class, near-zero ranking impact), and the triggering shape — a comp target
+  whose name collides with a same-named module/global used *outside* the comprehension in
+  the same function — is rare. Accepted as the simplification's cost under FP ≫ FN given the
+  magnitude; the comprehension-own-scope **target model** (this bullet) avoids it entirely
+  and becomes load-bearing once a consumer must distinguish comp-scope from function-scope
+  (shared-global identity #81, or an implicit-capture walk) — build it then, not now.)*
 - **TS/JS (`swc`)** — `var` **hoists** to the function scope while `let`/`const` are
   **block-scoped with a TDZ**; closures capture by reference; a namespace import
   (`import * as V`) is an **immutable module namespace** (→ its own suppression, like
