@@ -5,6 +5,7 @@ pub mod detect;
 pub mod functions;
 pub mod imports;
 pub mod module_map;
+pub mod scope;
 pub mod source;
 
 use fxrank_core::CorpusProfile;
