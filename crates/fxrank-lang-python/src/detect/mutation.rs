@@ -21,15 +21,12 @@
 //!
 //! ## Strategy
 //!
-//! 1. **Pre-scan** the function body for `global`/`nonlocal` declarations and
-//!    local bindings — `Assign`/`AnnAssign` targets (incl. tuple/list/starred
-//!    destructuring), `AugAssign` bare-`Name` targets, `for`/`async for` loop
-//!    targets, `with … as`/`async with … as` names, and `except … as` /
-//!    `except* … as` names — building the `globals`, `nonlocals`, and `locals`
-//!    sets. (Python scoping: any binding-form in a body makes the name
-//!    function-local for the whole function.)
-//! 2. **Extract** parameter names from `unit.params`.
-//! 3. **Walk** the body classifying write targets: `Assign`/`AnnAssign`/`AugAssign`
+//! 1. **Resolve** each write-site's root name against the file's `ScopeTree`
+//!    (spec 078) — `global`/`nonlocal` declarations, params, locals, imports,
+//!    and module-level bindings are all encoded in the tree's binding walk, so
+//!    a single `scope.resolve(unit_scope, name)` replaces the old pre-scan +
+//!    flat-set membership checks (Task 6 removed the last flat-set consumer).
+//! 2. **Walk** the body classifying write targets: `Assign`/`AnnAssign`/`AugAssign`
 //!    targets, and mutating method calls (`.append`, `.update`, `.add`) via
 //!    `on_call` in the EffectSink.
 //!
@@ -41,15 +38,13 @@ use std::collections::HashSet;
 use fxrank_core::confidence::detection_confidence;
 use fxrank_core::effect::{Effect, EffectKind, Tier};
 use fxrank_core::score::weight_for_class;
-use libcst_native::{
-    Assert, AssignTargetExpression, Call, Expression, Name, Parameters, Raise, SmallStatement,
-    Statement, Suite,
-};
+use libcst_native::{Assert, AssignTargetExpression, Call, Expression, Name, Raise};
 
 use super::expr::render_expr;
 use super::{EffectSink, walk_own_body};
-use crate::functions::{FnBody, FnUnit};
+use crate::functions::FnUnit;
 use crate::imports::Imports;
+use crate::scope::{BindingOrigin, ScopeId, ScopeTree};
 use crate::source::{SpanIndex, anchor_of_subslice};
 
 /// Detect mutation effects in `unit`'s own body, with escape analysis.
@@ -59,31 +54,32 @@ use crate::source::{SpanIndex, anchor_of_subslice};
 /// constructor init); `false` means it escapes.
 ///
 /// Task 9 consumes the `contained` flags to apply boundary-containment discounts.
-pub fn detect(
+///
+/// `scope` is threaded through so `MutSink` can compute `unit_scope` — the
+/// unit's own `Function` scope in the file's `ScopeTree` (spec 078). Every
+/// classification arm (`classify_and_push`, `on_assign_target`, and now
+/// `on_call`'s #50 gate) resolves through `scope`/`unit_scope`; the flat
+/// `params`/`globals`/`nonlocals`/`locals`/`module_bindings` sets that used to
+/// back these checks are gone (Task 6, spec 078) — `on_call` was the last
+/// consumer.
+///
+/// `imports` and `module_bindings` are kept as parameters (not read here) so
+/// this function's public arity is unchanged — they are threaded through
+/// `gather`/`analyze_unit`/`build_record` and 4 `lib.rs` call sites; re-rippling
+/// that signature is out of scope for Task 6 (Task 9 may revisit).
+pub(crate) fn detect(
     unit: &FnUnit,
-    imports: &Imports,
-    module_bindings: &HashSet<String>,
+    _imports: &Imports,
+    _module_bindings: &HashSet<String>,
+    scope: &ScopeTree,
     span: &SpanIndex,
 ) -> Vec<(Effect, bool)> {
-    // ── Step 1: collect param names from the unit's signature ────────────────
-    let params = collect_param_names(unit.params);
-
-    // ── Step 2: pre-scan body for global/nonlocal declarations + local assigns ─
-    let mut globals: HashSet<String> = HashSet::new();
-    let mut nonlocals: HashSet<String> = HashSet::new();
-    let mut locals: HashSet<String> = HashSet::new();
-    prescan_body(&unit.body, &mut globals, &mut nonlocals, &mut locals);
-
-    // ── Step 3: classify writes via the EffectSink driver ────────────────────
     let is_init = unit.symbol == "__init__";
+    let unit_scope = scope.unit_scope_of(unit);
     let mut sink = MutSink {
-        params: &params,
-        globals: &globals,
-        nonlocals: &nonlocals,
-        locals: &locals,
-        imports,
-        module_bindings,
         is_init,
+        scope,
+        unit_scope,
         span,
         effects: Vec::new(),
     };
@@ -91,295 +87,22 @@ pub fn detect(
     sink.effects
 }
 
-// ─── parameter name extraction ────────────────────────────────────────────────
-
-/// Extract all parameter name strings from `params`.
-///
-/// Covers positional-only, regular, keyword-only, and `**kwargs` params;
-/// skips the `*` bare separator. The `self`/`cls` first-param convention is
-/// included — callers that want to exclude it do so by not treating `self` as
-/// a mutation target (it is handled specially in the write-site classifier).
-fn collect_param_names(params: &Parameters) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let all = params
-        .posonly_params
-        .iter()
-        .chain(&params.params)
-        .chain(&params.kwonly_params);
-    for p in all {
-        out.insert(p.name.value.to_owned());
-    }
-    if let Some(libcst_native::StarArg::Param(p)) = &params.star_arg {
-        out.insert(p.name.value.to_owned());
-    }
-    if let Some(p) = &params.star_kwarg {
-        out.insert(p.name.value.to_owned());
-    }
-    out
-}
-
-// ─── pre-scan: global/nonlocal declarations + local bindings ─────────────────
-
-/// Walk the body suite or lambda body expression to collect:
-/// - `globals`: names declared with `global`.
-/// - `nonlocals`: names declared with `nonlocal`.
-/// - `locals`: names introduced by assignment in the function body — including
-///   `Assign`/`AnnAssign` targets (incl. tuple/list/starred destructuring),
-///   `AugAssign` bare-`Name` targets, `for`/`async for` loop targets,
-///   `with … as`/`async with … as` names, and `except … as` / `except* … as`
-///   names.  (Python scoping: any binding-form in a body makes the name
-///   function-local for the whole function.)
-///
-/// Residual accepted limits (not collected here): `match` pattern captures,
-/// comprehension-scope targets (Python 3 gives them their own scope), and
-/// walrus (`:=`) operator targets.
-///
-/// Only scans the **own** body (does not descend into nested `def`/`lambda`).
-fn prescan_body(
-    body: &FnBody,
-    globals: &mut HashSet<String>,
-    nonlocals: &mut HashSet<String>,
-    locals: &mut HashSet<String>,
-) {
-    match body {
-        // Function/lambda body: nested def/class names ARE local bindings of this
-        // function, so `seed_defs = true` (refs #55).
-        FnBody::Suite(suite) => prescan_suite(suite, globals, nonlocals, locals, true),
-        FnBody::Expr(_) => {} // lambdas have no statements
-        // The `<module>` unit: prescan each top-level statement. Module-level
-        // names that appear in a `global` declaration inside a nested def are
-        // handled by that nested def's own prescan; at module scope itself,
-        // every bare name assignment IS a module-level binding (no `global` needed).
-        // `seed_defs = false`: a top-level def/class name is a MODULE binding
-        // (handled by `module_bindings` → global.mutation), not a local of the
-        // `<module>` unit — seeding it would wrongly downgrade module-scope
-        // `SomeClass.attr = …` from global to local (refs #55 regression guard).
-        FnBody::Module(stmts) => {
-            for stmt in *stmts {
-                prescan_stmt(stmt, globals, nonlocals, locals, false);
-            }
-        }
-    }
-}
-
-fn prescan_suite(
-    suite: &Suite,
-    globals: &mut HashSet<String>,
-    nonlocals: &mut HashSet<String>,
-    locals: &mut HashSet<String>,
-    seed_defs: bool,
-) {
-    match suite {
-        Suite::IndentedBlock(b) => {
-            for stmt in &b.body {
-                prescan_stmt(stmt, globals, nonlocals, locals, seed_defs);
-            }
-        }
-        Suite::SimpleStatementSuite(s) => {
-            for small in &s.body {
-                prescan_small(small, globals, nonlocals, locals);
-            }
-        }
-    }
-}
-
-fn prescan_stmt(
-    stmt: &Statement,
-    globals: &mut HashSet<String>,
-    nonlocals: &mut HashSet<String>,
-    locals: &mut HashSet<String>,
-    seed_defs: bool,
-) {
-    match stmt {
-        Statement::Simple(line) => {
-            for small in &line.body {
-                prescan_small(small, globals, nonlocals, locals);
-            }
-        }
-        Statement::Compound(c) => prescan_compound(c, globals, nonlocals, locals, seed_defs),
-    }
-}
-
-fn prescan_compound(
-    compound: &libcst_native::CompoundStatement,
-    globals: &mut HashSet<String>,
-    nonlocals: &mut HashSet<String>,
-    locals: &mut HashSet<String>,
-    seed_defs: bool,
-) {
-    use libcst_native::CompoundStatement;
-    match compound {
-        // Nested def/class: do NOT descend (own-body attribution), but in a FUNCTION
-        // body the def/class *name* is a local binding of the enclosing function —
-        // seed it so a later write to it (e.g. `helper.alters_data = True`) resolves
-        // as local, not a captured opaque binding (refs #55). `seed_defs` is false for
-        // the `<module>` unit, where such a name is a module binding (→ global), so it
-        // must NOT be seeded there.
-        CompoundStatement::FunctionDef(f) => {
-            if seed_defs {
-                locals.insert(f.name.value.to_owned());
-            }
-        }
-        CompoundStatement::ClassDef(c) => {
-            if seed_defs {
-                locals.insert(c.name.value.to_owned());
-            }
-        }
-        CompoundStatement::If(i) => {
-            prescan_suite(&i.body, globals, nonlocals, locals, seed_defs);
-            if let Some(orelse) = &i.orelse {
-                prescan_orelse(orelse, globals, nonlocals, locals, seed_defs);
-            }
-        }
-        CompoundStatement::For(f) => {
-            // `for <target> in …` — the target is a Python local for the whole function
-            // (PEP 3104), whether the loop is `for` or `async for` (same node, just an
-            // `asynchronous` flag). Collect target names before recursing into the body.
-            crate::imports::collect_target_names(&f.target, locals);
-            prescan_suite(&f.body, globals, nonlocals, locals, seed_defs);
-            if let Some(orelse) = &f.orelse {
-                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
-            }
-        }
-        CompoundStatement::While(w) => {
-            prescan_suite(&w.body, globals, nonlocals, locals, seed_defs);
-            if let Some(orelse) = &w.orelse {
-                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
-            }
-        }
-        CompoundStatement::Try(t) => {
-            prescan_suite(&t.body, globals, nonlocals, locals, seed_defs);
-            for h in &t.handlers {
-                // `except SomeError as e:` — `e` is a Python local for the whole
-                // function (unlike in Python 2, it is deleted after the block, but it
-                // IS in scope inside the handler and binds the name function-locally).
-                if let Some(asname) = &h.name {
-                    crate::imports::collect_target_names(&asname.name, locals);
-                }
-                prescan_suite(&h.body, globals, nonlocals, locals, seed_defs);
-            }
-            if let Some(orelse) = &t.orelse {
-                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
-            }
-            if let Some(fin) = &t.finalbody {
-                prescan_suite(&fin.body, globals, nonlocals, locals, seed_defs);
-            }
-        }
-        CompoundStatement::TryStar(t) => {
-            prescan_suite(&t.body, globals, nonlocals, locals, seed_defs);
-            for h in &t.handlers {
-                // `except* SomeError as e:` — same binding semantics as `except … as`.
-                if let Some(asname) = &h.name {
-                    crate::imports::collect_target_names(&asname.name, locals);
-                }
-                prescan_suite(&h.body, globals, nonlocals, locals, seed_defs);
-            }
-            if let Some(orelse) = &t.orelse {
-                prescan_suite(&orelse.body, globals, nonlocals, locals, seed_defs);
-            }
-            if let Some(fin) = &t.finalbody {
-                prescan_suite(&fin.body, globals, nonlocals, locals, seed_defs);
-            }
-        }
-        CompoundStatement::With(w) => {
-            // `with expr as <target>:` (and `async with`) — `target` is a Python local
-            // for the whole function. Both are the same `With` node with an
-            // `asynchronous` flag. Collect asname targets before recursing into the body.
-            for item in &w.items {
-                if let Some(asname) = &item.asname {
-                    crate::imports::collect_target_names(&asname.name, locals);
-                }
-            }
-            prescan_suite(&w.body, globals, nonlocals, locals, seed_defs);
-        }
-        CompoundStatement::Match(m) => {
-            for case in &m.cases {
-                prescan_suite(&case.body, globals, nonlocals, locals, seed_defs);
-            }
-        }
-    }
-}
-
-fn prescan_orelse(
-    orelse: &libcst_native::OrElse,
-    globals: &mut HashSet<String>,
-    nonlocals: &mut HashSet<String>,
-    locals: &mut HashSet<String>,
-    seed_defs: bool,
-) {
-    match orelse {
-        libcst_native::OrElse::Elif(elif) => {
-            prescan_suite(&elif.body, globals, nonlocals, locals, seed_defs);
-            if let Some(inner) = &elif.orelse {
-                prescan_orelse(inner, globals, nonlocals, locals, seed_defs);
-            }
-        }
-        libcst_native::OrElse::Else(e) => {
-            prescan_suite(&e.body, globals, nonlocals, locals, seed_defs);
-        }
-    }
-}
-
-fn prescan_small(
-    small: &SmallStatement,
-    globals: &mut HashSet<String>,
-    nonlocals: &mut HashSet<String>,
-    locals: &mut HashSet<String>,
-) {
-    match small {
-        SmallStatement::Global(g) => {
-            for item in &g.names {
-                globals.insert(item.name.value.to_owned());
-            }
-        }
-        SmallStatement::Nonlocal(n) => {
-            for item in &n.names {
-                nonlocals.insert(item.name.value.to_owned());
-            }
-        }
-        SmallStatement::Assign(a) => {
-            // Collect ALL bound names recursively through tuple/list/starred
-            // destructuring (not just bare `Name`). Python's scoping rule: any
-            // binding-assignment in a function body — including `(a, b) = …` and
-            // `[x, *rest] = …` — makes the bound names local to the whole function.
-            for target in &a.targets {
-                crate::imports::collect_target_names(&target.target, locals);
-            }
-        }
-        // AnnAssign `x: T = …` also introduces a local (recurse for safety,
-        // though `x: T` is always a bare Name in practice).
-        SmallStatement::AnnAssign(a) => {
-            crate::imports::collect_target_names(&a.target, locals);
-        }
-        // AugAssign `x += …` binds the name locally when the target is a bare Name.
-        // Only a Name target introduces a binding; `x.attr += 1` / `x[i] += 1` do not.
-        SmallStatement::AugAssign(a) => {
-            if let AssignTargetExpression::Name(n) = &a.target {
-                locals.insert(n.value.to_owned());
-            }
-        }
-        _ => {}
-    }
-}
-
 // ─── write-site classifier (EffectSink) ──────────────────────────────────────
 
 struct MutSink<'a> {
-    params: &'a HashSet<String>,
-    globals: &'a HashSet<String>,
-    nonlocals: &'a HashSet<String>,
-    /// Locally-assigned names (global/nonlocal names are removed from this set
-    /// in the classification logic).
-    locals: &'a HashSet<String>,
-    /// File-wide import table — lets the cascade resolve an import-rooted write (F5)
-    /// and distinguish a captured opaque binding (F1) from a known module.
-    imports: &'a Imports,
-    /// Module top-level binding names (assign targets + def/class). A write whose
-    /// root is one of these — and is not a local/param/global-decl/import — is
-    /// module-shared state, escalated to `global.mutation` (the #29 analog).
-    module_bindings: &'a HashSet<String>,
     /// True when analyzing `__init__` (so `self.attr = …` is local init).
     is_init: bool,
+    /// The file's scope tree (spec 078). Consulted by `classify_and_push`,
+    /// `on_assign_target`'s bare-name global/nonlocal gate, and (as of Task 6)
+    /// `on_call`'s #50 module-import suppression gate — all via
+    /// `scope.resolve(unit_scope, name)`. The flat `params`/`globals`/
+    /// `nonlocals`/`locals`/`imports`/`module_bindings` fields this replaced
+    /// are gone; `on_call` was the last consumer.
+    scope: &'a ScopeTree,
+    /// `unit.symbol`'s own `Function` scope in `scope`, computed once via
+    /// `scope.unit_scope_of(unit)`. Every `resolve()` call in this sink starts
+    /// here (there is no per-use-site cursor — see the guideline).
+    unit_scope: ScopeId,
     span: &'a SpanIndex<'a>,
     effects: Vec<(Effect, bool)>,
 }
@@ -396,25 +119,22 @@ impl EffectSink for MutSink<'_> {
         // #50: a mutating-method call whose receiver is a bare imported **module**
         // name (`os.remove()`) is a call on the module, not a mutation of it — the
         // effect belongs to the callee and is scored by the call detector. Suppress
-        // it, but only when the name genuinely resolves to the module here:
-        //   - it must NOT be shadowed by a closer binding (a param/local/global/
-        //     nonlocal named `os` wins per Python scoping — `classify_and_push`
-        //     checks those before the import arm, so the gate must respect the same
-        //     precedence or it drops a real mutation);
-        //   - it must be a plain `import` (a module), NOT a `from m import n` name
-        //     (which may bind a mutable object — `from cfg import CACHE;
-        //     CACHE.append(x)` stays a global.mutation).
+        // it, but only when the name genuinely resolves to the module here.
+        // `resolve` returns `ModuleImport` ONLY when the name is a plain `import`
+        // (not a `from m import n` name — those may bind a mutable object, e.g.
+        // `from cfg import CACHE; CACHE.append(x)` stays a global.mutation) AND it
+        // is not shadowed by a closer param/local/global/nonlocal binding (the
+        // function scope wins the walk before the module scope) — so this is
+        // exactly `!shadowed && is_module_import(name)`.
         // An *attribute* receiver reached through an import (`config.settings.append()`)
         // still mutates module-shared state and stays a global.mutation.
-        if let Expression::Name(recv) = attr.value.as_ref() {
-            let name = recv.value;
-            let shadowed = self.params.contains(name)
-                || self.locals.contains(name)
-                || self.globals.contains(name)
-                || self.nonlocals.contains(name);
-            if !shadowed && self.imports.is_module_import(name) {
-                return;
-            }
+        if let Expression::Name(recv) = attr.value.as_ref()
+            && matches!(
+                self.scope.resolve(self.unit_scope, recv.value).0,
+                BindingOrigin::ModuleImport
+            )
+        {
+            return;
         }
         // The receiver's root name is the write target.
         let Some(root) = root_name_of_expr(&attr.value) else {
@@ -483,7 +203,10 @@ impl EffectSink for MutSink<'_> {
             // Plain `=` to a bare name declared `global`/`nonlocal` is an escaping
             // rebind, not a local binding — emit. A true local binding emits nothing.
             AssignTargetExpression::Name(n)
-                if self.globals.contains(n.value) || self.nonlocals.contains(n.value) =>
+                if matches!(
+                    self.scope.resolve(self.unit_scope, n.value).0,
+                    BindingOrigin::Global | BindingOrigin::EnclosingCaptured
+                ) =>
             {
                 let name = n.value.to_owned();
                 let (line, col) = name_line_col(n, self.span);
@@ -526,100 +249,111 @@ impl MutSink<'_> {
             return;
         }
 
-        // Global declaration: `global x` → `GlobalMutation`. Include the write
-        // expression in evidence so the report is traceable to the actual write site.
-        if self.globals.contains(&root) {
-            self.push(
-                EffectKind::GlobalMutation,
-                Tier::Exact,
-                line,
-                col,
-                format!("global {root} ({evidence})"),
-                false,
-            );
-            return;
-        }
+        // Resolve the root name via the scope tree, starting at this unit's own
+        // scope. Each arm below reproduces one case of the flat cascade this
+        // replaces (F5 imports, F2-analog module_bindings, F1 captured-fallback —
+        // see the origin→effect table in the spec 078 Task 5 brief), byte-identical.
+        match self.scope.resolve(self.unit_scope, &root).0 {
+            // Global declaration: `global x` → `GlobalMutation`. Include the write
+            // expression in evidence so the report is traceable to the write site.
+            BindingOrigin::Global => {
+                self.push(
+                    EffectKind::GlobalMutation,
+                    Tier::Exact,
+                    line,
+                    col,
+                    format!("global {root} ({evidence})"),
+                    false,
+                );
+            }
 
-        // Nonlocal declaration: `nonlocal x` → `ThisMutation` (escaping outer scope).
-        // Include the write expression for the same traceability reason.
-        if self.nonlocals.contains(&root) {
-            self.push(
-                EffectKind::ThisMutation,
-                Tier::Exact,
-                line,
-                col,
-                format!("nonlocal {root} ({evidence})"),
-                false,
-            );
-            return;
-        }
+            // Nonlocal declaration: `nonlocal x` → `ThisMutation` (escaping outer
+            // scope). Include the write expression for the same reason.
+            BindingOrigin::EnclosingCaptured => {
+                self.push(
+                    EffectKind::ThisMutation,
+                    Tier::Exact,
+                    line,
+                    col,
+                    format!("nonlocal {root} ({evidence})"),
+                    false,
+                );
+            }
 
-        // Parameter mutation: root is a param name (but NOT `self`, handled above).
-        if self.params.contains(&root) {
-            self.push(
-                EffectKind::ParamMutation,
-                Tier::Heuristic,
-                line,
-                col,
-                evidence,
-                false,
-            );
-            return;
-        }
+            // Parameter mutation: root is a param name (but NOT `self`, handled above).
+            BindingOrigin::Param => {
+                self.push(
+                    EffectKind::ParamMutation,
+                    Tier::Heuristic,
+                    line,
+                    col,
+                    evidence,
+                    false,
+                );
+            }
 
-        // Local binding mutation: root is locally assigned (and not global/nonlocal).
-        if self.locals.contains(&root) {
-            self.push(
-                EffectKind::LocalMutation,
-                Tier::Exact,
-                line,
-                col,
-                evidence,
-                true,
-            );
-            return;
-        }
+            // Local binding mutation: root is locally assigned (and not global/nonlocal).
+            BindingOrigin::Local => {
+                self.push(
+                    EffectKind::LocalMutation,
+                    Tier::Exact,
+                    line,
+                    col,
+                    evidence,
+                    true,
+                );
+            }
 
-        // F5: root resolves through the ImportTable → module-level state (the imported
-        // module/name) escaping the function. global.mutation (class 6, Heuristic),
-        // contained=false. A same-named LOCAL already won above.
-        if self.imports.resolve(&root).is_some() {
-            self.push(
-                EffectKind::GlobalMutation,
-                Tier::Heuristic,
-                line,
-                col,
-                format!("{evidence} (imported `{root}`)"),
-                false,
-            );
-            return;
-        }
+            // F5: root resolves through the import table → module-level state (the
+            // imported module/name) escaping the function. global.mutation (class 6,
+            // Heuristic), contained=false. A same-named LOCAL/param/global/nonlocal
+            // already won above (resolve's nearest-binding precedence).
+            BindingOrigin::ModuleImport | BindingOrigin::FromImport => {
+                self.push(
+                    EffectKind::GlobalMutation,
+                    Tier::Heuristic,
+                    line,
+                    col,
+                    format!("{evidence} (imported `{root}`)"),
+                    false,
+                );
+            }
 
-        // F2 analog (Python #29): root is a MODULE top-level binding (a
-        // module-level name / def / class) whose contents are mutated
-        // (subscript/attr/method) — module-shared state used for cross-function /
-        // cross-module communication → global.mutation (class 6, Heuristic). A
-        // bare rebind without `global` is a LOCAL (Python semantics) and already
-        // won above; an explicit `global x` rebind already hit the globals arm.
-        // So this catches exactly the content-mutation-of-module-container case.
-        if self.module_bindings.contains(&root) {
-            self.push(
-                EffectKind::GlobalMutation,
-                Tier::Heuristic,
-                line,
-                col,
-                format!("{evidence} (module-level `{root}`)"),
-                false,
-            );
-            return;
-        }
+            // F2 analog (Python #29): root is a MODULE top-level binding (a
+            // module-level name / def / class) whose contents are mutated
+            // (subscript/attr/method) — module-shared state used for cross-function /
+            // cross-module communication → global.mutation (class 6, Heuristic). A
+            // bare rebind without `global` is a LOCAL (Python semantics) and already
+            // won above; an explicit `global x` rebind already hit the Global arm.
+            // So this catches exactly the content-mutation-of-module-container case.
+            BindingOrigin::ModuleBinding => {
+                self.push(
+                    EffectKind::GlobalMutation,
+                    Tier::Heuristic,
+                    line,
+                    col,
+                    format!("{evidence} (module-level `{root}`)"),
+                    false,
+                );
+            }
 
-        // F1: the root resolves to NONE of self/global/nonlocal/param/local/import/
-        // module-binding — a captured outer (enclosing-function) binding we cannot
-        // bound syntactically → hidden.mutation (class 3, hidden:true,
-        // contained:false), subreason "captured-binding". Mirrors the TS `captured`
-        // hidden case (Milestone A left it un-emitted).
-        self.push_hidden(line, col, evidence, "captured-binding");
+            // F1: the root resolves to NONE of self/global/nonlocal/param/local/import/
+            // module-binding — a captured outer (enclosing-function) binding we cannot
+            // bound syntactically → hidden.mutation (class 3, hidden:true,
+            // contained:false), subreason "captured-binding". Mirrors the TS `captured`
+            // hidden case (Milestone A left it un-emitted).
+            BindingOrigin::Unresolved => {
+                self.push_hidden(line, col, evidence, "captured-binding");
+            }
+
+            // Never constructed by the Python resolver (host-global ambient IO is
+            // a TS-only concern, see `scope.rs`'s `BindingOrigin::HostGlobalIo`
+            // doc) — panics loudly rather than silently folding into Unresolved,
+            // so a resolver change that starts emitting it here is caught fast.
+            BindingOrigin::HostGlobalIo => {
+                unreachable!("Python resolver never emits HostGlobalIo")
+            }
+        }
     }
 
     /// Push a `HiddenMutation` (`hidden:true` + a `subreason`), always escaping
@@ -752,12 +486,13 @@ mod tests {
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let mut out: HashMap<String, Vec<(EffectKind, bool)>> = HashMap::new();
         for unit in &units {
-            let pairs = detect(unit, &imports, &module_bindings, &span);
+            let pairs = detect(unit, &imports, &module_bindings, &scope, &span);
             out.insert(
                 unit.symbol.clone(),
                 pairs.iter().map(|(e, c)| (e.kind, *c)).collect(),
@@ -772,12 +507,13 @@ mod tests {
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let mut out: HashMap<String, Vec<(EffectKind, bool, String)>> = HashMap::new();
         for unit in &units {
-            let pairs = detect(unit, &imports, &module_bindings, &span);
+            let pairs = detect(unit, &imports, &module_bindings, &scope, &span);
             out.insert(
                 unit.symbol.clone(),
                 pairs
@@ -895,22 +631,17 @@ mod tests {
     /// the channel Python has never used. `push` stays the honest hidden:false path.
     #[test]
     fn push_hidden_emits_hidden_mutation_with_subreason() {
-        let params = std::collections::HashSet::new();
-        let globals = std::collections::HashSet::new();
-        let nonlocals = std::collections::HashSet::new();
-        let locals = std::collections::HashSet::new();
         let src = "x\n";
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
+        let module_bindings = HashSet::new();
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
+        let unit_scope = scope.module_scope();
         let span = crate::source::SpanIndex::new(src);
         let mut sink = MutSink {
-            params: &params,
-            globals: &globals,
-            nonlocals: &nonlocals,
-            locals: &locals,
-            imports: &imports,
-            module_bindings: &HashSet::new(),
             is_init: false,
+            scope: &scope,
+            unit_scope,
             span: &span,
             effects: Vec::new(),
         };
@@ -932,16 +663,35 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
         let span = crate::source::SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, src, &span, &anchors);
         let f = units.iter().find(|u| u.symbol == "f").unwrap();
-        let pairs = detect(f, &imports, &module_bindings, &span);
+        let pairs = detect(f, &imports, &module_bindings, &scope, &span);
         assert!(
             pairs.iter().any(|(e, _)| e.kind == ParamMutation),
             "lst.append where lst is a param → ParamMutation, got: {:?}",
             pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
         );
+    }
+
+    /// Task 4 (#78): `detect` accepts a `&ScopeTree` and still finds the same
+    /// param-mutation effect — the compile-level proof that threading the scope
+    /// tree through is pure wiring (no behavior change).
+    #[test]
+    fn detect_accepts_scope_tree() {
+        let src = "def f(lst):\n    lst.append(1)\n";
+        let module = libcst_native::parse_module(src, None).unwrap();
+        let imports = crate::imports::Imports::build(&module);
+        let mb = crate::imports::module_bindings(&module);
+        let tree = crate::scope::ScopeTree::build(&module, &imports, &mb);
+        let span = crate::source::SpanIndex::new(src);
+        let anchors = crate::source::lambda_anchors(src).unwrap();
+        let (units, _) = crate::functions::collect(&module, src, &span, &anchors);
+        let f = units.iter().find(|u| u.symbol == "f").unwrap();
+        let pairs = detect(f, &imports, &mb, &tree, &span);
+        assert!(pairs.iter().any(|(e, _)| e.kind == ParamMutation));
     }
 
     /// F5: a write whose root resolves through the ImportTable is module-level state
@@ -1003,13 +753,15 @@ mod tests {
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
         let span = crate::source::SpanIndex::new(&src);
         let unit =
             crate::functions::module_init_unit(&module).expect("module has executable top-level");
-        let effs: Vec<(EffectKind, bool)> = detect(&unit, &imports, &module_bindings, &span)
-            .iter()
-            .map(|(e, c)| (e.kind, *c))
-            .collect();
+        let effs: Vec<(EffectKind, bool)> =
+            detect(&unit, &imports, &module_bindings, &scope, &span)
+                .iter()
+                .map(|(e, c)| (e.kind, *c))
+                .collect();
         assert!(
             effs.contains(&(GlobalMutation, false)),
             "module-level `def.attr = …` must be GlobalMutation(false), got: {effs:?}"
@@ -1030,11 +782,12 @@ mod tests {
         let module = libcst_native::parse_module(&src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
         let span = crate::source::SpanIndex::new(&src);
         let anchors = crate::source::lambda_anchors(&src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, &src, &span, &anchors);
         let inner = units.iter().find(|u| u.symbol == "inner").unwrap();
-        let pairs = detect(inner, &imports, &module_bindings, &span);
+        let pairs = detect(inner, &imports, &module_bindings, &scope, &span);
         let hidden = pairs
             .iter()
             .find(|(e, _)| e.kind == HiddenMutation)
@@ -1074,6 +827,7 @@ mod tests {
         let module = libcst_native::parse_module(src, None).unwrap();
         let imports = crate::imports::Imports::build(&module);
         let module_bindings = crate::imports::module_bindings(&module);
+        let scope = crate::scope::ScopeTree::build(&module, &imports, &module_bindings);
         let span = crate::source::SpanIndex::new(src);
         let anchors = crate::source::lambda_anchors(src).expect("tokenize must succeed");
         let (units, _) = functions::collect(&module, src, &span, &anchors);
@@ -1081,7 +835,7 @@ mod tests {
             .iter()
             .find(|u| u.symbol == fn_name)
             .expect("unit not found");
-        detect(unit, &imports, &module_bindings, &span)
+        detect(unit, &imports, &module_bindings, &scope, &span)
     }
 
     #[test]
@@ -1186,29 +940,27 @@ mod tests {
         );
     }
 
-    /// Characterization test — ACCEPTED LIMITATION, not desired behavior (#78).
-    ///
-    /// `Imports` is a single file-wide, flat table (a documented over-approximation:
-    /// an import in one function resolves same-named calls in another). So a
-    /// function-local `import x as NAME` in one function marks `NAME` a module for
-    /// the WHOLE file, and the #50 suppression then drops another function's
-    /// `NAME.<mut>()` — turning the flat table's pre-existing mis-resolution from a
-    /// *mis-classified* mutation into a *dropped* one. The precise fix is
-    /// scope-aware import resolution (deferred, #78 / spec 025 §13a); when it lands,
-    /// this test should flip to assert `GlobalMutation`. Pinned here so the
-    /// behavior change is deliberate, not silent. The trigger is contrived (the
-    /// same short name bound as a module alias in one function and a `from`-imported
-    /// mutable at module scope).
+    /// #78: g's function-local `import os as CACHE` no longer suppresses f's
+    /// CACHE mutation. Scope-aware import resolution (this task) closes the
+    /// cross-function collision the flat/file-wide `Imports` table used to
+    /// cause: module scope now holds only TOP-LEVEL imports, and a
+    /// function-body import binds only that function's own scope — so `g`'s
+    /// local `import os as CACHE` never reaches module scope, and `f`'s
+    /// `CACHE` resolves through module scope to the top-level
+    /// `from cfg import CACHE` (`FromImport`, not `on_call`-suppressed) —
+    /// `GlobalMutation`. Was pinned as an accepted limitation before this fix
+    /// (see git history); this is an intentional, deliberate signal recovery.
     #[test]
-    fn cross_function_flat_import_collision_drops_signal_accepted_limitation() {
+    fn cross_function_import_does_not_leak_across_functions() {
         let src = "from cfg import CACHE\n\
                    def f():\n    CACHE.append(1)\n\
                    def g():\n    import os as CACHE\n";
         let pairs = detect_src(src, "f");
         assert!(
-            !pairs.iter().any(|(e, _)| e.kind == GlobalMutation),
-            "accepted limitation (#78): `g`'s local `import os as CACHE` pollutes the \
-             file-wide table so `f`'s CACHE.append() is currently dropped; got: {:?}",
+            pairs
+                .iter()
+                .any(|(e, c)| e.kind == EffectKind::GlobalMutation && !*c),
+            "f's CACHE (module-level from-import) must be GlobalMutation, got {:?}",
             pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
         );
     }
@@ -1228,6 +980,31 @@ mod tests {
         assert!(
             !pairs.iter().any(|(e, _)| e.kind == GlobalMutation),
             "shadowing local must not escalate to GlobalMutation"
+        );
+    }
+
+    /// #78 final-review MUST-FIX: a function-local import reassigned to a local
+    /// in the SAME function must resolve as `Local`, not `ModuleImport`. The
+    /// flat cascade checks `locals` BEFORE `imports` (F5), so `build_funcdef`'s
+    /// insertion order must make locals win — imports are the lowest-precedence
+    /// function-scope binding (inserted before locals/params/nonlocals/globals).
+    #[test]
+    fn function_local_import_reassigned_is_local_not_global() {
+        // Flat cascade checks locals before imports (F5); a name both imported AND
+        // locally reassigned in the same function is a Local, not a module import.
+        let src = "def f():\n    import os\n    os = {}\n    os['k'] = 1\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            pairs
+                .iter()
+                .any(|(e, c)| e.kind == EffectKind::LocalMutation && *c),
+            "os['k']=1 must be LocalMutation/contained, got {:?}",
+            pairs.iter().map(|(e, c)| (e.kind, *c)).collect::<Vec<_>>()
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|(e, _)| e.kind == EffectKind::GlobalMutation)
         );
     }
 
@@ -1283,6 +1060,133 @@ mod tests {
         assert!(
             !pairs.iter().any(|(e, _)| e.kind == GlobalMutation),
             "destructured local must not escalate to GlobalMutation"
+        );
+    }
+
+    /// Characterization pin (spec 078 Task 5): the resolver-based path must
+    /// agree with today's flat-set cascade for one representative write per
+    /// `BindingOrigin`. Passes on the pre-reroute flat code (characterizing
+    /// existing behavior) and must keep passing after `classify_and_push`/
+    /// `on_assign_target` are rerouted onto `ScopeTree::resolve`.
+    #[test]
+    fn classify_origins_match_flat_behavior() {
+        // one representative write per origin; assert exact (kind, contained)
+        let cases: &[(&str, &str, EffectKind, bool)] = &[
+            (
+                "import os\ndef f():\n    global g\n    g = 1\n",
+                "f",
+                EffectKind::GlobalMutation,
+                false,
+            ), // Global (rebind under `global`, via on_assign_target)
+            (
+                "def outer():\n    n = []\n    def f():\n        nonlocal n\n        n.append(1)\n",
+                "f",
+                EffectKind::ThisMutation,
+                false,
+            ), // EnclosingCaptured (nonlocal)
+            (
+                "def f(p):\n    p.append(1)\n",
+                "f",
+                EffectKind::ParamMutation,
+                false,
+            ), // Param
+            (
+                "def f():\n    x = []\n    x.append(1)\n",
+                "f",
+                EffectKind::LocalMutation,
+                true,
+            ), // Local
+            (
+                "import config\ndef f():\n    config.settings.append(1)\n",
+                "f",
+                EffectKind::GlobalMutation,
+                false,
+            ), // ModuleImport (attribute receiver, not on_call-suppressed)
+            (
+                "from cfg import CACHE\ndef f():\n    CACHE.append(1)\n",
+                "f",
+                EffectKind::GlobalMutation,
+                false,
+            ), // FromImport
+            (
+                "STORE = {}\ndef f():\n    STORE['k'] = 1\n",
+                "f",
+                EffectKind::GlobalMutation,
+                false,
+            ), // ModuleBinding
+            (
+                "def f():\n    captured.append(1)\n",
+                "f",
+                EffectKind::HiddenMutation,
+                false,
+            ), // Unresolved -> captured-binding
+        ];
+        for (src, sym, kind, contained) in cases {
+            let pairs = detect_src(src, sym);
+            assert!(
+                pairs
+                    .iter()
+                    .any(|(e, c)| e.kind == *kind && *c == *contained),
+                "src {src:?}: expected {kind:?} contained={contained}, got {:?}",
+                pairs.iter().map(|(e, c)| (e.kind, *c)).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// #55/Task 8: a `match`-case capture (`case [name, *args]:`) binds `args`
+    /// as a function-local — mutating it must be LocalMutation(contained), not
+    /// a captured-binding hidden.mutation (the function-scope builder's
+    /// prescan previously never walked `MatchPattern`s at all).
+    #[test]
+    fn match_capture_is_local_not_captured() {
+        let src = "def f(cmd):\n    match cmd:\n        case [name, *args]:\n            args.append(1)\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            pairs
+                .iter()
+                .any(|(e, c)| e.kind == EffectKind::LocalMutation && *c)
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|(e, _)| e.kind == EffectKind::HiddenMutation)
+        );
+    }
+
+    /// #55/Task 8: a walrus `:=` target binds a function-local wherever it
+    /// appears (here, inside an `if` test) — mutating it must be
+    /// LocalMutation(contained), not captured-binding.
+    #[test]
+    fn walrus_target_is_local_not_captured() {
+        let src = "def f(xs):\n    if (buf := list(xs)):\n        buf.append(1)\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            pairs
+                .iter()
+                .any(|(e, c)| e.kind == EffectKind::LocalMutation && *c)
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|(e, _)| e.kind == EffectKind::HiddenMutation)
+        );
+    }
+
+    /// #55/Task 8: a comprehension `for` target binds a function-local (this
+    /// task collects it into the FUNCTION scope, not a comprehension-own scope
+    /// — a deliberate simplification, see `scope.rs`'s `prescan_comp_for` doc
+    /// comment) — mutating it inside the comprehension must not fall to
+    /// captured-binding.
+    #[test]
+    fn comprehension_target_mutation_is_local_not_captured() {
+        let src = "def f(rows):\n    return [r.sort() or r for r in rows]\n";
+        let pairs = detect_src(src, "f");
+        assert!(
+            !pairs
+                .iter()
+                .any(|(e, _)| e.kind == EffectKind::HiddenMutation),
+            "comprehension target `r` must resolve locally, got {:?}",
+            pairs.iter().map(|(e, _)| e.kind).collect::<Vec<_>>()
         );
     }
 }

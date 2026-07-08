@@ -1,0 +1,41 @@
+---
+source: crates/fxrank-lang-python/tests/snapshots.rs
+expression: snapshot
+---
+{
+  "hotspots": [
+    {
+      "async_boundary": false,
+      "await_count": 0,
+      "confidence": 1.0,
+      "effects": [
+        {
+          "class": 1,
+          "discounted_to": null,
+          "hidden": false,
+          "kind": "local.mutation",
+          "tier": "exact"
+        },
+        {
+          "class": 1,
+          "discounted_to": null,
+          "hidden": false,
+          "kind": "local.mutation",
+          "tier": "exact"
+        },
+        {
+          "class": 1,
+          "discounted_to": null,
+          "hidden": false,
+          "kind": "local.mutation",
+          "tier": "exact"
+        }
+      ],
+      "max_class": 1,
+      "own_score": 2.0,
+      "risk_features": [],
+      "risk_weight": 0,
+      "symbol": "h"
+    }
+  ]
+}
