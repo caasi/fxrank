@@ -1,4 +1,4 @@
-//! Frontend-internal scope-aware binding resolution (spec 078).
+//! Frontend-internal scope-aware binding resolution (plan 030).
 //! See docs/scope-aware-binding-resolution-guideline.md. NOTHING here crosses
 //! the UnitRecord boundary; fxrank-core knows none of these types.
 
@@ -84,7 +84,7 @@ pub(crate) enum ScopeKind {
 
 pub(crate) type ScopeId = usize;
 
-/// The file's scope tree — `module → function/method` (spec 078; comprehensions
+/// The file's scope tree — `module → function/method` (plan 030; comprehensions
 /// are not their own scope yet, see #55/Task 8). The module BINDING scope is
 /// always id `0`; every `def`/`async def`/`lambda` gets its own `Function`
 /// scope, parented to its lexical enclosing scope (a class body is not a scope —

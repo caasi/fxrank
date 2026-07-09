@@ -339,7 +339,7 @@ fn collect_small(
 /// `Name("os")` → `"os"`, `Attribute(Name("a"), Name("b"))` → `"a.b"`.
 ///
 /// `pub(crate)`: also used by `scope.rs`'s top-level/function-body import
-/// collectors (spec 078, #78), so both places parse the same import forms
+/// collectors (plan 030, #78), so both places parse the same import forms
 /// identically instead of duplicating this logic.
 pub(crate) fn noa_to_string(noa: &NameOrAttribute) -> String {
     match noa {

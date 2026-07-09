@@ -85,7 +85,7 @@ impl Frontend for PythonFrontend {
                     let imports = imports::Imports::build(&module);
                     let module_bindings = crate::imports::module_bindings(&module);
                     // Build the file's scope tree once, over this SAME `module` —
-                    // `ScopeTree::unit_scope_of`'s body-pointer match (spec 078)
+                    // `ScopeTree::unit_scope_of`'s body-pointer match (plan 030)
                     // requires it to be built from the identical `&Module` that
                     // `functions::collect` walks below, so the pointers coincide.
                     let scope = scope::ScopeTree::build(&module, &imports, &module_bindings);

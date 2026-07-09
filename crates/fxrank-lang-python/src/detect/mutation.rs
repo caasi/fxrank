@@ -22,7 +22,7 @@
 //! ## Strategy
 //!
 //! 1. **Resolve** each write-site's root name against the file's `ScopeTree`
-//!    (spec 078) — `global`/`nonlocal` declarations, params, locals, imports,
+//!    (plan 030) — `global`/`nonlocal` declarations, params, locals, imports,
 //!    and module-level bindings are all encoded in the tree's binding walk, so
 //!    a single `scope.resolve(unit_scope, name)` replaces the old pre-scan +
 //!    flat-set membership checks (Task 6 removed the last flat-set consumer).
@@ -56,11 +56,11 @@ use crate::source::{SpanIndex, anchor_of_subslice};
 /// Task 9 consumes the `contained` flags to apply boundary-containment discounts.
 ///
 /// `scope` is threaded through so `MutSink` can compute `unit_scope` — the
-/// unit's own `Function` scope in the file's `ScopeTree` (spec 078). Every
+/// unit's own `Function` scope in the file's `ScopeTree` (plan 030). Every
 /// classification arm (`classify_and_push`, `on_assign_target`, and now
 /// `on_call`'s #50 gate) resolves through `scope`/`unit_scope`; the flat
 /// `params`/`globals`/`nonlocals`/`locals`/`module_bindings` sets that used to
-/// back these checks are gone (Task 6, spec 078) — `on_call` was the last
+/// back these checks are gone (Task 6, plan 030) — `on_call` was the last
 /// consumer.
 ///
 /// `imports` and `module_bindings` are kept as parameters (not read here) so
@@ -92,7 +92,7 @@ pub(crate) fn detect(
 struct MutSink<'a> {
     /// True when analyzing `__init__` (so `self.attr = …` is local init).
     is_init: bool,
-    /// The file's scope tree (spec 078). Consulted by `classify_and_push`,
+    /// The file's scope tree (plan 030). Consulted by `classify_and_push`,
     /// `on_assign_target`'s bare-name global/nonlocal gate, and (as of Task 6)
     /// `on_call`'s #50 module-import suppression gate — all via
     /// `scope.resolve(unit_scope, name)`. The flat `params`/`globals`/
@@ -252,7 +252,7 @@ impl MutSink<'_> {
         // Resolve the root name via the scope tree, starting at this unit's own
         // scope. Each arm below reproduces one case of the flat cascade this
         // replaces (F5 imports, F2-analog module_bindings, F1 captured-fallback —
-        // see the origin→effect table in the spec 078 Task 5 brief), byte-identical.
+        // see the origin→effect table in the plan 030 Task 5 brief), byte-identical.
         match self.scope.resolve(self.unit_scope, &root).0 {
             // Global declaration: `global x` → `GlobalMutation`. Include the write
             // expression in evidence so the report is traceable to the write site.
@@ -1063,7 +1063,7 @@ mod tests {
         );
     }
 
-    /// Characterization pin (spec 078 Task 5): the resolver-based path must
+    /// Characterization pin (plan 030 Task 5): the resolver-based path must
     /// agree with today's flat-set cascade for one representative write per
     /// `BindingOrigin`. Passes on the pre-reroute flat code (characterizing
     /// existing behavior) and must keep passing after `classify_and_push`/

@@ -1,4 +1,4 @@
-//! Load-bearing invariant for spec 078: binding/scope resolution is entirely
+//! Load-bearing invariant for plan 030: binding/scope resolution is entirely
 //! frontend-internal (`crate::scope`) and must never cross the `UnitRecord`
 //! boundary into `fxrank-core`. This is a mechanical guard, not red-first
 //! TDD — it is expected to pass immediately, since the invariant held
