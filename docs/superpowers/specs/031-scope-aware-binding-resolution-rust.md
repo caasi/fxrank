@@ -270,14 +270,16 @@ separate namespace and are ignored by the resolver; they never change a score.
 | `if let` / `while let` pattern | `if let Some(mut x) = o { … }` | then-branch / loop body | `Local` |
 | `let`-chain operand pattern | `if let Some(a)=x && let Some(b)=y {…}` | later operands + chain body (R7) | `Local` |
 | `match` arm pattern (incl. `mut`, `ref`/`ref mut`, `@`, struct/tuple/slice, or-patterns, `*rest`-like slice tails) | `Ok(mut x)`, `P { x, .. }`, `[a, rest @ ..]`, `n @ 1..=9` | that arm (guard + body) | `Local` (or-pattern names bind once per arm) |
-| closure param | `\|mut acc: Vec<_>\| acc.push(1)` | the closure's **own unit** scope | `Param` of the closure unit (channel by type — §1.1 makes a Rust closure its own unit, so its params are that unit's `Param`, matching TS) |
-| nested `fn` param / nested `impl` method param | `fn outer() { fn helper(v: &mut Vec<i32>) {…} }` | the nested item's **own unit** scope | `Param` of the nested unit (channel by type; a `&mut` param → `param.mutation` with the mut-channel discount — §4.3, decision resolving the earlier Q2) |
+| closure param, reference-typed (`&mut`/`&`) | `\|buf: &mut Vec<_>\| buf.push(1)` | the closure's **own unit** scope | `Param` of the closure unit (channel by type — §1.1 makes a Rust closure its own unit; **only a reference-typed param is `Param`**) |
+| closure param, by-value | `\|mut acc: Vec<_>\| acc.push(1)` | the closure's **own unit** scope | `Local` of the closure unit (a by-value param is a `Local` — the guideline's Rust note; `mut` is honored via the interim `seed_pat_locals` path, so a by-value `mut` closure param is a `mut` `Local` → `local.mutation`, AC-C2) |
+| nested `fn` / nested `impl` method param, reference-typed (`&mut`/`&`) | `fn outer() { fn helper(v: &mut Vec<i32>) {…} }` | the nested item's **own unit** scope | `Param` of the nested unit (channel by type; a `&mut` param → `param.mutation` with the mut-channel discount — §4.3, decision resolving the earlier Q2) |
+| nested `fn` / nested `impl` method param, by-value | `fn outer() { fn helper(mut x: Vec<i32>) {…} }` | the nested item's **own unit** scope | `Local` of the nested unit (a by-value param is a `Local` — the guideline's Rust note; **origin `Param` is reserved for reference-typed params**) |
 | capture of enclosing `let`/param (closure body) | `let mut v=…; \|\| v.push(1)` | resolves outward across the unit boundary | `EnclosingCaptured` (nested `fn`s cannot capture — R5) |
 | block-level `static` | `fn f() { static HITS: AtomicUsize = …; }` | its block, hoisted (R4) | `ModuleBinding` — Rust's global-write channel regardless of nesting depth |
 | block-level `const` | `fn f() { const N: usize = 3; }` | its block, hoisted | non-writable `Local` (a `const` cannot be written; the binding exists so the *name* shadows correctly during resolution) |
 | block-level `use` | `fn f() { use std::mem::swap; }` | its block, hoisted | `FromImport` (today: invisible — the `use`-table is top-level-only — so such a base falls to the captured-binding FP; correctness gain landed under a labelled delta with named fixtures — §5.4) |
 | top-level `static` | file item | file scope | `ModuleBinding` |
-| top-level `const` | `const K: usize = 3;` | file scope | non-writable file-scope binding (name-only; mirrors the block-level `const` row — a `const` is never a write target, so it yields no write effect; seeded so the name shadows and never falls to `captured-binding`) |
+| top-level `const` | `const K: usize = 3;` | file scope | non-writable file-scope binding (name-only; mirrors the block-level `const` row — a `const` is never a write target, so it yields no write effect; seeded so the name shadows and never falls to `captured-binding`). **A write-shaped use of a top-level `const` name today falls to `captured-binding`, so seeding it is a behavior change — landed under a labelled delta (AC-D3e), not compat.** |
 | top-level `use` name | `use std::fs;` / `use m::CACHE as C;` | file scope | `FromImport` |
 | nothing in scope | — | — | `Unresolved` — the honest fallback |
 
@@ -302,9 +304,9 @@ discount-cancel — all byte-identical):
 |---|---|---|
 | `Param`, channel `&mut` | `param.mutation`, `Discount::MutParam` | `mut_params` arm. Now also covers a `&mut`-typed **nested-`fn`/closure** param, attributed to that nested **unit's own** record (where the `&mut` is genuinely visible in its signature — decision resolving Q2). The discount is a **partial** containment discount, not full erasure: a `&mut` declaration means the callee *may* mutate but the channel is declared-and-bounded at the call site. |
 | (`self` + `&mut self`) | `param.mutation`, `Discount::MutSelf` | pre-resolve, unchanged |
-| `Local`, `mut` | `local.mutation`, Exact, contained | `let_mut` arm |
-| `Local`, non-`mut` | **no effect** | today's fall-through silence (`locals` membership suppresses every later arm) |
-| `Param`, by-value | **no effect** | same silence today (`seed` ignores `is_mut` for params) — see Open Question Q1 |
+| `Local`, `mut` | `local.mutation`, Exact, contained | `let_mut` arm. Also a by-value `mut` **closure / nested-unit** param (its own unit's `Local`, `mut` honored via the interim `seed_pat_locals` path) — this is why AC-C2's `\|mut x\| x.push(1)` stays `local.mutation`. |
+| `Local`, non-`mut` | **no effect** | today's fall-through silence (`locals` membership suppresses every later arm). Also a by-value non-`mut` closure / nested-unit param. |
+| `Param`, by-value (**signature** param only) | **no effect** | same silence today (`seed` inserts a by-value signature param into `locals` only, discarding `mut`) — see Open Question Q1. Only **signature** params reach this row: origin `Param` is reserved for reference-typed (`&mut`/`&`) params, so a by-value **closure / nested-unit** param is a `Local` (above), never a `Param`. |
 | `ModuleBinding` | `global.mutation`, Heuristic, `write to global {base}` | `statics` arm |
 | `FromImport` | `global.mutation`, Heuristic, `write to imported {base}` | `use`-table arm (008-F5; near-vacuous in Rust, kept for symmetry) |
 | `EnclosingCaptured` | `hidden.mutation`, subreason `captured-binding` | Rust has no `nonlocal`, so every capture is the guideline's **implicit** arm. A closure that mutates a captured enclosing `let` resolves here. **Attribution note:** relative to *today*, the reclassification of a captured-local mutation from the enclosing unit's `local.mutation` to the closure unit's `hidden.mutation` is produced by the **sibling** collection change (§1.1), which re-homes the closure into its own unit; 031's resolver only *names* the origin. Whether the 025 fold should re-contain such a write at the enclosing owner is a propagation question for the sibling — flagged for review (§7). |
@@ -376,13 +378,30 @@ now constructed (it left this list — §6.2).
   Today's flat model seeds its sets *during* the body walk (`visit_local`, etc.)
   and classifies by a fixed arm order. The compat resolver must therefore (a)
   **seed at walk-time**, not eagerly, so any position-sensitive membership is
-  reproduced, and (b) reproduce today's **exact arm precedence** — `mut_params`
-  → `&mut self` / `&self`-shared → `let_mut` → `statics` (if not a local) →
-  `imports` (if not a local) → captured-binding fallback — and today's **dual
-  set-membership**: a `&mut T` param name lives in **both** `locals` and
-  `mut_params`; a `let mut x` lives in **both** `locals` and `let_mut`. The
-  resolver's origin+metadata must encode both memberships so the cascade lands on
-  the same arm. Cross-reference Python **plan 030**'s explicit insertion-order
+  reproduced, and (b) reproduce today's **exact arm precedence** across the
+  **two separate entry points** (mirroring how §4.3 already splits them):
+    - the **`record_write` cascade** (assignments, compound-assign, and a
+      mutating-method receiver): `mut_params` → `&mut self` → `let_mut` →
+      `statics` (if not a local) → `imports` (if not a local) → captured-binding
+      fallback;
+    - the **interior-mutator method-call path** (`mutation.rs` ~406–446, a
+      distinct entry point — *not* a `record_write` arm): `&self`/`&T`-shared
+      (`shared_refs`) checked **first** → `statics` → otherwise silent. The
+      shared-`&` inversion is checked before that path's **own** `statics` arm,
+      which is why the anti-Goodhart `&self` interior-mut case stays `hidden`.
+  Reproduce today's **dual set-membership**: a `&mut T` param name lives in
+  **both** `locals` and `mut_params`; a `let mut x` lives in **both** `locals`
+  and `let_mut`; a `&T` shared param (and `&self`) lives in **both** `locals`
+  and `shared_refs`. The resolver's origin+metadata must encode every membership
+  so the cascade lands on the same arm. **Interior-path shadow-blindness
+  (compat-critical):** the interior-mutator path tests `shared_refs`/`statics`
+  membership with **no `!locals` guard**, so a shadowing rebind does *not*
+  suppress it today — `fn f(r: &S) { let r = other(); r.borrow_mut(); }` still
+  emits `interior-mut`, and a same-named `static` + local still emits the
+  interior write-to-global. Compat reproduces this **shadow-blind** behavior
+  **byte-for-byte**; the shadow-aware correction (a closer shadowing local
+  suppressing the shared-ref / static interior write) lands only as a named
+  **Delta-1 / Delta-2** shape, never in the compat port. Cross-reference Python **plan 030**'s explicit insertion-order
   note (its `build_funcdef` inserts imports→locals→params→nonlocals→globals,
   low-to-high precedence, last-write-wins). This replaces the earlier
   "byte-identical **by construction**" phrasing with **"asserted byte-identical
@@ -397,8 +416,13 @@ now constructed (it left this list — §6.2).
 - **`ImportTable` seeding — lazy fallback (default) vs. enumeration.**
   `ImportTable` today exposes only `resolve(name)` / `has_glob()` (a point
   lookup); it cannot **enumerate** its local names. Seeding every `FromImport`
-  binding eagerly into the file scope would need a new enumeration accessor
-  (Python's `iter_local_names` is the precedent). The **default recommendation is
+  binding eagerly into the file scope would need either a new enumeration
+  accessor on `ImportTable`, or the route Python's `scope.rs` actually takes for
+  the eager case: **ignore the `Imports` table and re-collect the top-level
+  imports directly from the `syn` AST** (Python's `ScopeTree::build` takes an
+  `Imports` parameter but leaves it unused — `_imports` — and collects the
+  module's top-level imports straight from the parsed module instead; there is
+  no `iter_local_names` accessor). The **default recommendation is
   the lazy fallback**: seed no imports up front, and at the point a name **misses**
   every other scope, consult `imports.resolve(name).is_some()` before falling to
   `Unresolved` — simpler, adds no API, and preserves `statics`-before-`imports`
@@ -454,7 +478,9 @@ compat baseline is the **post-sibling** corpus.
   `local.mutation`, never `hidden.mutation`) stays green at **every** commit of
   this work. The four non-closure forms hold verbatim (Locals of the enclosing
   unit). The **closure form** (`let c = |mut x: Vec<i32>| x.push(1)`) is
-  re-homed by the sibling: `x` is now the closure unit's by-value `mut` `Param`.
+  re-homed by the sibling: `x` is now the closure unit's by-value `mut` `Local`
+  (a by-value param is a `Local`, §4.2/§4.3 — origin `Param` is reserved for
+  reference-typed params).
   The invariant 031 preserves is the FP-removal essence — the closure form still
   **never** falls to `captured-binding` `hidden.mutation`; its `local.mutation`
   classification is inherited byte-for-byte from the sibling's collection
@@ -569,34 +595,44 @@ Nested `fn`s / nested-`impl` methods (now their own units — §1.1) get their o
 scope; block-level items resolve as items; block-level `use`/`const` land here
 under this labelled delta with named fixtures.
 
-- **AC-D3a.** Nested-`fn` params stop falling to the captured-binding FP and
-  classify as `param.mutation` on the nested fn's **own** unit:
+- **AC-D3a (post-sibling baseline regression PIN, not a 031 snapshot delta).**
+  Nested-`fn` params classify as `param.mutation` on the nested fn's **own** unit:
 
   ```rust
   fn outer() {
       fn helper(v: &mut Vec<i32>) { v.push(1); } // → param.mutation (Discount::MutParam),
                                                  //   on helper's OWN unit
-                                                 //   (today: hidden.mutation "captured-binding" FP)
+                                                 //   (pre-sibling: hidden.mutation "captured-binding" FP)
   }
   ```
 
   The `&mut` **type** supplies the channel; the binding `v` carries no `mut`
   keyword, so `is_mut`/channel derive from `&mut Vec<i32>` (§4.2). A lifetime on
-  the type does not change the score.
+  the type does not change the score. **This already holds in the post-sibling
+  flat baseline** — once the sibling makes `helper` its own unit, `detect()` runs
+  per-unit and `seed()` sees the `&mut` param directly → `mut_params` →
+  `param.mutation`; 031 changes nothing here. It is pinned as a compat-gate
+  regression guard, not a diff 031 owns.
 
-- **AC-D3b.** The no-capture rule (R5): a name inside a nested `fn` never
-  resolves to the enclosing function's locals — it sees the enclosing *static*
-  (an item, R4) instead.
+- **AC-D3b (post-sibling baseline regression PIN, not a 031 snapshot delta).**
+  The no-capture rule (R5): a name inside a nested `fn` never resolves to the
+  enclosing function's locals — it sees the enclosing *static* (an item, R4)
+  instead.
 
   ```rust
   static REGISTRY: Registry = Registry::new();
   fn outer() {
       let mut REGISTRY = Registry::new();
       fn helper() { REGISTRY.insert(1); }  // → global.mutation: the nested fn sees the STATIC
-                                           //   (today: outer's leaked let_mut → local.mutation)
+                                           //   (pre-sibling: outer's leaked let_mut → local.mutation)
       REGISTRY.insert(2);                  // → local.mutation: outer's own shadowing local
   }
   ```
+
+  Like AC-D3a, **this already holds in the post-sibling flat baseline**: `helper`
+  is its own unit, so `detect()` on it never sees `outer`'s `REGISTRY` local and
+  resolves the static (`global.mutation`), while `outer`'s own shadow local stays
+  `local.mutation`. Pinned as a compat-gate regression guard, not a 031 diff.
 
 - **AC-D3c.** Block-level `static` items are the global channel at any depth:
 
@@ -618,10 +654,10 @@ under this labelled delta with named fixtures.
   }
   ```
 
-- **AC-D3d — closure capture resolves to `EnclosingCaptured` (reversal of the
-  earlier draft).** A closure body's use of an enclosing `mut` local now resolves
-  **across the unit boundary** to `EnclosingCaptured` (Rust now constructs it —
-  §4.3), not to a `Local` of a shared parent unit:
+- **AC-D3d — closure capture resolves to `EnclosingCaptured` (regression PIN,
+  produces NO snapshot diff).** A closure body's use of an enclosing `mut` local
+  resolves **across the unit boundary** to `EnclosingCaptured` (Rust now
+  constructs it — §4.3), not to a `Local` of a shared parent unit:
 
   ```rust
   fn f() {
@@ -632,35 +668,60 @@ under this labelled delta with named fixtures.
   ```
 
   Per the §4.3 map this yields `hidden.mutation "captured-binding"` at the
-  closure's own unit. The *today → post-sibling* change (closure re-homed into
-  its own unit) is owned by the sibling (§1.1); 031 asserts only that the
-  resolver returns `EnclosingCaptured` for the captured base. Whether the 025
-  fold should re-contain the write at `f` (the owner of `v`) is a sibling
-  propagation question — flagged (§7).
+  closure's own unit. **This produces no snapshot diff:** the post-sibling flat
+  baseline already emits `hidden.mutation "captured-binding"` for the unseeded
+  captured base `v` (it misses every flat set → `Unresolved` fallback); 031 only
+  renames the **internal** origin `Unresolved` → `EnclosingCaptured`, which the
+  §4.3 map sends to the *same* effect and evidence. The *today → post-sibling*
+  change (closure re-homed into its own unit) is owned by the sibling (§1.1); 031
+  asserts only that the resolver returns `EnclosingCaptured` for the captured
+  base. Whether the 025 fold should re-contain the write at `f` (the owner of
+  `v`) is a sibling propagation question — flagged (§7).
 
-- **AC-D3e — block-level `use`/`const` (decision 5).** Named fixtures:
+- **AC-D3e — block-level `use`/`const` + top-level `const` (decision 5, F5).**
+  Named fixtures:
   - `fn f() { use std::mem::swap; swap(&mut a, &mut b); … }` — a block-level
     `use` name resolves as `FromImport` instead of falling to the captured-binding
     FP;
   - `fn f() { const N: usize = 3; … }` — a block-level `const` is a non-writable
-    binding that shadows correctly and yields no write effect.
-  Because block-level `use`/`const` widen the resolvable-name surface, the
+    binding that shadows correctly and yields no write effect;
+  - `const K: usize = 3; fn f() { … }` — a **top-level** `const` is likewise a
+    non-writable file-scope binding; a write-shaped use of its name yields no
+    effect instead of falling to the captured-binding FP (a `hidden.mutation`
+    removed — a genuine 031-owned snapshot diff, which is why top-level `const`
+    seeding is folded here rather than into the compat port; §4.2 row).
+  Because block-level `use`/`const` (and top-level `const`) widen the
+  resolvable-name surface, the
   **new-FP-surface risk** (a bare name newly resolving where it used to fall
   through) is checked against the dogfood scan under §5.5.
 
-Snapshot diffs accepted: captured-binding FPs turning into `param.mutation` /
-`local.mutation` / `global.mutation`, recovered block-static globals, and the
-`EnclosingCaptured` reclassification of AC-D3d — each eyeballed.
+Snapshot diffs accepted under this delta: **only the genuinely 031-owned diffs**
+— **AC-D3c** (recovered block-level `static` globals), **AC-D3c2** (item
+hoisting: a block-level static used before its declaration), and **AC-D3e**
+(block-level `use` → `FromImport`, block-level `const` → non-writable, and
+top-level `const` seeding — F5) — each eyeballed. **AC-D3a / AC-D3b / AC-D3d are
+post-sibling baseline regression pins, not 031 snapshot deltas** — they already
+hold in the post-sibling flat corpus (see each), so they contribute no diff here;
+AC-D3d in particular produces **no** diff at all (031 only renames the internal
+origin `Unresolved` → `EnclosingCaptured`, mapping to the same effect).
 
 ### 5.5 Post-delta honesty check
 
 After all three deltas, remaining `captured-binding` emissions in the Rust
-fixtures/corpus must be genuinely out-of-lexical-reach names (macro-derived,
-glob-import-obscured, or truly undeclared) — spot-check the dogfood scan (this
-repo), and, in the same pass, review the **new-FP-surface** opened by block-level
-`use`/`const` and by `EnclosingCaptured` (a name that newly resolves where it
-used to fall through). Record the residual shapes in the PR description, the way
-`008-dogfood-deltas.md` did.
+fixtures/corpus must be **either** genuinely out-of-reach names (macro-derived,
+glob-import-obscured, or truly undeclared) **or** resolved captures
+(`EnclosingCaptured`) — the latter are *in* lexical reach yet share the
+`captured-binding` subreason, because §4.3 maps both `Unresolved` and
+`EnclosingCaptured` to `hidden.mutation "captured-binding"`. So the honesty
+criterion is not "all remaining emissions are out-of-reach"; a resolved capture
+is a legitimate residual. Spot-check the dogfood scan (this repo), and, in the
+same pass, review the **new-FP-surface** opened by block-level `use`/`const` and
+by `EnclosingCaptured` (a name that newly resolves where it used to fall
+through). Record the residual shapes in the PR description, the way
+`008-dogfood-deltas.md` did. **Note:** differentiating the two residual buckets
+by evidence / subreason (so the dogfood pass can separate a true out-of-reach
+miss from a resolved capture) is a **future labelled delta**, not part of this
+compat-preserving work — 031 keeps them sharing the subreason.
 
 ## 6. Design constraints
 
@@ -737,9 +798,11 @@ property the guideline states for Python.)
 ## 7. Open questions (left for review, deliberately)
 
 **Resolved since the last draft (recorded, no longer open):** the earlier Q2
-(nested-`fn` param origin) is decided — a nested-`fn`/closure param is a `Param`
-of that nested **unit's own** record, a `&mut` one classifying as `param.mutation`
-with the mut-channel discount (§4.2/§4.3), following §1.1. The earlier Q3
+(nested-`fn` param origin) is decided — a **reference-typed** (`&mut`/`&`)
+nested-`fn`/closure param is a `Param` of that nested **unit's own** record, a
+`&mut` one classifying as `param.mutation` with the mut-channel discount; a
+**by-value** nested-`fn`/closure param is a `Local` (origin `Param` is reserved
+for reference-typed params — §4.2/§4.3), following §1.1. The earlier Q3
 (`let`-chains) is decided and promoted to requirement **R7**.
 
 - **Q1 — by-value `mut` param writes.** Today `fn f(mut v: Vec<i32>) {
