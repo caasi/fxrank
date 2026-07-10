@@ -29,7 +29,16 @@ Tasks 1–5 landed). Scan scope actually parsed:
 
 (agent-browser/cli and ripgrep are read-only external corpora — not modified.)
 
-## False-positive definition (final — escape-based; folds in F6 "local OR parameter")
+**Coverage caveat (undercount).** The closure counts above (333 / 1975 / 274) are **lower
+bounds**. A closure written *inside a macro invocation's token stream* — `vec![Box::new(|x| …)]`,
+or a closure passed to a custom macro — is invisible to `syn::visit` (the token stream is
+unparsed), so it is neither collected as its own unit nor attributed to any parent, and its
+effects go **uncounted** by every detector. This is a known `syn` limitation (now stated in the
+`functions.rs` module doc), analogous to the TS/Python frontends' macro/template blind spots; it
+is **not chased** in #83 (a real fix needs per-macro arg-position parsing). The FP figures below
+therefore also exclude any macro-hidden closure — the true closure population is somewhat larger,
+but the *escape-based FP rate* it would add is bounded by the same morally-local ceiling ripgrep
+already exhibits.
 
 An emitted `<closure@…>` (or binding-named) unit's `captured-binding` emission counts as a
 **false positive** iff **both** hold:
@@ -127,9 +136,13 @@ naive "captured-write ⇒ FP" rule would have mislabeled it.
 **Ship Q5(a).** No corpus, and no reading of the total, comes anywhere near the **FP > 50**
 reopen trigger:
 
-- **Per unique closure site: 16 FP ≤ 20** ⇒ clean-ship threshold met. The gate's comparator —
-  the **#55 ~76-site** "unacceptable" baseline — is site-based, so this is the faithful reading:
-  16 vs 76 is a ~79% reduction, a categorically cleaner surface.
+- **Per unique closure site: 16 FP ≤ 20** ⇒ clean-ship threshold met — the operative criterion.
+  *Comparator caveat (not apples-to-apples):* the **#55 ~76-site** "unacceptable" figure was the
+  **pre-#78-fix** total across **all** previously-unseeded binding forms (`for`/`if let`/`while
+  let`/`match`-arm **and** closure params), most of which were fixed and closed *before* this
+  dogfood ran; today's **16 is a narrower, closure-only, post-#78** population. So the two are
+  not the same population — the `≤ 20` gate, not a headline percentage against 76, is what the
+  verdict rests on. (16 is comfortably under 20 on its own terms.)
 - **Per emission: 25 FP** — sits in the 21–50 advisory band (above the ≤ 20 clean-ship line,
   far below the > 50 reopen line). Every emission beyond the 16 sites is a **repeat captured
   write inside an already-counted non-escaping visitor closure** (e.g. `config.rs:90` = one
@@ -212,7 +225,13 @@ shadowing**, one layer up: `#78` scope-qualifies *bindings* (name → binding, p
 `scope.rs`); (c) would scope-qualify *call targets* (call → callee-unit) in language-neutral
 core **`resolve.rs`**. Once nested `fn`s / closures are their own units, a nested `fn helper`
 and a module-level `helper` share a simple name, so a bare `helper()` ambiguous-drops in the
-flat `SymbolIndex`. (c) is a **possible future cross-language enhancement**, **gated by
+flat `SymbolIndex`. The same non-lexical root has a **second, sharper symptom**: when a nested
+name is **corpus-unique**, a bare `helper()` in an *unrelated* fn — one that cannot lexically see
+the other fn's local `helper` — **false-resolves** to the nested unit (a spurious edge, *new*
+vs pre-#83 where the call was simply unresolved). Both the collision-drop and the corpus-unique
+false-resolve are what (c) would fix by resolving calls lexically; the false-resolve is also
+exactly what makes Task-5's binding-named `let f = |…|; f()` edge resolve at all (the fallback is
+not lexical, so it cuts both ways). (c) is a **possible future cross-language enhancement**, **gated by
 diagnostic 4** (bare-name edge-loss magnitude) as its trigger evidence — and that magnitude is
 **LOW** here, so:
 
