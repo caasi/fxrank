@@ -55,7 +55,7 @@ false, .. }`, not a crash. It returns a `FrontendOutput`:
 
 | field | what you fill it with |
 |---|---|
-| `functions: Vec<Hotspot>` | one scored hotspot per function unit (skip test units unless `include_tests`) |
+| `functions: Vec<Hotspot>` | one scored hotspot per function unit — every named/anonymous fn, **including nested fns & closures** (skip test units unless `include_tests`) |
 | `records: Vec<UnitRecord>` | one neutral record per same unit — the cross-file fold's input |
 | `module_risks: Vec<RiskFeature>` | module-level risks (e.g. `impl Drop`, `extern`) |
 | `diagnostics: Vec<Diagnostic>` | one per file that failed to parse |
@@ -107,6 +107,7 @@ strings — add kinds to `EffectKind`/`RiskKind` in core (each has `wire()` + a 
 | **Corpus profile** | Your `CORPUS_PROFILE` four channels (`prune_dirs`, `exclude_file_globs`, `test_file_globs`, `prune_marker_files`); whether test-skip is name-based, source-based (AST), or both | **`corpus-profile-guideline.md`** |
 | **Imports & bindings** | `ImportTable` (local name → module string, dynamic flag) and the module-level binding set. *(Target: the scope-aware resolver — name use → `BindingOrigin` + binding id, feeding the mutation model)* | cross-file guideline *The floor*; **`scope-aware-binding-resolution-guideline.md`** (target, spec 078) |
 | **Cross-file refs** | Per `CallSiteRef`: set `qualified` (is this a qualified outward reference?) and `first_party` (in-codebase but maybe out-of-scope?). Core filters on these bools — no language syntax in core | **`cross-file-resolution-guideline.md`** (*What becomes a reach*, first/third-party classifier) |
+| **Function-unit granularity** | Every function — named or anonymous, **including nested `fn`s, methods, closures/lambdas/arrows** — is its own unit (one `Hotspot` + one `UnitRecord`). A unit's own-body walk **must not descend into a nested unit's body**: nested effects are never rolled into the parent (no double-counting); the enclosing caller inherits them only through the cross-file fold. Python (`def`/nested `def`/`lambda`) and TS (fns/arrows) do this — folding a nested body into its parent is a bug. *(TS's React two-pass deliberately absorbs recognized hook-callbacks into the owning component — a domain override, not the base rule.)* | this guide + cross-file guideline *Propagation* |
 | **Module-init units** | If your language runs code at import time (top-level statements, decorators, default args, class bodies), synthesize one `<module>` unit per module. Rust rarely needs this (const-eval at compile time) | cross-file guideline *Module-init units* |
 | **Roots** | Nothing — frontends always emit `is_root: false`; the CLI sets roots from explicit FILE args | cross-file guideline *Roots* |
 
