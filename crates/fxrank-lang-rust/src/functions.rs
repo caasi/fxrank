@@ -410,22 +410,54 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
         self.in_test = saved_test;
     }
 
+    // Const-expr containers (`const`/`static` items and impl/trait assoc consts).
+    // Their initializer is an *expression* body, so anything named inside it — a
+    // closure OR a block-local `fn`/`impl` method — is NOT importable and must be
+    // treated as nested. The base `Collector` threads `in_test`/`in_unit_body`
+    // through mods/fns/impls/traits but not these, so inherit BOTH here:
+    //  - `in_test`: a `#[cfg(test)] const F: fn() = || …;` scores test-only.
+    //  - `in_unit_body`: a `const X: () = { fn helper() {} };` gets `is_nested`
+    //    (empty canonical path) — else `helper` false-resolves via an importable
+    //    `crate::helper` (Fable T2; closures are already covered by the F8 guard,
+    //    but a named `fn` in the initializer relied on `in_unit_body`).
     fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
-        // A `#[cfg(test)] const F: fn() = || …;` makes its initializer closure
-        // test-only — the base `Collector` threads `in_test` through mods/fns/
-        // impls/traits but not const/static items, so inherit it here too.
         let saved_test = self.in_test;
+        let saved_in_unit = self.in_unit_body;
         self.in_test = self.in_test || is_cfg_test(&node.attrs);
+        self.in_unit_body = true;
         visit::visit_item_const(self, node);
         self.in_test = saved_test;
+        self.in_unit_body = saved_in_unit;
     }
 
     fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
-        // Same as `visit_item_const` for `#[cfg(test)] static F: fn() = || …;`.
         let saved_test = self.in_test;
+        let saved_in_unit = self.in_unit_body;
         self.in_test = self.in_test || is_cfg_test(&node.attrs);
+        self.in_unit_body = true;
         visit::visit_item_static(self, node);
         self.in_test = saved_test;
+        self.in_unit_body = saved_in_unit;
+    }
+
+    fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+        let saved_test = self.in_test;
+        let saved_in_unit = self.in_unit_body;
+        self.in_test = self.in_test || is_cfg_test(&node.attrs);
+        self.in_unit_body = true;
+        visit::visit_impl_item_const(self, node);
+        self.in_test = saved_test;
+        self.in_unit_body = saved_in_unit;
+    }
+
+    fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
+        let saved_test = self.in_test;
+        let saved_in_unit = self.in_unit_body;
+        self.in_test = self.in_test || is_cfg_test(&node.attrs);
+        self.in_unit_body = true;
+        visit::visit_trait_item_const(self, node);
+        self.in_test = saved_test;
+        self.in_unit_body = saved_in_unit;
     }
 
     fn visit_local(&mut self, node: &'ast syn::Local) {
@@ -688,6 +720,32 @@ mod tests {
             assert!(
                 units.iter().find(|u| u.symbol == name).unwrap().is_test,
                 "`{name}` in a #[cfg(test)] mod must be test (module-level ∘ unit-level)"
+            );
+        }
+    }
+
+    #[test]
+    fn named_fn_in_const_expr_container_is_nested() {
+        // Regression (Fable T2): a named fn inside a const/static/assoc-const
+        // initializer is block-local and NOT importable, so it must get
+        // `is_nested = true` (empty canonical path), like a fn-body-nested fn.
+        // Before the fix these const-expr containers did not thread `in_unit_body`,
+        // so `helper` got an importable `crate::helper` path and false-resolved.
+        for src in [
+            "const X: () = { fn helper() {} };",
+            "static Y: () = { fn helper() {} };",
+            "struct S; impl S { const C: () = { fn helper() {} }; }",
+            "trait T { const C: () = { fn helper() {} }; }",
+        ] {
+            let file = syn::parse_file(src).unwrap();
+            let units = collect(&file, "a.rs");
+            let helper = units
+                .iter()
+                .find(|u| u.symbol == "helper")
+                .unwrap_or_else(|| panic!("helper not collected for: {src}"));
+            assert!(
+                helper.is_nested,
+                "a fn inside a const-expr container must be nested (non-importable): {src}"
             );
         }
     }
