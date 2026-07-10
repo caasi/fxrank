@@ -173,6 +173,15 @@ pub(crate) fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
 /// unit (the syn analog of the swc `Collector` in `fxrank-lang-ts`). Inline
 /// modules (`mod m { … }`) are threaded into `mod_path`; out-of-line modules
 /// (just `mod foo;`) carry no body and are skipped.
+///
+/// **Known limitation (`syn`):** a closure written inside a *macro invocation's
+/// token stream* — `vec![Box::new(|x| …)]`, or a closure argument to a custom
+/// macro — is **not** reached: `syn::visit` does not parse unexpanded macro
+/// tokens, so such a closure is neither collected as its own unit nor attributed
+/// to any parent, and its effects go uncounted. Shared with the TS/Python
+/// macro/template blind spots; not chased in #83 (a fix needs per-macro
+/// arg-position parsing). See `docs/032-nested-unit-dogfood.md` (the closure
+/// population it measures is a lower bound for this reason).
 pub fn collect(file: &syn::File, path: &str) -> Vec<FnUnit> {
     let mut collector = Collector {
         path,
@@ -262,6 +271,10 @@ fn name_line_col(span: proc_macro2::Span) -> (usize, usize) {
 fn let_binding_name(pat: &syn::Pat) -> Option<String> {
     match pat {
         syn::Pat::Ident(pi) => Some(pi.ident.to_string()),
+        // A type-annotated let (`let g: fn(i32)->i32 = |x| x;`) parses as
+        // `Pat::Type { pat: Box<Pat::Ident>, ty }`; peel the wrapper so the
+        // closure still adopts the binding name (mirrors collect_pat_bindings).
+        syn::Pat::Type(pt) => let_binding_name(&pt.pat),
         _ => None,
     }
 }
@@ -394,6 +407,24 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
         self.mod_path.push(node.ident.to_string());
         visit::visit_item_mod(self, node);
         self.mod_path.pop();
+        self.in_test = saved_test;
+    }
+
+    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+        // A `#[cfg(test)] const F: fn() = || …;` makes its initializer closure
+        // test-only — the base `Collector` threads `in_test` through mods/fns/
+        // impls/traits but not const/static items, so inherit it here too.
+        let saved_test = self.in_test;
+        self.in_test = self.in_test || is_cfg_test(&node.attrs);
+        visit::visit_item_const(self, node);
+        self.in_test = saved_test;
+    }
+
+    fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+        // Same as `visit_item_const` for `#[cfg(test)] static F: fn() = || …;`.
+        let saved_test = self.in_test;
+        self.in_test = self.in_test || is_cfg_test(&node.attrs);
+        visit::visit_item_static(self, node);
         self.in_test = saved_test;
     }
 
@@ -575,6 +606,41 @@ mod tests {
             anon[0], anon[1],
             "same-line closures must differ by col; got {anon:?}"
         );
+    }
+
+    #[test]
+    fn typed_let_closure_adopts_binding_name() {
+        // A type-annotated let binds as `Pat::Type` wrapping `Pat::Ident`; the
+        // closure must still adopt `g`, not fall back to a positional symbol.
+        let src = "fn f() { let g: fn(i32) -> i32 = |x| x + 1; }";
+        let file = syn::parse_file(src).unwrap();
+        let units = collect(&file, "a.rs");
+        let syms: Vec<&str> = units.iter().map(|u| u.symbol.as_str()).collect();
+        assert!(
+            syms.contains(&"g"),
+            "typed let-bound closure adopts `g`; got {syms:?}"
+        );
+        assert!(
+            !syms.iter().any(|s| s.starts_with("<closure@L")),
+            "no positional fallback for a typed let binding; got {syms:?}"
+        );
+    }
+
+    #[test]
+    fn cfg_test_static_closure_is_test() {
+        // A closure initializer inside a `#[cfg(test)] static` item must inherit
+        // the item's cfg(test)-ness (base Collector doesn't thread const/static).
+        let src = "#[cfg(test)]\nstatic F: fn() = || { let _ = 1; };";
+        let file = syn::parse_file(src).unwrap();
+        let units = collect(&file, "a.rs");
+        assert!(!units.is_empty(), "closure initializer must be collected");
+        for u in &units {
+            assert!(
+                u.is_test,
+                "`{}` inside a #[cfg(test)] static must be is_test",
+                u.symbol
+            );
+        }
     }
 
     #[test]
