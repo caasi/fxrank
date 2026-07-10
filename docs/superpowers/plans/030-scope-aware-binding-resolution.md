@@ -71,7 +71,7 @@ mod tests {
 - [ ] **Step 3: Minimal implementation** (top of `src/scope.rs`)
 
 ```rust
-//! Frontend-internal scope-aware binding resolution (spec 078).
+//! Frontend-internal scope-aware binding resolution (plan 030).
 //! See docs/scope-aware-binding-resolution-guideline.md. NOTHING here crosses
 //! the UnitRecord boundary; fxrank-core knows none of these types.
 

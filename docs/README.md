@@ -23,7 +23,7 @@ docs + the code**, without reading any spec. Start here:
    - **[`mutation-classification-guideline.md`](mutation-classification-guideline.md)** — how a write site becomes a mutation effect.
    - **[`corpus-profile-guideline.md`](corpus-profile-guideline.md)** — which files are scanned vs skipped (your `CORPUS_PROFILE`).
    - **[`cross-file-resolution-guideline.md`](cross-file-resolution-guideline.md)** — imports → definitions, the call graph, propagation, and the first-party/third-party boundary.
-   - **[`scope-aware-binding-resolution-guideline.md`](scope-aware-binding-resolution-guideline.md)** — a name use → the binding it denotes, within a unit (feeds the mutation model). *Spec 078; **implemented for the Python frontend**, still a target for TS/Rust.*
+   - **[`scope-aware-binding-resolution-guideline.md`](scope-aware-binding-resolution-guideline.md)** — a name use → the binding it denotes, within a unit (feeds the mutation model). ***Implemented for the Python frontend** (plan 030); still a target for TS/Rust.*
 3. Normative source for scores (no spec needed): `crates/fxrank-core/src/score.rs`
    (weights, discounts, `own_score`, `rank_key`) and the `EffectKind`/`RiskKind`
    vocabularies in `crates/fxrank-core/src/effect.rs`.
@@ -44,7 +44,7 @@ breakdown (a table in the mutation/corpus guidelines; a richer structure in the 
 one), **Honest per-language differences (intentional)**, and **Per-frontend realization**
 (headings vary slightly) — so a new language is, in each, one new column/bullet plus one
 realization bullet. (The scope-aware-binding-resolution model is **implemented for the Python
-frontend** (spec 078) and remains a **target** for TS/Rust — it follows the same shape so
+frontend** (plan 030) and remains a **target** for TS/Rust — it follows the same shape so
 each frontend slots in as it is built.)
 
 ## SDD artifacts (`docs/superpowers/`)

@@ -10,14 +10,14 @@ entirely in the frontend, so its results never reach the core (§*The load-beari
 invariant*).
 
 This is a **descriptive reference** for the shared cross-language model. It began as a
-**target model** (the design spec 078 builds); the **Python frontend now conforms** —
-078 landed for Python (`crates/fxrank-lang-python/src/scope.rs`, with the mutation detector
+**target model** (the design plan 030 builds); the **Python frontend now conforms** —
+plan 030 landed for Python (`crates/fxrank-lang-python/src/scope.rs`, with the mutation detector
 ported onto `ScopeTree::resolve`) — while **TS and Rust remain targets**. The **floor for
 the not-yet-migrated frontends** is the flat per-unit binding *sets* (`locals`/`params`/
 `globals`/… and the file-wide `Imports` table) documented in
 `mutation-classification-guideline.md` *(Shared model)*, plus the interim Rust binding-form
 seeding on branch `feat/078-scope-resolution`. It is not a contract; nothing is required to
-conform, and where this disagrees with the code, the code wins — but during 078 this file
+conform, and where this disagrees with the code, the code wins — but during plan 030 this file
 and the code are written together.
 
 Related shared-model docs: `mutation-classification-guideline.md` (this doc feeds it —
@@ -52,11 +52,11 @@ two things consumed **before the `UnitRecord` leaves the frontend**:
 2. a correctly-scoped `CallSiteRef` — a call whose base resolves to a param/local is a
    bare local ref, **not** a qualified outward import ref (feeds the cross-file resolver).
 
-*(Staging note — Python 078: the first Python step delivers consumer 1 only. Consumer 2
+*(Staging note — Python plan 030: the first Python step delivers consumer 1 only. Consumer 2
 (scoped `CallSiteRef`) is a **named non-goal** of that step — `calls.rs` keeps consuming the
 file-wide `Imports` table, so the cross-function import collision still exists on the
 call-resolution side until a follow-up moves `calls.rs` onto the resolver. Deferring it
-keeps 078's Python step to two labelled deltas rather than adding a call-graph delta axis;
+keeps plan 030's Python step to two labelled deltas rather than adding a call-graph delta axis;
 the resolver it builds is the prerequisite. This is recorded so the half is deferred, not
 silently unfinished.)*
 
@@ -183,9 +183,9 @@ model each resolver builds over its own AST is not**, and must not be.
   (→ `Global`/`EnclosingCaptured`, not `Local`); comprehension and generator expressions
   get **their own scope** (Python 3), so a comprehension target does not leak to the
   enclosing function; `import` vs `from`-import is the `ModuleImport`/`FromImport` split.
-  These are Python semantics — no other frontend has them. *(078 status: `match`-arm
+  These are Python semantics — no other frontend has them. *(plan 030 status: `match`-arm
   captures, walrus `:=`, and comprehension targets — **uncollected residuals** in the flat
-  code — are collected in 078's Python step. **Deliberate divergence, code wins:** comp
+  code — are collected in plan 030's Python step. **Deliberate divergence, code wins:** comp
   targets are collected into the **function scope** as `Local`, not a comprehension-own
   scope. For the mutation of a comp target *inside* its own comprehension (the common,
   motivating case) this is `local.mutation` either way — effect-identical. The **cost** of
