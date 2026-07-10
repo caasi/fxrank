@@ -521,9 +521,14 @@ mod tests {
             .collect()
     }
 
-    /// #78/#55: writes to `for` / `if let` / `while let` / `match`-arm / closure
-    /// bindings must classify as `local.mutation`, not the captured-binding
+    /// #78/#55: writes to `for` / `if let` / `while let` / `match`-arm bindings
+    /// must classify as `local.mutation`, not the captured-binding
     /// `hidden.mutation` FP (previously only `let` seeded locals — ~76× in dogfood).
+    ///
+    /// The closure form (`let c = |mut x| x.push(1)`) is now its OWN unit and is
+    /// asserted separately in `closure_binding_seeds_locals_on_own_unit` — the
+    /// closure's by-value `mut` param routes through `is_closure → let_mut` on the
+    /// closure unit's own seed.
     #[test]
     fn binding_forms_seed_locals_not_captured() {
         let cases = [
@@ -531,7 +536,6 @@ mod tests {
             "fn f(o: Option<Vec<i32>>) { if let Some(mut x) = o { x.push(1); } }",
             "fn f(o: Option<Vec<i32>>) { while let Some(mut x) = o { x.push(1); } }",
             "fn f(r: Result<Vec<i32>, ()>) { match r { Ok(mut x) => x.push(1), _ => {} } }",
-            "fn f() { let c = |mut x: Vec<i32>| x.push(1); let _ = c; }",
         ];
         for src in cases {
             let kinds = mut_kinds(src);
@@ -544,5 +548,36 @@ mod tests {
                 "the mutation should be local.mutation; src={src:?} got {kinds:?}"
             );
         }
+    }
+
+    /// A closure with a by-value `mut` param (`let c = |mut x: Vec<i32>| x.push(1)`)
+    /// is its own unit (Task 2). Its `FnSig.is_closure` routes the `mut` param
+    /// into `let_mut`, so the write classifies as `local.mutation` on the closure
+    /// unit — NOT the captured-binding `hidden.mutation` FP. Assert on the closure
+    /// unit directly (the enclosing `f` transiently double-counts until Task 4).
+    #[test]
+    fn closure_binding_seeds_locals_on_own_unit() {
+        let src = "fn f() { let c = |mut x: Vec<i32>| x.push(1); let _ = c; }";
+        let file = syn::parse_file(src).unwrap();
+        let imports = ImportTable::from_file(&file);
+        let statics = HashSet::new();
+        let units = crate::functions::collect(&file, "t.rs");
+        let closure = units
+            .iter()
+            .find(|u| u.sig.is_closure)
+            .expect("closure must be collected as its own unit");
+        assert_eq!(closure.symbol, "c", "let-bound closure adopts `c`");
+        let kinds: Vec<EffectKind> = detect(&closure.body, &closure.sig, &statics, &imports)
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(
+            !kinds.contains(&EffectKind::HiddenMutation),
+            "closure by-value mut must not be captured hidden.mutation; got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&EffectKind::LocalMutation),
+            "the closure mutation should be local.mutation; got {kinds:?}"
+        );
     }
 }

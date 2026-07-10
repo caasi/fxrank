@@ -15,7 +15,7 @@
 //! `Frontend` impl maps `FnUnit` to `Hotspot` for scoring.
 
 use syn::spanned::Spanned;
-use syn::{ImplItem, Item, ItemImpl, ItemTrait, TraitItem};
+use syn::visit::{self, Visit};
 
 /// A normalized, owned function signature.
 ///
@@ -160,149 +160,250 @@ pub(crate) fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
 
 /// Collect all function units from a parsed file at `path`.
 ///
-/// Module items (`Item::Mod`) are walked recursively when they have an inline
-/// body; out-of-line modules (just `mod foo;`) cannot be resolved here and are
-/// skipped — the caller is expected to feed each file separately.
+/// Uses a [`Collector`] (`syn::visit::Visit`) that descends into fn/method
+/// bodies and every `ExprClosure`, emitting one [`FnUnit`] each — so a nested
+/// `fn`, a nested-`impl`/`trait` method, and a closure each become their own
+/// unit (the syn analog of the swc `Collector` in `fxrank-lang-ts`). Inline
+/// modules (`mod m { … }`) are threaded into `mod_path`; out-of-line modules
+/// (just `mod foo;`) carry no body and are skipped.
 pub fn collect(file: &syn::File, path: &str) -> Vec<FnUnit> {
-    let mut units = Vec::new();
-    collect_items(&file.items, path, false, &[], &mut units);
-    units
+    let mut collector = Collector {
+        path,
+        units: Vec::new(),
+        mod_path: Vec::new(),
+        in_test: false,
+        type_ctx: None,
+        pending_name: None,
+    };
+    collector.visit_file(file);
+    collector.units
 }
 
-fn collect_items(
-    items: &[Item],
-    path: &str,
-    in_cfg_test: bool,
-    mod_path: &[String],
-    out: &mut Vec<FnUnit>,
-) {
-    for item in items {
-        match item {
-            Item::Fn(f) => {
-                let symbol = f.sig.ident.to_string();
-                let start = f.sig.ident.span().start();
-                let line = start.line;
-                let col = start.column + 1; // proc-macro2 column is 0-based
-                let is_test = in_cfg_test || has_test_attr(&f.attrs) || is_cfg_test(&f.attrs);
-                out.push(FnUnit {
-                    id: format!("{path}:{line}:{col}:{symbol}"),
-                    symbol,
-                    path: path.to_string(),
-                    line,
-                    col,
-                    sig: FnSig::from_signature(&f.sig),
-                    body: FnBodyOwned::Block(*f.block.clone()),
-                    is_test,
-                    mod_path: mod_path.to_vec(),
-                });
-            }
+/// The enclosing `impl`/`trait` type context, threaded like TS's `class_name`.
+///
+/// `self_ty` is the last path-segment ident of the impl self-type (or the trait
+/// name for a `trait` block); `trait_name` is `Some` only for a trait *impl*
+/// (`impl T for S`), which produces the `<S as T>::m` symbol.
+struct TypeCtx {
+    self_ty: String,
+    trait_name: Option<String>,
+}
 
-            Item::Impl(impl_block) => {
-                // A `#[cfg(test)] impl …` block makes all its methods test-only.
-                let in_cfg_test = in_cfg_test || is_cfg_test(&impl_block.attrs);
-                collect_from_impl(impl_block, path, in_cfg_test, mod_path, out);
-            }
+/// A `syn::visit::Visit` that collects every function unit in a file.
+///
+/// Save/restore of `type_ctx`/`in_test`/`mod_path` around each recursion lets a
+/// nested `impl` (inside a fn body), a `#[cfg(test)]` module, and a nested test
+/// unit compose correctly. `pending_name` carries a `let`-binding ident to the
+/// next closure so `let f = |…|` adopts `f`.
+struct Collector<'a> {
+    path: &'a str,
+    units: Vec<FnUnit>,
+    /// Inline-`mod` nesting for the item currently being walked.
+    mod_path: Vec<String>,
+    /// True while inside a test unit's body or a `#[cfg(test)]` module — nested
+    /// units inherit `is_test` from it.
+    in_test: bool,
+    /// The enclosing `impl`/`trait` type context (for method symbols).
+    type_ctx: Option<TypeCtx>,
+    /// Binding name for a closure that is the direct `init` of the `let` being
+    /// walked; consumed by the next `visit_expr_closure` via `.take()`.
+    pending_name: Option<String>,
+}
 
-            Item::Trait(trait_item) => {
-                // A `#[cfg(test)] trait …` makes its default-bodied methods test-only.
-                let in_cfg_test = in_cfg_test || is_cfg_test(&trait_item.attrs);
-                collect_from_trait(trait_item, path, in_cfg_test, mod_path, out);
-            }
-
-            Item::Mod(m) => {
-                if let Some((_, nested_items)) = &m.content {
-                    let nested_in_cfg_test = in_cfg_test || is_cfg_test(&m.attrs);
-                    let mut child = mod_path.to_vec();
-                    child.push(m.ident.to_string());
-                    collect_items(nested_items, path, nested_in_cfg_test, &child, out);
-                }
-                // `mod foo;` without a body is out-of-line — skip.
-            }
-
-            _ => {}
-        }
+impl Collector<'_> {
+    fn emit(
+        &mut self,
+        symbol: String,
+        line: usize,
+        col: usize,
+        sig: FnSig,
+        body: FnBodyOwned,
+        is_test: bool,
+    ) {
+        let path = self.path;
+        self.units.push(FnUnit {
+            id: format!("{path}:{line}:{col}:{symbol}"),
+            symbol,
+            path: path.to_string(),
+            line,
+            col,
+            sig,
+            body,
+            is_test,
+            mod_path: self.mod_path.clone(),
+        });
     }
 }
 
-fn collect_from_impl(
-    impl_block: &ItemImpl,
-    path: &str,
-    in_cfg_test: bool,
-    mod_path: &[String],
-    out: &mut Vec<FnUnit>,
-) {
-    // Render the self type as the last path-segment ident (e.g. `S` for `impl S`).
-    let type_name = last_path_ident(&impl_block.self_ty);
+/// The 1-based `(line, col)` of a name span (`col` is 1-based; proc-macro2 is 0-based).
+fn name_line_col(span: proc_macro2::Span) -> (usize, usize) {
+    let start = span.start();
+    (start.line, start.column + 1)
+}
 
-    // Is this a trait impl?  `impl T for S` vs bare `impl S`.
-    let trait_name: Option<String> = impl_block
-        .trait_
-        .as_ref()
-        .map(|(_, path, _)| last_segment_ident(path));
-
-    for item in &impl_block.items {
-        if let ImplItem::Fn(method) = item {
-            let method_name = method.sig.ident.to_string();
-            let start = method.sig.ident.span().start();
-            let line = start.line;
-            let col = start.column + 1; // proc-macro2 column is 0-based
-
-            let symbol = match &trait_name {
-                Some(tr) => format!("<{type_name} as {tr}>::{method_name}"),
-                None => format!("{type_name}::{method_name}"),
-            };
-
-            let is_test = in_cfg_test || has_test_attr(&method.attrs) || is_cfg_test(&method.attrs);
-            out.push(FnUnit {
-                id: format!("{path}:{line}:{col}:{symbol}"),
-                symbol,
-                path: path.to_string(),
-                line,
-                col,
-                sig: FnSig::from_signature(&method.sig),
-                body: FnBodyOwned::Block(method.block.clone()),
-                is_test,
-                mod_path: mod_path.to_vec(),
-            });
-        }
+/// The binding ident of a `let <ident> = …` pattern, else `None` (only the
+/// dominant `let f = |…|` form adopts a name; destructuring binds nothing).
+fn let_binding_name(pat: &syn::Pat) -> Option<String> {
+    match pat {
+        syn::Pat::Ident(pi) => Some(pi.ident.to_string()),
+        _ => None,
     }
 }
 
-fn collect_from_trait(
-    trait_item: &ItemTrait,
-    path: &str,
-    in_cfg_test: bool,
-    mod_path: &[String],
-    out: &mut Vec<FnUnit>,
-) {
-    let trait_name = trait_item.ident.to_string();
+impl<'ast> Visit<'ast> for Collector<'ast> {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        let symbol = node.sig.ident.to_string();
+        let (line, col) = name_line_col(node.sig.ident.span());
+        let is_test = self.in_test || has_test_attr(&node.attrs) || is_cfg_test(&node.attrs);
+        self.emit(
+            symbol,
+            line,
+            col,
+            FnSig::from_signature(&node.sig),
+            FnBodyOwned::Block((*node.block).clone()),
+            is_test,
+        );
+        // Recurse into the body so nested fns / methods / closures are collected,
+        // inheriting this unit's test-ness.
+        let saved_test = self.in_test;
+        self.in_test = is_test;
+        visit::visit_item_fn(self, node);
+        self.in_test = saved_test;
+    }
 
-    for item in &trait_item.items {
-        if let TraitItem::Fn(method) = item {
-            // Only emit a unit when there is a default body.
-            if let Some(block) = &method.default {
-                let method_name = method.sig.ident.to_string();
-                let start = method.sig.ident.span().start();
-                let line = start.line;
-                let col = start.column + 1; // proc-macro2 column is 0-based
-                let symbol = format!("{trait_name}::{method_name}");
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        // Self type as the last path-segment ident (e.g. `S` for `impl S`).
+        let self_ty = last_path_ident(&node.self_ty);
+        // Trait impl?  `impl T for S` vs bare `impl S`.
+        let trait_name = node
+            .trait_
+            .as_ref()
+            .map(|(_, path, _)| last_segment_ident(path));
 
-                let is_test =
-                    in_cfg_test || has_test_attr(&method.attrs) || is_cfg_test(&method.attrs);
-                out.push(FnUnit {
-                    id: format!("{path}:{line}:{col}:{symbol}"),
-                    symbol,
-                    path: path.to_string(),
-                    line,
-                    col,
-                    sig: FnSig::from_signature(&method.sig),
-                    body: FnBodyOwned::Block(block.clone()),
-                    is_test,
-                    mod_path: mod_path.to_vec(),
-                });
-            }
-            // Bodyless `fn required(&self);` — skip.
+        let saved_ctx = self.type_ctx.replace(TypeCtx {
+            self_ty,
+            trait_name,
+        });
+        // A `#[cfg(test)] impl …` makes all its methods test-only.
+        let saved_test = self.in_test;
+        self.in_test = self.in_test || is_cfg_test(&node.attrs);
+        visit::visit_item_impl(self, node);
+        self.in_test = saved_test;
+        self.type_ctx = saved_ctx;
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        let method_name = node.sig.ident.to_string();
+        let symbol = match &self.type_ctx {
+            Some(ctx) => match &ctx.trait_name {
+                Some(tr) => format!("<{} as {tr}>::{method_name}", ctx.self_ty),
+                None => format!("{}::{method_name}", ctx.self_ty),
+            },
+            None => method_name,
+        };
+        let (line, col) = name_line_col(node.sig.ident.span());
+        let is_test = self.in_test || has_test_attr(&node.attrs) || is_cfg_test(&node.attrs);
+        self.emit(
+            symbol,
+            line,
+            col,
+            FnSig::from_signature(&node.sig),
+            FnBodyOwned::Block(node.block.clone()),
+            is_test,
+        );
+        let saved_test = self.in_test;
+        self.in_test = is_test;
+        visit::visit_impl_item_fn(self, node);
+        self.in_test = saved_test;
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        let saved_ctx = self.type_ctx.replace(TypeCtx {
+            self_ty: node.ident.to_string(),
+            trait_name: None,
+        });
+        // A `#[cfg(test)] trait …` makes its default-bodied methods test-only.
+        let saved_test = self.in_test;
+        self.in_test = self.in_test || is_cfg_test(&node.attrs);
+        visit::visit_item_trait(self, node);
+        self.in_test = saved_test;
+        self.type_ctx = saved_ctx;
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        // Only trait methods WITH a default body are units; bodyless sigs skip.
+        let Some(block) = &node.default else {
+            return;
+        };
+        let method_name = node.sig.ident.to_string();
+        let symbol = match &self.type_ctx {
+            Some(ctx) => format!("{}::{method_name}", ctx.self_ty),
+            None => method_name,
+        };
+        let (line, col) = name_line_col(node.sig.ident.span());
+        let is_test = self.in_test || has_test_attr(&node.attrs) || is_cfg_test(&node.attrs);
+        self.emit(
+            symbol,
+            line,
+            col,
+            FnSig::from_signature(&node.sig),
+            FnBodyOwned::Block(block.clone()),
+            is_test,
+        );
+        let saved_test = self.in_test;
+        self.in_test = is_test;
+        visit::visit_trait_item_fn(self, node);
+        self.in_test = saved_test;
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        // `mod foo;` without a body is out-of-line — nothing to collect.
+        if node.content.is_none() {
+            return;
         }
+        let saved_test = self.in_test;
+        self.in_test = self.in_test || is_cfg_test(&node.attrs);
+        self.mod_path.push(node.ident.to_string());
+        visit::visit_item_mod(self, node);
+        self.mod_path.pop();
+        self.in_test = saved_test;
+    }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        // `let f = |…|` — hand the binding name to the next closure visited.
+        if let Some(init) = &node.init
+            && matches!(&*init.expr, syn::Expr::Closure(_))
+        {
+            self.pending_name = let_binding_name(&node.pat);
+        }
+        visit::visit_local(self, node);
+        // Defensive clear in case it wasn't consumed.
+        self.pending_name = None;
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        let (line, col) = name_line_col(node.span());
+        let symbol = self
+            .pending_name
+            .take()
+            .unwrap_or_else(|| format!("<closure@L{line}C{col}>"));
+        let sig = FnSig {
+            receiver: None,
+            inputs: node.inputs.iter().cloned().collect(),
+            unsafety: false,
+            asyncness: node.asyncness.is_some(),
+            is_closure: true,
+            unsafe_anchor: None,
+        };
+        let body = match &*node.body {
+            syn::Expr::Block(eb) => FnBodyOwned::Block(eb.block.clone()),
+            other => FnBodyOwned::Expr(Box::new(other.clone())),
+        };
+        // A closure inherits its enclosing unit's test-ness (never adds any).
+        let is_test = self.in_test;
+        self.emit(symbol, line, col, sig, body, is_test);
+        // Recurse so nested closures inside this one are collected.
+        visit::visit_expr_closure(self, node);
     }
 }
 
@@ -401,5 +502,93 @@ mod tests {
             c.0, 1,
             "walk_with must reach the compound-assign in the body"
         );
+    }
+
+    #[test]
+    fn nested_fn_is_its_own_unit() {
+        let file =
+            syn::parse_file("fn outer() { fn helper(v: &mut Vec<i32>) { v.push(1); } }").unwrap();
+        let units = collect(&file, "a.rs");
+        let syms: Vec<&str> = units.iter().map(|u| u.symbol.as_str()).collect();
+        assert!(syms.contains(&"outer"));
+        assert!(
+            syms.contains(&"helper"),
+            "nested fn must be its own unit; got {syms:?}"
+        );
+    }
+
+    #[test]
+    fn closure_takes_binding_name_else_positional_fallback() {
+        let src = "fn f() { let g = |x: i32| x + 1; let _ = (|y: i32| y, |z: i32| z); }";
+        let file = syn::parse_file(src).unwrap();
+        let units = collect(&file, "a.rs");
+        let syms: Vec<&str> = units.iter().map(|u| u.symbol.as_str()).collect();
+        assert!(
+            syms.contains(&"g"),
+            "let-bound closure adopts `g`; got {syms:?}"
+        );
+        let anon: Vec<&str> = syms
+            .iter()
+            .copied()
+            .filter(|s| s.starts_with("<closure@L"))
+            .collect();
+        assert_eq!(
+            anon.len(),
+            2,
+            "two same-line closures → two units; got {anon:?}"
+        );
+        assert_ne!(
+            anon[0], anon[1],
+            "same-line closures must differ by col; got {anon:?}"
+        );
+    }
+
+    #[test]
+    fn nested_units_inherit_is_test() {
+        let file = syn::parse_file("#[test]\nfn t() { fn helper() {} let c = || 1; }").unwrap();
+        let units = collect(&file, "a.rs");
+        for name in ["t", "helper", "c"] {
+            assert!(
+                units.iter().find(|u| u.symbol == name).unwrap().is_test,
+                "`{name}` must inherit is_test"
+            );
+        }
+    }
+
+    #[test]
+    fn tokio_test_nested_closure_inherits_is_test() {
+        let file = syn::parse_file(
+            "#[tokio::test]\nasync fn t() { let c = || { let d = || 1; d() }; c(); }",
+        )
+        .unwrap();
+        let units = collect(&file, "a.rs");
+        for u in &units {
+            assert!(
+                u.is_test,
+                "`{}` under #[tokio::test] must inherit is_test",
+                u.symbol
+            );
+        }
+        for name in ["c", "d"] {
+            assert!(
+                units.iter().any(|u| u.symbol == name),
+                "let-bound nested closure `{name}` must be its own unit under #[tokio::test]"
+            );
+        }
+    }
+
+    #[test]
+    fn cfg_test_mod_composes_with_unit_level_inheritance() {
+        let file = syn::parse_file(
+            "#[cfg(test)]\nmod tests { fn helper_in_test_mod() { let c = || 1; } }",
+        )
+        .unwrap();
+        let units = collect(&file, "a.rs");
+        for name in ["helper_in_test_mod", "c"] {
+            assert!(
+                units.iter().find(|u| u.symbol == name).unwrap().is_test,
+                "`{name}` in a #[cfg(test)] mod must be test (module-level ∘ unit-level)"
+            );
+        }
     }
 }
