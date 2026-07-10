@@ -6,11 +6,11 @@
 
 **Branch / rebase mechanics.** This plan (#83) lands on `main` first (feature branch `feat/083-nested-unit-collection` → PR → merge). Spec 031's branch `feat/078-rust-scope-resolution` then **rebases onto post-#83 `main`** so it sees nested units + captures already collected; 031 does not merge before #83.
 
-**Settled inputs to encode, not re-litigate:** Q5 = **option (a)** — a mutably-capturing closure emits `hidden.mutation "captured-binding"` on the **closure's own unit** (cross-language-consistent with Python/TS, zero extra machinery); the **merge gate is a dogfood of the closure FP rate** (Task 6 produces it as a `docs/008-dogfood-deltas.md`-style doc). Re-containment (option b) is explicitly **not built here**.
+**Settled inputs to encode, not re-litigate:** Q5 = **option (a)** — a mutably-capturing closure emits `hidden.mutation "captured-binding"` on the **closure's own unit** (cross-language-consistent with Python/TS, zero extra machinery); the **merge gate is a dogfood of the closure FP count** (Task 6 produces it as a `docs/008-dogfood-deltas.md`-style doc; gate = FP ≤ 20 across three local corpora, > 50 reopens Q5 via option (b)). Re-containment (option b) is explicitly **not built here**.
 
 **Two design decisions settled in review — final, encoded below, not reopened:**
 - **D-Boundary = Option A (per-walker no-ops).** The Task-4 boundary is: each of the SIX own-body walkers overrides `visit_item` → no-op AND `visit_expr_closure` → no-op, so the enclosing walk stops at every nested-unit boundary. **Option B (collection-time body pruning) is dropped** — it leaked two ways (closure params still seeded into the parent; an in-body `Item::Mod` double-counted). Option A dissolves both: a `visit_item` no-op also stops at an in-body `Item::Mod`, and a `visit_expr_closure` no-op means closure params are never seeded into the parent.
-- **D-OQ2 = accept + measure (option a).** Nested units stay in the core `SymbolIndex` name index; a bare `helper()` to a same-named module-level fn ambiguous-drops (symmetric — intra-tree and external edges both drop when same-named). This is the **existing language-neutral core behavior** (Python/TS nested units already do this), so it adds **zero** new cross-language obligation. Option (b) (exclude nested from `name_idx`) is **rejected** — it is a false-resolve trap (an intra-tree `helper()` would then wrongly resolve to the module-level unit). The "correct" fix (c) — scope-aware CALL resolution (call→callee-unit by lexical/nesting scope) — is **documented-only, NOT opened as an issue**: it's a core `resolve.rs` concern (the call-graph twin of #78's binding shadowing), a *possible future cross-language enhancement* gated by the measured edge-loss magnitude (Task-6 metric 5), and it does **not** block closing #78.
+- **D-OQ2 = accept + measure (option a).** Nested units stay in the core `SymbolIndex` name index; a bare `helper()` to a same-named module-level fn ambiguous-drops (symmetric — intra-tree and external edges both drop when same-named). This is the **existing language-neutral core behavior** (Python/TS nested units already do this), so it adds **zero** new cross-language obligation. Option (b) (exclude nested from `name_idx`) is **rejected** — it is a false-resolve trap (an intra-tree `helper()` would then wrongly resolve to the module-level unit). The "correct" fix (c) — scope-aware CALL resolution (call→callee-unit by lexical/nesting scope) — is **documented-only, NOT opened as an issue**: it's a core `resolve.rs` concern (the call-graph twin of #78's binding shadowing), a *possible future cross-language enhancement* gated by the measured edge-loss magnitude (Task-6 diagnostic 4 — the OQ2 "metric 5"), and it does **not** block closing #78.
 
 **Goal:** Bring `fxrank-lang-rust`'s function-unit collection in line with the cross-language invariant recorded in `docs/adding-a-language-frontend.md` §*Function-unit granularity*: **every nested `fn`, nested-`impl`/`trait` method, and closure becomes its own `Hotspot` + `UnitRecord`**, and the enclosing unit's own-body walk **stops at each nested-unit boundary** (no double-counting). Today `functions::collect_items` recurses only into `Item::Mod`, so nested `fn`s/closures fold into the enclosing unit — Rust is the cross-language outlier. This plan closes only **collection + boundary + identity + propagation**; it does **no** scope resolution (that is 031's `EnclosingCaptured` cascade — Q5(a) deliberately keeps today's flat detector cascade).
 
@@ -99,7 +99,9 @@ Foundational and first: a closure has no `syn::Signature` and often no `syn::Blo
   - **Closure params** (`is_closure == true`) — route each input pat through the existing `seed_pat_locals` path, which **honors `is_mut → let_mut`**, reproducing today's interim `visit_expr_closure`→`seed_pat_locals` seeding **byte-for-byte**. This is the OQ1/Blocker-2 fix; it lands here in Task 1 (the one place the container reshape crosses into detector behavior), guarded by `cargo insta test` byte-identity outside the closure fixtures.
 - `risk::detect_fn_risks` reads `sig.unsafety` + `sig.span()` today — replace with `sig.unsafety` + `sig.unsafe_anchor` (only ever `Some` for an `unsafe fn`; closures are never unsafe). `analyze_unit` reads `sig.asyncness` — replace with `FnSig.asyncness`.
 
-**Cross-artifact coordination (Blocker 2, cross-branch — 031 lives only on `feat/078-rust-scope-resolution`).** Spec 031 §4.2/§4.3 currently describes AC-C2 (`|mut x| → local.mutation`) as working "via the interim `seed_pat_locals` path" on the **enclosing** unit's `visit_expr_closure`. Once the closure is its own unit, that mechanism moves to the **closure's own `seed`** (the `is_closure` route above). 031's text needs a matching sync when it rebases onto post-#83 main — **flag this as a coordination item on that branch; do not edit 031 here.**
+**Cross-artifact coordination (Blocker 2, cross-branch — 031 lives only on `feat/078-rust-scope-resolution`).** Spec 031 has **two** things to reconcile when it rebases onto post-#83 main — **flag both as coordination items on that branch; do not edit 031 here.** (F7 — the earlier note named only the first and mischaracterized it.)
+  1. **Stale mechanism *label* only — not the attribution target.** 031 §4.2/§4.3 already attributes the closure by-value `|mut x| → local.mutation` (AC-C2) row to the **closure's OWN unit** — 031 presupposes post-#83, so the *attribution* is already correct. What goes stale is only the mechanism **label** "via the interim `seed_pat_locals` path": post-#83 that seeding lives on the closure's own `seed` (the `is_closure` route above), NOT on any enclosing unit's `visit_expr_closure`. 031 just re-labels the mechanism; it does **not** re-point the row.
+  2. **Named-fn by-value-`mut` divergence (the material one).** 031 §4.2 *also* classifies **nested NAMED-fn / nested-method by-value `mut` params** as `Local → local.mutation` (the "nested fn … by-value → Local of the nested unit" rows; §4.3 row ~307). 032 instead routes **ALL** named fns — top-level and nested alike — through the **silent signature path** (`is_closure = false`: a named fn's by-value `mut` param seeds `locals` discarding `is_mut`, by the settled Q1-silence). So 031's named-fn `local.mutation` classification **diverges** from 032's silence and must be reconciled on rebase — this, not the AC-C2 label, is the substantive sync. 032's own choice stays faithful to Q1-silence; this note is purely about 031's completeness, not a change to 032.
 
 - [ ] **Step 1: Write the failing test** (in `src/functions.rs`, added to the existing `mod tests`)
 
@@ -147,7 +149,8 @@ Replace the manual `collect_items` item-loop with a `syn::visit::Visit` `Collect
 - **Add nested `fn`s** (a `fn` in a block / fn body) and **nested-`impl`/`trait` methods** (an `impl`/`trait` inside a fn body) as units. Thread an impl/trait **type context** like TS's `class_name` (override `visit_item_impl`/`visit_item_trait` to set the self-type/trait name, compute the same `S::m` / `<S as T>::m` / `T::defaulted` symbols the current `collect_from_impl`/`collect_from_trait` produce).
 - **Add closures** (`ExprClosure`, anywhere an expression appears) as units.
 - **`is_test` inheritance:** thread an `in_test: bool`; a nested `fn`/method/closure inside a `#[test]`/`#[tokio::test]`/`#[cfg(test)]` unit inherits `is_test = true` (else the dogfood drowns in test-closures). Set `in_test` on entering a test unit's body; children read it.
-- **Binding-name adoption (`pending_name`, the TS analog):** on `visit_local` whose `init.expr` is `Expr::Closure`, set `pending_name = Some(<let-binding ident>)`; the next `visit_expr_closure` consumes it via `.take()` as its symbol so a later `f()` edge resolves (Task 5). Cover the `let f = |…|` form (the dominant idiom); a `const`/`static` closure value is not expressible in Rust and needs no handling. Non-adopted closures fall back to **`<closure@L{line}C{col}>`** with `col` from the **closure span** (`node.span().start().column + 1`) — collision-proof for two closures on one line (mirrors TS `<arrow@L{line}C{col}>`; the crate's `id` = `path:line:col:symbol` invariant, CLAUDE.md, requires the col).
+- **Binding-name adoption (`pending_name`, the TS analog):** on `visit_local` whose `init.expr` is `Expr::Closure`, set `pending_name = Some(<let-binding ident>)`; the next `visit_expr_closure` consumes it via `.take()` as its symbol so a later `f()` edge resolves (Task 5). Cover the `let f = |…|` form (the dominant idiom). Non-adopted closures fall back to **`<closure@L{line}C{col}>`** with `col` from the **closure span** (`node.span().start().column + 1`) — collision-proof for two closures on one line (mirrors TS `<arrow@L{line}C{col}>`; the crate's `id` = `path:line:col:symbol` invariant, CLAUDE.md, requires the col).
+  - **F8 — a `const`/`static` closure value IS expressible (correct the earlier claim).** `const ADD: fn(i32) -> i32 = |x| x + 1;` (and the `static` form) are valid Rust — a non-capturing closure coerces to a fn pointer. `syn`'s default `visit_item` recursion reaches such a closure through `Item::Const`/`Item::Static`, so the `Collector` **will** emit an anonymous `<closure@…>` unit for it. Two obligations follow: (1) **identity** — Task 3 forces `is_nested = true` for **every** closure regardless of collection depth (a module-level `const` closure is not lexically inside another unit's body, yet must still get an empty `canonical_path` — otherwise it emits a garbage non-empty canonical path built from an anonymous `<closure@…>` symbol); (2) **naming** — either handle `visit_item_const`/`visit_item_static` for `pending_name` adoption (adopt the item ident), or accept that such a closure is **not** name-adopted and falls back to the positional `<closure@…>` symbol. The plan takes the simpler route: **no `const`/`static` name adoption; positional `<closure@…>` fallback**, with the identity guard (empty canonical) doing the load-bearing work in Task 3.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -195,8 +198,13 @@ fn tokio_test_nested_closure_inherits_is_test() {
     for u in &units {
         assert!(u.is_test, "`{}` under #[tokio::test] must inherit is_test", u.symbol);
     }
-    // closure-in-closure: at least two <closure@..> (c and d) are present and test.
-    assert!(units.iter().filter(|u| u.symbol.starts_with("<closure@L")).count() >= 2);
+    // F3: the closures are `let`-bound, so `pending_name` adopts `c`/`d` — they are
+    // NOT `<closure@L…>`. Assert both nested closure units exist (and, via the loop
+    // above, inherit is_test): this pins closure-in-closure (2+ level) inheritance.
+    for name in ["c", "d"] {
+        assert!(units.iter().any(|u| u.symbol == name),
+            "let-bound nested closure `{name}` must be its own unit under #[tokio::test]");
+    }
 }
 
 #[test]
@@ -227,7 +235,8 @@ fn cfg_test_mod_composes_with_unit_level_inheritance() {
 A nested `fn helper` must **not** get a bare-`helper` importable canonical path: that would (i) let a `use crate::m::helper` false-resolve to the nested fn via `CanonicalIndex.primary`, and (ii) collide with a real module-level `helper`, breaking its qualified/`self::`/`super::` resolution. Mirror **exactly** what Python does for methods/nested defs/lambdas: give nested units an **empty `canonical_path`** (`detect/mod.rs` Python: `if !unit.is_module_level { vec![] }`) — empty ⇒ not inserted into `CanonicalIndex.primary` (`resolve.rs::CanonicalIndex::from_records` skips `canonical_path.is_empty()`), verified against core.
 
 **Interfaces:**
-- Add a **nesting flag** to `FnUnit` (frontend-internal `bool`, the Python `is_module_level` inverse — e.g. `is_nested: bool`, set `true` for any closure / nested `fn` / nested-impl method; `false` for top-level fns and top-level-impl/trait methods). The `Collector` sets it from its nesting depth (Python threads `def_depth`; here: any unit emitted while inside another unit's body is nested). Distinct from `FnSig.is_closure` (Task 1, mutation seed) — `is_nested` covers nested named fns/methods too, and drives canonical-path emptiness only.
+- Add a **nesting flag** to `FnUnit` (frontend-internal `bool`, the Python `is_module_level` inverse — e.g. `is_nested: bool`, set `true` for any closure / nested `fn` / nested-impl method; `false` for top-level fns and top-level-impl/trait methods). The `Collector` sets it from its nesting depth (Python threads `def_depth`; here: any named unit emitted while inside another unit's body is nested). Distinct from `FnSig.is_closure` (Task 1, mutation seed) — `is_nested` covers nested named fns/methods too, and drives canonical-path emptiness only.
+  - **F8 — force `is_nested = true` for EVERY closure regardless of collection depth.** A closure has no meaningful importable name, so it must **never** populate `CanonicalIndex.primary` — but a `const`/`static` module-level closure (`const ADD: fn(i32) -> i32 = |x| x + 1;`, valid Rust — a non-capturing closure coerces to a fn pointer) is emitted at depth 0, *not* lexically inside another unit's body, so a pure depth-based rule would leave it `is_nested = false` and give it a **garbage non-empty `canonical_path` built from an anonymous `<closure@…>` symbol**. Guard against this by setting `is_nested = true` **unconditionally whenever the unit is a closure** (`FnSig.is_closure == true`), OR-ed with the depth rule for named nested fns/methods. This is independent of `FnSig.is_closure`'s mutation-seeding role: `is_closure` → closure-only `let_mut` seeding; `is_nested` → empty canonical path for all nested units **and** all closures (incl. the depth-0 `const`/`static` closure).
 - `canonical_path_of(unit, module_tree)` returns `vec![]` when `unit.is_nested` (before the module lookup), else today's `["crate"] ++ file_mod ++ mod_path ++ symbol_segments`.
 - **Blocker 3 — `referencing_mod` must NOT be derived from the (now-empty) `canonical_path`.** Today `build_record` does `referencing_mod = module_of_unit(&canonical_path, &unit.symbol)` (`detect/mod.rs:123`). For a nested unit `canonical_path` is empty ⇒ `module_of_unit` returns `vec![]` ⇒ a `self::`/`super::` ref **inside** the nested body loses its anchor (`resolve_in_crate` returns `None` on an empty referencing module). Add a **separate** `module_context_of(unit, module_tree)` that computes the unit's module directly from the file module + `mod_path`, **independent of the emitted canonical path**:
   ```rust
@@ -244,7 +253,7 @@ A nested `fn helper` must **not** get a bare-`helper` importable canonical path:
 **Name-index (`SymbolIndex`) participation — SETTLED (D-OQ2 = option a, accept + measure).** Empty `canonical_path` fixes the **precise** index. But `SymbolIndex::from_records` (core) indexes **every** record by simple name, so a nested `helper` still enters under `helper`. Consequence: a **bare, unqualified** `helper()` call to a same-named module-level fn now finds 2 entries → ambiguous → dropped (a **quieter FN**, symmetric — both intra-tree and external edges drop when the name collides). Crucially, a **qualified** call — `use crate::m::helper; helper()`, `self::helper()`, `super::helper()` — resolves via `resolved_target` through `CanonicalIndex.primary`/aliases, which the nested unit (empty path) does **not** populate, so **those do NOT regress**. This is the **existing language-neutral core behavior** — Python/TS nested units already exhibit exactly this ambiguity — so #83 adds **zero** new cross-language obligation. **Decision: mirror Python — accept the bare-name ambiguity, do NOT add a core exclusion.**
 
 - **Option (b) — exclude nested units from `name_idx` — is REJECTED**: it is a false-resolve trap. If a nested `helper` were removed from the name index, an intra-tree bare `helper()` (in the *same* fn as the nested `helper`) would then wrongly resolve to the *module-level* `helper`. Dropping-on-ambiguity is the safe, symmetric behavior.
-- **Option (c) — scope-aware CALL resolution (call → callee-unit by lexical/nesting scope) — is the "correct" long-term fix but is DOCUMENTED-ONLY, NOT opened as an issue.** It is a core `resolve.rs` concern (the call-graph twin of #78's binding shadowing), a *possible future cross-language enhancement* gated by the **measured** edge-loss magnitude (Task-6 metric 5), and it does **not** block closing #78. Task 6 records the magnitude and a deferred/gated paragraph; it is not scoped into #83.
+- **Option (c) — scope-aware CALL resolution (call → callee-unit by lexical/nesting scope) — is the "correct" long-term fix but is DOCUMENTED-ONLY, NOT opened as an issue.** It is a core `resolve.rs` concern (the call-graph twin of #78's binding shadowing), a *possible future cross-language enhancement* gated by the **measured** edge-loss magnitude (Task-6 diagnostic 4 — the OQ2 "metric 5"), and it does **not** block closing #78. Task 6 records the magnitude and a deferred/gated paragraph; it is not scoped into #83.
 
 Record the residual FN honestly in the dogfood doc: a parent's bare `inner()`/`go()`/`run()` to a nested unit resolves only when that name is corpus-wide unique.
 
@@ -295,7 +304,15 @@ fn nested_unit_ref_keeps_self_super_anchor_despite_empty_canonical(/* Blocker 3 
     // A nested fn whose body makes a `self::sibling()` call. Even though the
     // nested unit's canonical_path is empty, its refs must still anchor to the
     // file module (`crate::m`) so `self::sibling` resolves to crate::m::sibling.
-    let mt = ModuleTree::build(&[SourceFile { path: "src/m.rs".into(), text: String::new() }]);
+    // F2: `ModuleTree::build` only recognizes a crate root at `src/lib.rs`/`src/main.rs`
+    // (`root_dir_of`). With ONLY `src/m.rs` in the batch there is no root, so
+    // `module_of("src/m.rs")` is `None` → `module_context_of` returns `[]` and the
+    // `self::sibling` anchor assertion below could never pass. Include `src/lib.rs`
+    // in the batch so `module_of("src/m.rs") = Some(["m"])`.
+    let mt = ModuleTree::build(&[
+        SourceFile { path: "src/lib.rs".into(), text: String::new() },
+        SourceFile { path: "src/m.rs".into(), text: String::new() },
+    ]);
     let file = syn::parse_file("fn outer() { fn nested() { self::sibling(); } }").unwrap();
     let imports = ImportTable::from_file(&file);
     let statics = std::collections::HashSet::new();
@@ -311,7 +328,7 @@ fn nested_unit_ref_keeps_self_super_anchor_despite_empty_canonical(/* Blocker 3 
 
 - [ ] **Step 2: Verify** — the first fails (nested unit currently gets a non-empty path or none at all depending on Task 2); the second pins the no-regression contract.
 - [ ] **Step 3: Implement** — add `is_nested` to `FnUnit` (set in the `Collector`); short-circuit `canonical_path_of` to `vec![]` for nested units; add `module_context_of` and switch `build_record`'s `referencing_mod` to it (Blocker 3). **First verify** against `resolve.rs` that empty `canonical_path` is skipped by `CanonicalIndex::from_records` (it is — `if !rec.canonical_path.is_empty()`), so no core change is needed for the precise path. Do **not** add a name-index exclusion (D-OQ2 rejects option b).
-- [ ] **Step 4: Verify** — both tests green; `cargo test --workspace` green (the 025/3e resolution tests still pass).
+- [ ] **Step 4: Verify (new + non-snapshot suites only — F-sequencing, F4)** — both new tests green, and the crate's **unit + integration tests EXCEPT the insta snapshots** pass (mirror Task 2 Step 4's "unit tests only" scoping). Do **NOT** gate on a full-green `cargo test --workspace` here and do **NOT** accept snapshots: between Task 2 and Task 4 the parent still double-counts re-homed effects, so the insta snapshots are mismatched **by design** until Task 4's labelled acceptance (F-sequencing forbids accepting them earlier). The first full-green `--workspace` gate belongs to **Task 4 Step 4**. (The 025/3e resolution tests, which are not snapshot-gated, do pass here and are worth running.)
 - [ ] **Step 5: Commit** — `fix(rust): nested units get empty canonical_path (identity guard) (#83)`
 
 ---
@@ -335,6 +352,7 @@ fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) { /* boundary: stop
 - **Do NOT no-op `visit_expr_async`.** A bare `async { … }` / `tokio::spawn(async move { … })` is an `ExprAsync`, **not** an `ExprClosure` and **not** an `Item` — the no-ops do not touch it, so it stays parent-attributed with its awaits counted (N4). Only `ExprClosure` (incl. `async || …`) is a unit.
 - **The no-ops live only on the six detector walkers**, never on the `Collector` (Task 2), which must keep descending to emit nested units.
 - **Delete the now-dead interim seeding:** `MutationWalker::visit_expr_closure` currently seeds closure param locals; replace it with the no-op (the closure's own unit seeds via `FnSig.is_closure`, Task 1). `MutationWalker` keeps its other seeding overrides (`visit_local`/`visit_expr_for_loop`/`visit_expr_let`/`visit_arm`) — those are the parent's own bindings, not nested units.
+- **F5 — named FN delta: closures lose the enclosing `unsafe fn` context (snapshot-visible).** Today `RiskWalker.fn_is_unsafe` (`risk.rs:69`) and `MutationWalker.unsafe_fn` (`mutation.rs:69`) are seeded from the **parent** `sig.unsafety`, and the parent walk currently descends into closure bodies — so a `*ptr` deref (`RawPtrDeref`) or a discount-cancel write inside a closure sitting in an `unsafe fn` **is** detected today (the walker's `inside_unsafe()` returns true via the parent's `fn_is_unsafe`). Post-plan the closure is its **own** unit with `FnSig.unsafety = false` (closures are never `unsafe`), and the Option-A `visit_expr_closure` no-op stops the parent at the closure — so those `unsafe`-context signals **silently vanish** from both units. In editions ≤2021 a closure body genuinely IS in the enclosing unsafe context, so this is a real (edition-dependent) **FN**. **Decision: accept-and-eyeball at Task 4** — when accepting the Task-4 snapshot deltas, treat any dropped `RawPtrDeref`/discount-cancel signal inside an `unsafe fn`'s closure as an **intended** boundary delta, not a bug. The alternative — threading an `in_unsafe_fn` inheritance bit into closure units so the closure's walkers re-derive unsafe context — is **NOT** built here; if the dogfood (Task 6) shows it matters, it is a scoped follow-up. State this in the snapshot-acceptance notes so the delta is documented.
 - **Maintenance hazard, named honestly:** every **future** detector walker must remember both no-ops or it silently double-counts. The cross-detector fixture below guards *today's* six; a new detector is one forgotten override away from a regression. (This is the one cost of Option A over a structural prune; accepted per D-Boundary.)
 
 - [ ] **Step 1: Write the failing fixtures** — (1) ONE canonical cross-detector boundary fixture asserting **all SIX** walkers stop (F-refs adds `refs::extract`, which the old draft omitted — a nested-body effectful call would else emit a spurious `CallSiteRef` on the parent); (2) the F-async fixture; (3) the F-3level fixture.
@@ -483,24 +501,39 @@ fn inline_map_closure_io_does_not_reappear_on_parent() {
     assert!(parent.refs.iter().all(|r| !matches!(r.kind, fxrank_core::record::RefKind::Free) || r.base != "map"),
         "the .map closure must not become a resolvable parent edge (N2)");
     // (2) After the REAL fold, no closure effect/class reaches the parent — its
-    //     propagated_max_class stays == its own max_class. Build the graph with
-    //     the precise resolver, fold, and materialize hotspots (test-only helper).
-    use fxrank_core::{graph::CallGraph, fold::{fold, to_hotspots}, resolve::{CanonicalIndex, resolve_ref_precise}};
+    //     propagated max_class stays == its own max_class. `to_hotspots` /
+    //     `boundary_summary` are `#[cfg(test)]` INSIDE fxrank-core → NOT callable
+    //     here, so drive the pub APIs (`from_records` + `fold`) and compute
+    //     propagated_max_class from the pub `Propagated` fields via
+    //     `score::max_class` — exactly as core's own fold tests do (e.g.
+    //     `propagated_gte_own_for_contained_only_unit`). F1.
+    use fxrank_core::{graph::CallGraph, fold::fold, score,
+                      resolve::{CanonicalIndex, resolve_ref_precise}};
     let idx = CanonicalIndex::from_records(&out.records);
+    // `from_records` passes the OWNING `&UnitRecord` (graph.rs:38-41), so the
+    // owner→path is `owner.path` — NOT `owner.split(':')`.
     let g = CallGraph::from_records(out.records.clone(), |r, owner, _nodes| {
-        let owner_path = owner.split(':').next().unwrap_or(owner);
-        resolve_ref_precise(r, &idx, owner_path)
+        resolve_ref_precise(r, &idx, &owner.path)
     });
     let folded = fold(&g);
-    let hs = to_hotspots(&g, &folded);
-    let ph = hs.iter().find(|h| h.symbol == "parent").unwrap();
-    assert_eq!(ph.propagated_max_class, ph.max_class,
+    let parent_rec = out.records.iter().find(|r| r.symbol == "parent").unwrap();
+    let p = folded.get(&parent_rec.unit_id).expect("parent in fold output");
+    // propagated_max_class from the pub Propagated fields:
+    let prop_classes: Vec<u8> = p.effects.iter().map(|e| e.effective_class()).collect();
+    let prop_risk = p.risks.iter().map(|r| r.class).max().unwrap_or(0);
+    let propagated_max_class = score::max_class(&prop_classes, prop_risk);
+    // own_max_class from the parent's OWN record (own-body fields, untouched by fold):
+    let own_classes: Vec<u8> = parent_rec.effects.iter().map(|e| e.effective_class()).collect();
+    let own_risk = parent_rec.risks.iter().map(|r| r.class).max().unwrap_or(0);
+    let own_max_class = score::max_class(&own_classes, own_risk);
+    // Load-bearing: parent's propagated == its own (no closure effect propagated).
+    assert_eq!(propagated_max_class, own_max_class,
         "no closure effect/class may propagate to the parent from an inline .map (N2); \
-         own={} propagated={}", ph.max_class, ph.propagated_max_class);
+         own={own_max_class} propagated={propagated_max_class}");
 }
 ```
 
-> **Grounding note for the implementer:** `CallGraph::from_records(records, resolve)`, `fold(&g)`, and the test-only `to_hotspots(&g, &folded)` are the real core APIs (`fxrank-core/src/{graph,fold}.rs`); the `resolve` closure signature is `|ref, owner_id, nodes| -> Option<Edge>`. If the owner→path derivation differs in the crate's own fold tests, mirror those instead — the assertion (propagated == own) is the load-bearing part.
+> **Grounding note for the implementer (F1):** `CallGraph::from_records(records, resolve)` and `fold(&g)` are pub core APIs (`fxrank-core/src/{graph,fold}.rs`); `to_hotspots`/`boundary_summary` are `#[cfg(test)]`-gated **inside** fxrank-core and thus **NOT callable** from `fxrank-lang-rust` tests. Get propagated stats the way core's own fold tests do: read the pub `Propagated { effects, risks, .. }` from `fold`'s output map (keyed by `unit_id`) and compute `propagated_max_class` via `score::max_class(&classes, risk)` (mirror `propagated_gte_own_for_contained_only_unit`). `from_records`' resolve closure is `Fn(&CallSiteRef, &UnitRecord /* owner */, &HashMap<UnitId, UnitRecord>) -> Option<Edge>` (graph.rs:38-41) — the owner is the full `&UnitRecord`, so pass `&owner.path` to `resolve_ref_precise` (NOT `owner.split(':')`). If you prefer, the pub `apply_fold` on your own-seeded `Hotspot`s is the alternative core-blessed path. The assertion (parent propagated == own) is the load-bearing part.
 
 - [ ] **Step 2: Verify** — the first fails if Task 2's `pending_name` adoption or the boundary broke the `writer` ref/edge; the second characterizes the accepted non-reappearance (should pass once the boundary is correct — pin it).
 - [ ] **Step 3: Implement** — reconcile `refs::extract` so the binding-named closure call resolves (it should already: under Option A the `RefsWalker` no-ops at the closure *definition* but still records the `writer()` *call* in the parent body, since `writer()` is a `RefKind::Free` path call, not a closure expression; verify the closure unit's `symbol`/`unit_id` land in the index). No new absorption. Ensure the closure unit's own record carries its escaping effect for the fold.
@@ -513,27 +546,32 @@ fn inline_map_closure_io_does_not_reappear_on_parent() {
 
 ### Task 6: Closure FP-rate dogfood — pre-register the design, then run
 
-Q5(a) ships per-closure `hidden.mutation "captured-binding"`; the **merge gate** is a dogfood of the closure FP rate — comparable to the documented **#55 ~76-site "unacceptable" baseline**. Pre-register the whole design **before** running so the number is not fitted after the fact; write results as a `docs/008-dogfood-deltas.md`-style doc that **doubles as spec 031's compat baseline artifact** (§5.5).
+Q5(a) ships per-closure `hidden.mutation "captured-binding"`; the **merge gate** is a dogfood of the closure FP **count** — comparable to the documented **#55 ~76-site "unacceptable" baseline**. Pre-register the whole design (corpora, FP definition, gate, metrics) **before** scanning so the number is not fitted after the fact; write results as a `docs/008-dogfood-deltas.md`-style doc that **doubles as spec 031's compat baseline artifact** (§5.5).
 
-**Pre-registered design (fix all four before the scan):**
-1. **FP definition.** A `<closure@…>` (or binding-named) unit's `captured-binding` emission is a **FP** when the captured binding is a plain **local of the immediately-enclosing fn** AND the closure is **consumed synchronously in the same expression** (the "morally-local" iterator/sort-key case — `sort_by_key`, `map`, `retain`). It is a **TP** when the closure is **stored, returned, or spawned** (escapes its enclosing frame). Decide per-site by the closure's consumption context.
-2. **Corpora.** (a) the fxrank workspace itself (`cargo run -p fxrank -- scan crates/`), and (b) a concrete **iterator/closure-heavy external Rust crate**: **`ripgrep` (`BurntSushi/ripgrep`)** — iterator- and closure-dense application code, comparable in shape to the #55 dogfood. **The operator supplies the checkout** (e.g. `~/GitHub/ripgrep`); the plan does not vendor it. If ripgrep is unavailable on the host, fall back to another closure-heavy checkout the operator names, and record which crate was used.
-3. **Metrics beyond FP rate (FIVE metrics — metric 5 is the D-OQ2 gate for the deferred fix (c)).** Record:
-   - (i) **Ranking churn** — the share of top-20 hotspots that are `<closure@…>` units (re-homing churn).
-   - (ii) **Concern-1 dilution** — the count of parent units that **drop ≥1 effect class** purely because effects re-homed to a nested unit (a parent looking "cleaner" only because its effect moved).
-   - (iii) **FP count** and (iv) **FP rate** of `captured-binding` per the definition above.
-   - (v) **Bare-name edge loss (D-OQ2)** — the count of resolvable bare-name call edges **lost pre-#83 vs post-#83** *specifically because a nested unit newly shares a simple name with a module-level unit* (a `helper()` that resolved before #83 now ambiguous-drops). This is the measured magnitude that gates the deferred scope-aware CALL resolution (c); it is the trigger evidence, not a reason to build (c) in #83.
-4. **Thresholds fixed before running (concrete, pre-registered — F-thresholds).** Ship (a) as-is when **all** hold:
-   - **FP ceiling:** closure `captured-binding` **FP count ≤ 20 absolute** across the two corpora, **AND** **FP rate ≤ 25%** of all `captured-binding` emissions (well under the #55 ~76-site "unacceptable" baseline).
-   - **Ranking-churn ceiling:** metric (i) — `<closure@…>` share of the **top-20 ≤ 25%** (closures must not bury real hotspots).
-   - If the FP count approaches the #55 ~76-site scale (say **> 50**) or churn exceeds the ceiling, that **data** (not a re-argued opinion) reopens Q5 for the follow-up re-containment (option b) — **do not build (b) here regardless**; record the finding and let review decide merge-vs-defer.
-   - **Deferred fix (c) trigger:** if metric (v) bare-name edge loss is **material** (pre-register: **> 10 edges** across the two corpora), the dogfood doc's deferred paragraph (below) flags (c) as the recommended future enhancement — still **not built or issue-opened in #83**.
+**Corpora — THREE concrete, all local (no vendoring, no "operator supplies a checkout" placeholder):**
+- **(a) the fxrank workspace itself** (`cargo run -p fxrank -- scan crates/`) — the visitor/detector profile, and the **031 compat baseline** (this same scan is 031's before/after reference).
+- **(b) `~/GitHub/agent-browser/cli`** — ~64k lines, ~2,865 closures, **iterator- and async-heavy** (39 async files, 67 `spawn`). This is the **TP calibration** corpus and the real exercise of the async-`||` (F-async) path — its `spawn`/`async`-moved closures are the escaping TPs the FP definition must keep classifying as TP.
+- **(c) `~/GitHub/ripgrep`** (already cloned) — ~53k lines, ~439 closures, **pure-synchronous** (0 async, 5 `spawn`). This is the **morally-local FP ceiling**: almost every closure is a synchronously-consumed iterator/sort-key, so ripgrep's FP rate *is* the upper bound of the "looks captured, is really local" case.
 
-- [ ] **Step 1: Write `docs/032-nested-unit-dogfood.md`** with the pre-registered items above **filled in as the protocol** (five metrics, concrete thresholds, empty results tables), committed **before** the scan — so the design is on record. **Include a short "Deferred: scope-aware CALL resolution (option c)" paragraph** stating: (c) is the call-graph twin of #78's binding shadowing, lives in core `resolve.rs`, is a *possible future cross-language enhancement*, is **gated by metric (v)** (bare-name edge-loss magnitude) as its trigger evidence, is **not opened as an issue** and **does not block closing #78**, and D-OQ2 deliberately accepts the current bare-name ambiguity (rejecting exclusion option b as a false-resolve trap).
-- [ ] **Step 2: Run** `cargo run -p fxrank -- scan crates/` and the chosen external crate; tabulate the FP/TP split, the two extra metrics, and the top-20 churn.
-- [ ] **Step 3: Fill results** into the doc; classify each residual `captured-binding` as FP/TP per the definition; state the merge verdict against the fixed thresholds (ship (a) / flag for review).
-- [ ] **Step 4: Verify** — `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check` all clean; the doc is complete (no TBDs).
-- [ ] **Step 5: Commit** — `docs(rust): pre-registered closure FP-rate dogfood gate + results (#83)`
+**FP definition (final — escape-based; supersedes the earlier "consumed synchronously in the same expression" wording AND folds in F6 "local OR parameter").** An emitted `<closure@…>` (or binding-named) unit's `captured-binding` emission counts as a **false positive** iff **both** hold:
+1. the captured binding is a **local OR parameter** of the immediately-enclosing fn (F6 — not just a local), **AND**
+2. the closure **does not escape** the enclosing fn.
+
+Concretely, **non-escaping ⇒ FP**: `.map(|x| acc.push(..))`, `.sort_by`, `.for_each`, and `let f = |..|; f()` where `f` is called within the **same** fn. **Escaping ⇒ true positive** (NOT a FP): the closure is passed to `thread::spawn` / `std::thread`, **returned** from the fn, **stored** into a struct/collection that outlives the call, or **moved into an `async`/task** that runs elsewhere. Decide per-site by the closure's escape context, not by the mutation itself.
+
+**Gate & metrics — pre-registered BEFORE scanning:**
+- **Gate (the one merge criterion):** total closure `captured-binding` **FP ≤ 20** across the three corpora ⇒ ship Q5(a) as-is. **FP > 50 ⇒ reopen Q5**, and the reopen lever is named explicitly: **Q5 option (b) — fold re-containment** (re-attribute the captured mutation back to the *owning* unit). This is **NOT** the deferred (c) scope-aware *call* resolution — (c) is the orthogonal bare-name edge-drop concern; (b) is the FP lever. **Neither (b) nor (c) is built in #83** regardless of the number; a breach records the finding and hands the merge-vs-defer decision to review.
+- **Diagnostics (reported, NOT gates)** — four numbers that characterize the change without blocking merge:
+  1. **Per-corpus FP-rate** — FP ÷ all `captured-binding` emissions, per corpus. **ripgrep's rate is the morally-local ceiling** (report it as such).
+  2. **Top-20 hotspot closure share** — the fraction of top-20 hotspots that are `<closure@…>` units (re-homing/ranking churn); **flag if > 25%** (closures burying real hotspots), but do not gate on it.
+  3. **Concern-1 dilution** — the count of parent units that **drop ≥1 effect class** purely because an effect re-homed to a nested unit (a parent looking "cleaner" only because its effect moved).
+  4. **Bare-name edge loss (the OQ2 "metric 5", D-OQ2)** — the count of resolvable bare-name call edges **lost pre-#83 vs post-#83** *specifically because a nested unit newly shares a simple name with a module-level unit* (a `helper()` that resolved before #83 now ambiguous-drops). This magnitude — reported, not gated — is the **trigger evidence** for the deferred scope-aware CALL resolution (c); it is not a reason to build (c) in #83.
+
+- [ ] **Step 1: Write `docs/032-nested-unit-dogfood.md`** with the pre-registered protocol above **filled in** (three corpora, escape-based FP definition, the single FP ≤ 20 gate + the > 50 reopen lever = Q5 option (b), the four diagnostics, empty results tables), committed **before** the scan — so the design is on record and doubles as 031's compat baseline. **Include a "Deferred: scope-aware CALL resolution (option c)" paragraph** stating: (c) is the call-graph twin of #78's binding shadowing, lives in core `resolve.rs`, is a *possible future cross-language enhancement*, is **gated by diagnostic 4** (bare-name edge-loss magnitude) as its trigger evidence, is **not opened as an issue** and **does not block closing #78**, and D-OQ2 deliberately accepts the current bare-name ambiguity (rejecting exclusion option b as a false-resolve trap). **Cross-link the `cross-file-resolution-guideline.md` "Deferred" section already committed on `main`** so the deferred (c) note is anchored to the shared guideline, not orphaned in this plan.
+- [ ] **Step 2: Run** `cargo run -p fxrank -- scan crates/` (self), then `~/GitHub/agent-browser/cli` and `~/GitHub/ripgrep`; tabulate the FP/TP split per corpus, the four diagnostics, and the top-20 churn. Classify each `captured-binding` FP/TP by the **escape** test above (local-OR-param + non-escaping = FP).
+- [ ] **Step 3: Fill results** into the doc; sum FP across the three corpora against the **FP ≤ 20** gate; if **> 50**, record the finding and name Q5 option (b) fold re-containment as the reopen lever (do NOT build it). Report diagnostic 4's magnitude in the deferred-(c) paragraph.
+- [ ] **Step 4: Verify** — `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check` all clean; the doc is complete (no TBDs; all three corpora scanned; gate verdict stated).
+- [ ] **Step 5: Commit** — `docs(rust): pre-registered closure FP-count dogfood gate + results (#83)`
 
 ---
 
@@ -544,7 +582,7 @@ Q5(a) ships per-closure `hidden.mutation "captured-binding"`; the **merge gate**
 - Enclosing own-body walk must not descend into a nested unit → Task 4 (boundary; **Option A** — 12 no-ops across the six walkers incl. `AwaitCounter`; F-refs adds the sixth walker to the fixture). ✓
 - Nested effects reach the caller only via the 025 fold → Task 5 (binding-named edges, corpus-unique caveat; the TWO distinct inline-HOF non-reappearances — `.map` method-drop vs `spawn(cl)` no-edge-from-value — documented, F-prop-claims). ✓
 - The TS-only React absorption has no Rust analogue / not in scope → N2, Task 4. ✓
-- Q5(a) settled = per-closure `hidden.mutation "captured-binding"`; merge gate = dogfood → Task 6 (pre-registered, concrete thresholds), N1 (031 only renames the origin later). ✓
+- Q5(a) settled = per-closure `hidden.mutation "captured-binding"`; merge gate = dogfood → Task 6 (pre-registered escape-based FP def, three local corpora, single **FP ≤ 20** gate + four reported diagnostics), N1 (031 only renames the origin later). ✓
 - 031 dependency (post-#83 baseline) → header (+ branch/rebase mechanics, F-branch) + N1 + Task 6 doubling as the 031 compat artifact. ✓
 
 **Fable condition → task mapping** (all five, test-first):
@@ -553,7 +591,7 @@ Q5(a) ships per-closure `hidden.mutation "captured-binding"`; the **merge gate**
 3. Nested-unit identity guard (empty `canonical_path`, D-OQ2 name-index accept, same-name regression pins, **module_context_of** for `referencing_mod`, Blocker 3) → Task 3. ✓
 4. Detector boundary (item + closure no-op, **Option A settled**, single cross-detector fixture asserting all six walkers, `async {}` scope-noted + F-async fixture + F-3level fixture, F-guideline prose fix) → Task 4. ✓
 5. Records + propagation + written trade-offs (corpus-unique edge; `.map` vs `spawn(cl)` distinction; strengthened inline-HOF post-fold assertion; untyped-closure-param known-FN) → Task 5. ✓
-6. Pre-registered Q5 dogfood gate (FP def, named corpus `ripgrep`, FIVE metrics incl. D-OQ2 edge-loss, concrete thresholds, deferred-(c) paragraph, `008-dogfood-deltas.md`-style doc) → Task 6. ✓
+6. Pre-registered Q5 dogfood gate (escape-based FP def folding F6; THREE local corpora — fxrank/agent-browser/ripgrep; single **FP ≤ 20** gate with the **> 50 ⇒ reopen** lever named as Q5 option (b) fold re-containment; four reported diagnostics incl. the D-OQ2 bare-name edge-loss; deferred-(c) paragraph cross-linked to `cross-file-resolution-guideline.md`; `008-dogfood-deltas.md`-style doc) → Task 6. ✓
 
 **Sequencing (F-sequencing):** reshape → collection (unit-level tests only, **no snapshot acceptance**) → identity guard → detector boundary (**Option A — the only snapshot-accepting task**) → records/propagation → dogfood, each test-first (red fixture, then implement), one logical step. The **transient double-count between Task 2 and Task 4 is live** (Option A is its own task, not folded into collection); it is called out in Task 2, and the branch **never records an intermediate wrong-attribution snapshot** — acceptance is gated to Task 4.
 
@@ -561,7 +599,7 @@ Q5(a) ships per-closure `hidden.mutation "captured-binding"`; the **merge gate**
 
 **Decisions settled in review — encoded above, NOT reopened here** (former OQ1–OQ5, now final):
 - **OQ1 → SETTLED (Task 1 / Blocker 2).** The closure-param `is_mut` seam is resolved by the `FnSig.is_closure` discriminant: a closure unit seeds its by-value `mut` params via `seed_pat_locals` (honoring `is_mut → let_mut`, reproducing today's behavior byte-for-byte); a named fn stays silent (spec 031 Q1). Guarded by `cargo insta` byte-identity outside the closure fixtures. Cross-branch: 031 §4.2/§4.3 must sync when it rebases (coordination item, not edited here).
-- **OQ2 → SETTLED (D-OQ2 = accept + measure).** Mirror Python: accept the bare-name name-index ambiguity (symmetric ambiguous-drop). Reject exclusion option (b) as a false-resolve trap. The correct fix (c) is documented-only, gated by Task-6 metric (v), not issue-opened, and does not block closing #78.
+- **OQ2 → SETTLED (D-OQ2 = accept + measure).** Mirror Python: accept the bare-name name-index ambiguity (symmetric ambiguous-drop). Reject exclusion option (b) as a false-resolve trap. The correct fix (c) is documented-only, gated by Task-6 diagnostic 4 (bare-name edge loss), not issue-opened, and does not block closing #78.
 - **OQ3 → SETTLED (D-Boundary = Option A).** Per-walker no-ops (12 overrides), not the collection-time prune (Option B dropped — it leaked closure-param seeding and in-body `Item::Mod` double-counts; Option A dissolves both). Accepted cost: future detectors must remember both no-ops.
 - **OQ4 → SETTLED (N4 + F-async).** Bare `async {}` / `tokio::spawn(async move {})` stay parent-attributed (awaits included — they are `ExprAsync`, untouched by the no-ops); an `async ||` closure is its own async-boundary unit. F-async fixture pins both await counts and the parent-refs exclusion.
-- **OQ5 → SETTLED (F-thresholds).** Concrete pre-registered thresholds (FP count ≤ 20 & rate ≤ 25%; top-20 closure share ≤ 25%; reopen-Q5 trigger > 50; defer-(c) trigger metric (v) > 10). The dogfood **data**, not a re-argued opinion, decides ship-(a)-now vs defer — but (b)/(c) are not built in #83 regardless.
+- **OQ5 → SETTLED (settled dogfood methodology).** One pre-registered **gate**: total closure `captured-binding` **FP ≤ 20** across the three local corpora ⇒ ship Q5(a); **FP > 50 ⇒ reopen Q5**, lever named as **Q5 option (b) — fold re-containment** (NOT the deferred (c) call resolution). The other four numbers — per-corpus FP-rate (ripgrep = morally-local ceiling), top-20 closure share (flag if > 25%), concern-1 dilution, and the D-OQ2 bare-name edge loss — are **reported diagnostics, not gates**. The dogfood **data**, not a re-argued opinion, decides ship-(a)-now vs defer — but (b)/(c) are not built in #83 regardless.
