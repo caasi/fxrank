@@ -2,7 +2,7 @@
 
 Status: **Draft** · Issue: #78 (Rust step; #55 is the symptom catalogue) · Milestone: A (syntactic only)
 
-**Depends on:** a paired sibling issue (to be filed) — *Rust nested-unit collection
+**Depends on:** #83 — *Rust nested-unit collection
 alignment* — which brings `functions::collect` into line with the Python and TS
 frontends by making nested `fn`s **and** closures their own `UnitRecord`s (§1.1).
 This spec's per-file scope tree (§4.4), its `EnclosingCaptured` handling, and its
@@ -83,7 +83,7 @@ them:
 Rust is the **outlier**: `collect_items` recurses only into `Item::Mod`, never
 into `fn` bodies or closures, so a nested `fn`/closure is walked as part of its
 enclosing unit and its effects fold into that unit's own-body. **This spec
-depends on bringing Rust in line** — the paired sibling issue *Rust nested-unit
+depends on bringing Rust in line** — the paired sibling issue #83 *Rust nested-unit
 collection alignment*, which:
 
 1. makes `functions::collect` **descend into `fn` bodies and closures**, emitting
