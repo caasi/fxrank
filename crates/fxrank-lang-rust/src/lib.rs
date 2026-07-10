@@ -187,4 +187,99 @@ mod tests {
              not Edge::Resolved to Foo::write — false-resolve not killed"
         );
     }
+
+    /// #83 Task 5: a binding-named closure `let writer = || io();` becomes its
+    /// own unit (Task 2) with `symbol == "writer"`; the parent's `writer()` call
+    /// site is a `RefKind::Free` ref that must resolve to the closure's own unit
+    /// (the 025 fold then re-surfaces the closure's escaping IO on the parent).
+    /// Corpus-unique name → no D-OQ2 ambiguity.
+    #[test]
+    fn binding_named_closure_call_produces_edge() {
+        use fxrank_core::frontend::SourceFile;
+        use fxrank_core::graph::Edge;
+        use fxrank_core::resolve::{CanonicalIndex, resolve_ref_precise};
+        let files = vec![SourceFile {
+            path: "src/lib.rs".into(),
+            text: "pub fn parent() { let writer = || { std::fs::write(\"a\", b\"x\").unwrap(); }; writer(); }".into(),
+        }];
+        let out = crate::RustFrontend::default().analyze(&files);
+        let idx = CanonicalIndex::from_records(&out.records);
+        let parent = out.records.iter().find(|r| r.symbol == "parent").unwrap();
+        let call = parent
+            .refs
+            .iter()
+            .find(|r| r.base == "writer")
+            .expect("writer() ref");
+        assert!(
+            matches!(
+                resolve_ref_precise(call, &idx, &parent.path),
+                Some(Edge::Resolved(_))
+            ),
+            "writer() must resolve to the closure's own unit"
+        );
+    }
+
+    /// #83 Task 5: an inline `.map(|x| io(x))` closure's IO must NOT reappear on
+    /// the parent. Two distinct assertions: (1) the `.map` ref is `RefKind::Method`
+    /// → hard-dropped in `resolve_ref`, so no resolvable Free parent edge (N2);
+    /// (2) after the REAL fold, the parent's propagated max_class == its own
+    /// max_class (no closure effect propagates). `to_hotspots`/`boundary_summary`
+    /// are `#[cfg(test)]` inside fxrank-core (not callable cross-crate), so the
+    /// propagated stats are read from the pub `Propagated` fields via
+    /// `score::max_class`, mirroring core's `propagated_gte_own_for_contained_only_unit`.
+    #[test]
+    fn inline_map_closure_io_does_not_reappear_on_parent() {
+        use fxrank_core::frontend::SourceFile;
+        let files = vec![SourceFile {
+            path: "src/lib.rs".into(),
+            text: "pub fn parent(xs: Vec<i32>) { let _: Vec<_> = xs.iter().map(|x| { std::fs::write(\"a\", b\"x\").ok(); x }).collect(); }".into(),
+        }];
+        let out = crate::RustFrontend::default().analyze(&files);
+        let parent = out.records.iter().find(|r| r.symbol == "parent").unwrap();
+        // (1) The `.map` ref is RefKind::Method → hard-dropped: no resolved edge.
+        assert!(
+            parent
+                .refs
+                .iter()
+                .all(|r| !matches!(r.kind, fxrank_core::record::RefKind::Free) || r.base != "map"),
+            "the .map closure must not become a resolvable parent edge (N2)"
+        );
+        // (2) After the REAL fold, no closure effect/class reaches the parent — its
+        //     propagated max_class stays == its own max_class.
+        use fxrank_core::{
+            fold::fold,
+            graph::CallGraph,
+            resolve::{CanonicalIndex, resolve_ref_precise},
+            score,
+        };
+        let idx = CanonicalIndex::from_records(&out.records);
+        // `from_records` passes the OWNING `&UnitRecord` (graph.rs:38-41), so the
+        // owner→path is `owner.path` — NOT `owner.split(':')`.
+        let g = CallGraph::from_records(out.records.clone(), |r, owner, _nodes| {
+            resolve_ref_precise(r, &idx, &owner.path)
+        });
+        let folded = fold(&g);
+        let parent_rec = out.records.iter().find(|r| r.symbol == "parent").unwrap();
+        let p = folded
+            .get(&parent_rec.unit_id)
+            .expect("parent in fold output");
+        // propagated_max_class from the pub Propagated fields:
+        let prop_classes: Vec<u8> = p.effects.iter().map(|e| e.effective_class()).collect();
+        let prop_risk = p.risks.iter().map(|r| r.class).max().unwrap_or(0);
+        let propagated_max_class = score::max_class(&prop_classes, prop_risk);
+        // own_max_class from the parent's OWN record (own-body fields, untouched by fold):
+        let own_classes: Vec<u8> = parent_rec
+            .effects
+            .iter()
+            .map(|e| e.effective_class())
+            .collect();
+        let own_risk = parent_rec.risks.iter().map(|r| r.class).max().unwrap_or(0);
+        let own_max_class = score::max_class(&own_classes, own_risk);
+        // Load-bearing: parent's propagated == its own (no closure effect propagated).
+        assert_eq!(
+            propagated_max_class, own_max_class,
+            "no closure effect/class may propagate to the parent from an inline .map (N2); \
+             own={own_max_class} propagated={propagated_max_class}"
+        );
+    }
 }
