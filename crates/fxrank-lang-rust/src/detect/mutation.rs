@@ -37,18 +37,18 @@ use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
-/// Detect mutation effects in `block`, seeding binding sets from `sig`.
+/// Detect mutation effects in `body`, seeding binding sets from `sig`.
 ///
 /// `statics` is the file-level set of real `static` item names; `imports` is the
 /// `use`-table. Both feed `record_write`'s base-resolution cascade.
 pub fn detect<'a>(
-    block: &syn::Block,
-    sig: &syn::Signature,
+    body: &crate::functions::FnBodyOwned,
+    sig: &crate::functions::FnSig,
     statics: &'a HashSet<String>,
     imports: &'a ImportTable,
 ) -> Vec<Effect> {
     let mut walker = MutationWalker::seed(sig, statics, imports);
-    walker.visit_block(block);
+    body.walk_with(&mut walker);
     walker.effects
 }
 
@@ -75,7 +75,11 @@ struct MutationWalker<'a> {
 }
 
 impl<'a> MutationWalker<'a> {
-    fn seed(sig: &syn::Signature, statics: &'a HashSet<String>, imports: &'a ImportTable) -> Self {
+    fn seed(
+        sig: &crate::functions::FnSig,
+        statics: &'a HashSet<String>,
+        imports: &'a ImportTable,
+    ) -> Self {
         let mut w = MutationWalker {
             mut_params: HashSet::new(),
             mut_self: false,
@@ -83,38 +87,42 @@ impl<'a> MutationWalker<'a> {
             let_mut: HashSet::new(),
             locals: HashSet::new(),
             unsafe_depth: 0,
-            unsafe_fn: sig.unsafety.is_some(),
+            unsafe_fn: sig.unsafety,
             statics,
             imports,
             effects: Vec::new(),
         };
-        for input in &sig.inputs {
-            match input {
-                syn::FnArg::Receiver(recv) => {
-                    // `&self` / `&mut self` both have `reference = Some`.
-                    if recv.reference.is_some() {
-                        if recv.mutability.is_some() {
-                            w.mut_self = true;
-                        } else {
-                            w.shared_refs.insert("self".to_string());
-                        }
-                    }
-                    w.locals.insert("self".to_string());
+        // Receiver (method `self`) — seed exactly as the old `FnArg::Receiver` arm.
+        if let Some(recv) = &sig.receiver {
+            // `&self` / `&mut self` both have `reference = Some`.
+            if recv.reference.is_some() {
+                if recv.mutability.is_some() {
+                    w.mut_self = true;
+                } else {
+                    w.shared_refs.insert("self".to_string());
                 }
-                syn::FnArg::Typed(pat_type) => {
-                    let mut bindings = Vec::new();
-                    collect_pat_bindings(&pat_type.pat, &mut bindings);
-                    for (name, _is_mut) in bindings {
-                        w.locals.insert(name.clone());
-                        match &*pat_type.ty {
-                            syn::Type::Reference(r) if r.mutability.is_some() => {
-                                w.mut_params.insert(name);
-                            }
-                            syn::Type::Reference(_) => {
-                                w.shared_refs.insert(name);
-                            }
-                            _ => {}
+            }
+            w.locals.insert("self".to_string());
+        }
+        // Params. Named fns/methods route through the silent signature path
+        // (by-value `mut` discarded, spec 031 Q1); closures honor `is_mut →
+        // let_mut` via `seed_pat_locals` (inert here — no closures in Task 1).
+        for pat in &sig.inputs {
+            if sig.is_closure {
+                w.seed_pat_locals(pat);
+            } else if let syn::Pat::Type(pat_type) = pat {
+                let mut bindings = Vec::new();
+                collect_pat_bindings(&pat_type.pat, &mut bindings);
+                for (name, _is_mut) in bindings {
+                    w.locals.insert(name.clone());
+                    match &*pat_type.ty {
+                        syn::Type::Reference(r) if r.mutability.is_some() => {
+                            w.mut_params.insert(name);
                         }
+                        syn::Type::Reference(_) => {
+                            w.shared_refs.insert(name);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -505,15 +513,9 @@ mod tests {
         let file = syn::parse_file(src).unwrap();
         let imports = ImportTable::from_file(&file);
         let statics = HashSet::new();
-        let item_fn = file
-            .items
-            .iter()
-            .find_map(|it| match it {
-                syn::Item::Fn(f) => Some(f),
-                _ => None,
-            })
-            .expect("expected one fn");
-        detect(&item_fn.block, &item_fn.sig, &statics, &imports)
+        let units = crate::functions::collect(&file, "t.rs");
+        let unit = units.first().expect("expected one fn");
+        detect(&unit.body, &unit.sig, &statics, &imports)
             .iter()
             .map(|e| e.kind)
             .collect()

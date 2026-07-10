@@ -33,19 +33,21 @@ use syn::visit::Visit;
 ///
 /// `path` is the source-file path (the file the risk lives in, as passed
 /// into the frontend); it is stored in every emitted `RiskFeature`.
-pub fn detect_fn_risks(block: &syn::Block, sig: &syn::Signature, path: &str) -> Vec<RiskFeature> {
+pub fn detect_fn_risks(
+    body: &crate::functions::FnBodyOwned,
+    sig: &crate::functions::FnSig,
+    path: &str,
+) -> Vec<RiskFeature> {
     let mut walker = RiskWalker {
         path: path.to_string(),
         unsafe_depth: 0,
-        fn_is_unsafe: sig.unsafety.is_some(),
+        fn_is_unsafe: sig.unsafety,
         features: Vec::new(),
     };
 
-    // `unsafe fn` → UnsafeFn (class 5, Exact).
-    if sig.unsafety.is_some() {
-        let loc = sig.span().start();
-        let line = loc.line;
-        let col = loc.column + 1;
+    // `unsafe fn` → UnsafeFn (class 5, Exact). The anchor is precomputed at
+    // collection time from `sig.span().start()` (Some only for an `unsafe fn`).
+    if let Some((line, col)) = sig.unsafe_anchor {
         walker.push(
             RiskKind::UnsafeFn,
             Tier::Exact,
@@ -55,7 +57,7 @@ pub fn detect_fn_risks(block: &syn::Block, sig: &syn::Signature, path: &str) -> 
         );
     }
 
-    walker.visit_block(block);
+    body.walk_with(&mut walker);
     walker.features
 }
 

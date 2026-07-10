@@ -1259,6 +1259,7 @@ fn cfg_test_module_risks_skipped_by_default() {
 #[test]
 fn mutation_detect_accepts_statics_and_imports() {
     use fxrank_lang_rust::detect::mutation;
+    use fxrank_lang_rust::functions;
     use fxrank_lang_rust::imports::ImportTable;
     use std::collections::HashSet;
 
@@ -1266,16 +1267,12 @@ fn mutation_detect_accepts_statics_and_imports() {
     let imports = ImportTable::from_file(&file);
     let statics: HashSet<String> = ["FOO".to_string()].into_iter().collect();
 
-    let item_fn = file
-        .items
-        .iter()
-        .find_map(|it| match it {
-            syn::Item::Fn(f) if f.sig.ident == "f" => Some(f),
-            _ => None,
-        })
-        .expect("fn f");
+    // Build the unit through the real container so `&unit.body`/`&unit.sig`
+    // exercise the normalized `FnBodyOwned`/`FnSig` shape.
+    let units = functions::collect(&file, "t.rs");
+    let unit = units.iter().find(|u| u.symbol == "f").expect("fn f");
 
-    let effects = mutation::detect(&item_fn.block, &item_fn.sig, &statics, &imports);
+    let effects = mutation::detect(&unit.body, &unit.sig, &statics, &imports);
     assert!(
         effects.iter().any(|e| e.kind.wire() == "local.mutation"),
         "local write still detected after signature change"

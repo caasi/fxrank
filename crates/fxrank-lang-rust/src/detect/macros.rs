@@ -20,12 +20,12 @@ use fxrank_core::score::weight_for_class;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
-/// Detect macro-invocation effects in `block`.
-pub fn detect(block: &syn::Block) -> Vec<Effect> {
+/// Detect macro-invocation effects in `body`.
+pub fn detect(body: &crate::functions::FnBodyOwned) -> Vec<Effect> {
     let mut walker = MacroWalker {
         effects: Vec::new(),
     };
-    walker.visit_block(block);
+    body.walk_with(&mut walker);
     walker.effects
 }
 

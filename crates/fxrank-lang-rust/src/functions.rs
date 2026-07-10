@@ -8,16 +8,103 @@
 //!
 //! Bodyless trait signatures (`fn required(&self);`) are NOT units — skip them.
 //!
-//! The `FnUnit` struct retains `sig` and `block` so that later detector tasks
-//! (T11–T15) can walk the body without re-parsing. Access pattern: callers that
-//! need effect detection import `FnUnit` from `fxrank_lang_rust::functions` and
-//! walk `.block`; the `Frontend` impl maps `FnUnit` to `Hotspot` for scoring.
+//! The `FnUnit` struct retains a normalized `sig` (`FnSig`) and `body`
+//! (`FnBodyOwned`) so that detector tasks can walk the body without re-parsing.
+//! Access pattern: callers that need effect detection import `FnUnit` from
+//! `fxrank_lang_rust::functions` and drive `.body.walk_with(&mut visitor)`; the
+//! `Frontend` impl maps `FnUnit` to `Hotspot` for scoring.
 
+use syn::spanned::Spanned;
 use syn::{ImplItem, Item, ItemImpl, ItemTrait, TraitItem};
 
+/// A normalized, owned function signature.
+///
+/// Unifies a named fn/method (`syn::Signature`) and a closure (`ExprClosure`,
+/// added in Task 2) into one shape. A named fn/method's typed params become
+/// `Pat::Type(PatType{ pat, ty })` (so the `&mut`/`&` type stays available for
+/// mutation seeding) and its receiver is split out into `receiver`; a closure's
+/// params are its `Punctuated<Pat>` as-is with `receiver = None`. This is the
+/// syn analog of the swc `FnSig { params: Vec<Pat> }` (see
+/// `fxrank-lang-ts/src/functions.rs`).
+#[derive(Clone)]
+pub struct FnSig {
+    /// Method receiver (`self`/`&self`/`&mut self`), else `None`. Free fns and
+    /// closures have none — handled SEPARATELY from `inputs`.
+    pub receiver: Option<syn::Receiver>,
+    /// Parameter *patterns*. A named fn/method's typed param is a
+    /// `Pat::Type(PatType{ pat, ty })`; a closure's params are its bare
+    /// `Punctuated<Pat>` (possibly untyped `Pat::Ident`).
+    pub inputs: Vec<syn::Pat>,
+    /// True when the fn/method is `unsafe`. (Closures are never unsafe.)
+    pub unsafety: bool,
+    /// True when the fn/method/closure is `async`.
+    pub asyncness: bool,
+    /// True ONLY for a closure unit. The mutation seed uses it to route a
+    /// closure's by-value `mut` param into `let_mut`; a named fn's by-value
+    /// `mut` param stays silent. Distinct from `FnUnit`-level nesting identity.
+    pub is_closure: bool,
+    /// `sig.span().start()` mapped to `(line, col+1)` for the `UnsafeFn` risk
+    /// anchor — `Some` only for an `unsafe fn`; `None` otherwise (incl. closures).
+    pub unsafe_anchor: Option<(usize, usize)>,
+}
+
+impl FnSig {
+    /// Build a `FnSig` from a named fn/method `syn::Signature`: the receiver is
+    /// split out, each `FnArg::Typed(pt)` becomes `Pat::Type(pt.clone())`, and
+    /// `unsafe_anchor` reproduces `risk.rs`'s old `sig.span().start()` anchor
+    /// byte-for-byte (only for an `unsafe fn`).
+    fn from_signature(sig: &syn::Signature) -> Self {
+        let mut receiver = None;
+        let mut inputs = Vec::new();
+        for input in &sig.inputs {
+            match input {
+                syn::FnArg::Receiver(r) => receiver = Some(r.clone()),
+                syn::FnArg::Typed(pt) => inputs.push(syn::Pat::Type(pt.clone())),
+            }
+        }
+        let unsafety = sig.unsafety.is_some();
+        let unsafe_anchor = if unsafety {
+            let loc = sig.span().start();
+            Some((loc.line, loc.column + 1))
+        } else {
+            None
+        };
+        FnSig {
+            receiver,
+            inputs,
+            unsafety,
+            asyncness: sig.asyncness.is_some(),
+            is_closure: false,
+            unsafe_anchor,
+        }
+    }
+}
+
+/// The owned body of a function unit.
+///
+/// A named fn/method carries a `syn::Block`; a closure (Task 2) may carry a bare
+/// expression. Detectors walk whichever variant is present via [`Self::walk_with`]
+/// (the syn analog of the swc `FnBodyOwned::walk_with`).
+pub enum FnBodyOwned {
+    /// A `{ … }` block (fn declarations, impl/trait methods, block-bodied closures).
+    Block(syn::Block),
+    /// A bare expression body, e.g. the `x + 1` in `|x| x + 1`.
+    Expr(Box<syn::Expr>),
+}
+
+impl FnBodyOwned {
+    /// Drive a syn `Visit` over this body (the block, or the single expr).
+    pub fn walk_with<'ast, V: syn::visit::Visit<'ast>>(&'ast self, v: &mut V) {
+        match self {
+            FnBodyOwned::Block(b) => v.visit_block(b),
+            FnBodyOwned::Expr(e) => v.visit_expr(e),
+        }
+    }
+}
+
 /// A concrete function unit — a named item with a body that can be analysed for
-/// effects. `sig` and `block` are kept verbatim so detectors in `detect/` can
-/// walk them without re-parsing.
+/// effects. `sig` and `body` are normalized owned clones so detectors in
+/// `detect/` can walk them without re-parsing.
 pub struct FnUnit {
     /// Display symbol: `free_fn`, `S::method`, `<S as T>::method`, `T::defaulted`.
     pub symbol: String,
@@ -29,10 +116,11 @@ pub struct FnUnit {
     pub line: usize,
     /// 1-based character column of the function's name (`sig.ident`).
     pub col: usize,
-    /// The full function signature (for detectors to inspect attributes, asyncness, etc.).
-    pub sig: syn::Signature,
-    /// The function body (for detectors to walk expressions in T11–T15).
-    pub block: syn::Block,
+    /// The normalized function signature (for detectors to inspect asyncness,
+    /// unsafety, receiver/params for mutation seeding, etc.).
+    pub sig: FnSig,
+    /// The normalized function body (for detectors to walk expressions).
+    pub body: FnBodyOwned,
     /// Whether this function is test code: `#[test]`/`#[bench]`, or carrying a bare
     /// `#[cfg(test)]` (on the fn, its `impl`/`trait` block, or an enclosing module).
     /// Computed at collection time; test units are excluded from scoring by default.
@@ -102,8 +190,8 @@ fn collect_items(
                     path: path.to_string(),
                     line,
                     col,
-                    sig: f.sig.clone(),
-                    block: *f.block.clone(),
+                    sig: FnSig::from_signature(&f.sig),
+                    body: FnBodyOwned::Block(*f.block.clone()),
                     is_test,
                     mod_path: mod_path.to_vec(),
                 });
@@ -171,8 +259,8 @@ fn collect_from_impl(
                 path: path.to_string(),
                 line,
                 col,
-                sig: method.sig.clone(),
-                block: method.block.clone(),
+                sig: FnSig::from_signature(&method.sig),
+                body: FnBodyOwned::Block(method.block.clone()),
                 is_test,
                 mod_path: mod_path.to_vec(),
             });
@@ -207,8 +295,8 @@ fn collect_from_trait(
                     path: path.to_string(),
                     line,
                     col,
-                    sig: method.sig.clone(),
-                    block: block.clone(),
+                    sig: FnSig::from_signature(&method.sig),
+                    body: FnBodyOwned::Block(block.clone()),
                     is_test,
                     mod_path: mod_path.to_vec(),
                 });
@@ -286,5 +374,32 @@ mod tests {
         assert!(is_test("c"), "#[tokio::test] must be test");
         assert!(is_test("d"), "#[actix_rt::test] must be test");
         assert!(!is_test("prod"), "a plain fn must not be test");
+    }
+
+    #[test]
+    fn fnsig_and_body_normalize_named_fn() {
+        let file = syn::parse_file("unsafe fn foo(x: &mut i32) { *x += 1; }").unwrap();
+        let units = collect(&file, "a.rs");
+        let u = &units[0];
+        assert_eq!(u.sig.inputs.len(), 1); // one typed param `x` (receiver is separate)
+        assert!(u.sig.receiver.is_none());
+        assert!(!u.sig.is_closure); // a named fn is not a closure
+        assert!(u.sig.unsafety);
+        assert!(!u.sig.asyncness);
+        assert!(matches!(u.body, FnBodyOwned::Block(_)));
+        // walk_with drives a syn visitor over the block.
+        struct Counter(usize);
+        impl<'ast> syn::visit::Visit<'ast> for Counter {
+            fn visit_expr_binary(&mut self, n: &'ast syn::ExprBinary) {
+                self.0 += 1;
+                syn::visit::visit_expr_binary(self, n);
+            }
+        }
+        let mut c = Counter(0);
+        u.body.walk_with(&mut c);
+        assert_eq!(
+            c.0, 1,
+            "walk_with must reach the compound-assign in the body"
+        );
     }
 }

@@ -24,7 +24,7 @@ use syn::visit::Visit;
 /// (calls, and later macros/mutation/risk) don't each hard-code `ImportTable`.
 pub(crate) type Imports = ImportTable;
 
-/// Run every detector over `unit.block` and assemble a scored [`Hotspot`].
+/// Run every detector over `unit.body` and assemble a scored [`Hotspot`].
 ///
 /// The gather step is the extension point: each detector returns `Vec<Effect>`
 /// and they are concatenated.
@@ -33,10 +33,10 @@ pub(crate) type Imports = ImportTable;
 /// `calls::detect` to flag bare static-name path expressions as `ambient.read`.
 pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, statics: &HashSet<String>) -> Hotspot {
     let effects: Vec<Effect> = gather(unit, imports, statics);
-    let risks = risk::detect_fn_risks(&unit.block, &unit.sig, &unit.path);
+    let risks = risk::detect_fn_risks(&unit.body, &unit.sig, &unit.path);
 
-    let is_async = unit.sig.asyncness.is_some();
-    let await_count = count_awaits(&unit.block);
+    let is_async = unit.sig.asyncness;
+    let await_count = count_awaits(&unit.body);
     let async_boundary = is_async || await_count > 0;
 
     let weights: Vec<u32> = effects.iter().map(|e| e.weight).collect();
@@ -74,8 +74,8 @@ pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, statics: &HashSet<Stri
     }
 }
 
-/// Count `expr.await` sites in a block using a simple visitor.
-fn count_awaits(block: &syn::Block) -> usize {
+/// Count `expr.await` sites in a body using a simple visitor.
+fn count_awaits(body: &crate::functions::FnBodyOwned) -> usize {
     struct AwaitCounter(usize);
     impl<'ast> Visit<'ast> for AwaitCounter {
         fn visit_expr_await(&mut self, _node: &'ast syn::ExprAwait) {
@@ -84,16 +84,16 @@ fn count_awaits(block: &syn::Block) -> usize {
         }
     }
     let mut counter = AwaitCounter(0);
-    counter.visit_block(block);
+    body.walk_with(&mut counter);
     counter.0
 }
 
 /// Gather effects from all detectors. New detectors plug in here.
 fn gather(unit: &FnUnit, imports: &ImportTable, statics: &HashSet<String>) -> Vec<Effect> {
     let mut effects = Vec::new();
-    effects.extend(calls::detect(&unit.block, imports, &unit.path, statics));
-    effects.extend(macros::detect(&unit.block));
-    effects.extend(mutation::detect(&unit.block, &unit.sig, statics, imports));
+    effects.extend(calls::detect(&unit.body, imports, &unit.path, statics));
+    effects.extend(macros::detect(&unit.body));
+    effects.extend(mutation::detect(&unit.body, &unit.sig, statics, imports));
     effects
 }
 
@@ -116,12 +116,12 @@ pub fn build_record(
     module_tree: &crate::module_tree::ModuleTree,
 ) -> fxrank_core::record::UnitRecord {
     let effects = gather(unit, imports, statics);
-    let risks = risk::detect_fn_risks(&unit.block, &unit.sig, &unit.path);
-    let await_count = count_awaits(&unit.block);
-    let async_boundary = unit.sig.asyncness.is_some() || await_count > 0;
+    let risks = risk::detect_fn_risks(&unit.body, &unit.sig, &unit.path);
+    let await_count = count_awaits(&unit.body);
+    let async_boundary = unit.sig.asyncness || await_count > 0;
     let canonical_path = canonical_path_of(unit, module_tree);
     let referencing_mod = module_of_unit(&canonical_path, &unit.symbol);
-    let call_refs = refs::extract(&unit.block, imports, &referencing_mod);
+    let call_refs = refs::extract(&unit.body, imports, &referencing_mod);
 
     fxrank_core::record::UnitRecord {
         unit_id: unit.id.clone(),
