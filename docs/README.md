@@ -47,6 +47,18 @@ realization bullet. (The scope-aware-binding-resolution model is **implemented f
 frontend** (plan 030) and remains a **target** for TS/Rust — it follows the same shape so
 each frontend slots in as it is built.)
 
+## Candidate work (documented, not yet filed as issues)
+
+Deferred directions kept issue-ready here so a future maintainer can open them with the
+rationale intact (rather than re-deriving it):
+
+- **Scope-aware call resolution** — the call-graph twin of #78's binding shadowing: make
+  `SymbolIndex` resolution lexically-scoped so a nested unit called from within its enclosing
+  scope resolves precisely instead of ambiguous-dropping against a same-named module-level unit.
+  Full write-up (problem, root cause, design sketch, cross-language cost, gate) in
+  **`cross-file-resolution-guideline.md` → *Deferred — scope-aware call resolution***. Gated by
+  #83's nested-unit dogfood magnitude; not required to close #78.
+
 ## SDD artifacts (`docs/superpowers/`)
 
 Numbered `NNN-*` spec/plan pairs share a 3-digit prefix (`specs/003-*` ↔ `plans/003-*`).

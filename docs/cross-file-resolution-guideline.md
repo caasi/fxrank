@@ -385,3 +385,45 @@ None of these exist in the current core model; spec 025 must add and test them:
 - **A stable site key** `(unit_id, line, col, kind)` for de-duplicating signals across the
   fold — `unit_id` already encodes the path, so the only schema change is `Effect`/`RiskFeature`
   gaining **`col`** (both have `line`); an inherited effect's origin travels in `provenance`.
+
+## Deferred — scope-aware call resolution (candidate issue, not yet filed)
+
+**Status:** a documented future direction, deliberately *not* opened as an issue yet.
+**Gate:** the edge-loss magnitude measured by #83's nested-unit dogfood (see the `032`
+dogfood-deltas doc / its bare-name ambiguous-drop metric). Open an issue when that
+magnitude warrants it — the sketch below is issue-ready.
+
+**Problem.** The call-graph `SymbolIndex` (`fxrank-core/src/resolve.rs`) resolves a call
+site to a callee unit by **flat simple name**, with no lexical-scope awareness. Once nested
+`fn`s / closures are their own units (#83, the cross-language norm), a nested `fn helper`
+and a module-level `helper` share the simple name → a bare `helper()` **ambiguous-drops**
+(`resolve_ref`: `Some(_) => None`). A call that resolves *today* is lost, and the intra-tree
+edge (`outer → outer`'s own nested `helper`) is never recovered. `#83` accepts this
+(it matches the existing shared-core behavior Python/TS already exhibit) and only *measures*
+it; the fix below is the principled resolution.
+
+**Root cause — the call-graph twin of #78.** Same disease #78 fixes for *bindings*, one
+layer up: a **flat name table ignoring lexical scope**. Lexically there is no ambiguity —
+`helper()` inside `outer` denotes `outer`'s nested `helper` (which *shadows* the module-level
+one); `helper()` elsewhere denotes the module-level one. The "ambiguity" is an artifact of the
+scope-blind index. #78 scope-qualifies *bindings* (name → binding, mutation layer, per-frontend
+`scope.rs`); this scope-qualifies *call targets* (call → callee-unit, cross-file `resolve.rs`
+layer — closer to #36's component).
+
+**Design sketch.** Give nested units a **parent-scoped canonical path** (e.g.
+`crate::m::outer::helper`) — unique, and *not* matched by a `use crate::m::helper`, so no
+import false-resolve. The frontend **pre-resolves lexically-visible intra-tree calls** to that
+path via `CallSiteRef.resolved_target`, and nested units are excluded from the flat simple-name
+fallback for *external* callers. Result: intra-tree edges kept, module-level names stay uniquely
+resolvable, **zero regression.** *Rejected alternative:* excluding nested units from the name
+index *without* pre-resolution — that **false-resolves** an intra-tree `helper()` to the
+module-level unit (worse than a drop).
+
+**Cross-language cost (why deferred, not auto-spawned).** The resolution logic lives in
+language-neutral core (`resolve.rs`), so it lands once — but each frontend must emit the nesting
+info (parent-scoped canonical paths / lexical pre-resolution), making it a cross-frontend
+obligation like #78. It is **not** required to close #78 (different layer), so it is deferred
+rather than forked mid-convergence.
+
+**Cross-links:** #78 (the binding twin), #83 (introduces the nested units + the gating metric),
+#36 (cross-file call resolution — closed; this refines it with scope awareness).
