@@ -129,6 +129,13 @@ pub struct FnUnit {
     /// Empty for a top-level item. Combined with the file's module path to form
     /// the canonical path. (025-3e)
     pub mod_path: Vec<String>,
+    /// Whether this unit is nested and therefore has no importable name: any
+    /// closure (unconditionally — even a depth-0 `const`/`static` closure, F8),
+    /// or any named `fn`/method emitted while inside another unit's body. Drives
+    /// canonical-path emptiness (a nested unit gets `vec![]` so it can never
+    /// false-resolve via `CanonicalIndex.primary`). DISTINCT from
+    /// `FnSig.is_closure` (which only routes closure mutation seeding). (#83)
+    pub is_nested: bool,
 }
 
 /// Returns `true` when `attrs` contains a `#[test]`/`#[bench]` attribute, in
@@ -172,6 +179,7 @@ pub fn collect(file: &syn::File, path: &str) -> Vec<FnUnit> {
         units: Vec::new(),
         mod_path: Vec::new(),
         in_test: false,
+        in_unit_body: false,
         type_ctx: None,
         pending_name: None,
     };
@@ -203,6 +211,11 @@ struct Collector<'a> {
     /// True while inside a test unit's body or a `#[cfg(test)]` module — nested
     /// units inherit `is_test` from it.
     in_test: bool,
+    /// True while walking *inside another unit's body* (a fn/method/trait-fn or
+    /// closure body). A named unit emitted with this set is nested → `is_nested`.
+    /// NOT set by `impl`/`trait`/`mod` blocks (those are not unit bodies), so a
+    /// top-level-impl method and a top-level-in-module fn stay non-nested. (#83)
+    in_unit_body: bool,
     /// The enclosing `impl`/`trait` type context (for method symbols).
     type_ctx: Option<TypeCtx>,
     /// Binding name for a closure that is the direct `init` of the `let` being
@@ -211,6 +224,7 @@ struct Collector<'a> {
 }
 
 impl Collector<'_> {
+    #[allow(clippy::too_many_arguments)]
     fn emit(
         &mut self,
         symbol: String,
@@ -219,6 +233,7 @@ impl Collector<'_> {
         sig: FnSig,
         body: FnBodyOwned,
         is_test: bool,
+        is_nested: bool,
     ) {
         let path = self.path;
         self.units.push(FnUnit {
@@ -231,6 +246,7 @@ impl Collector<'_> {
             body,
             is_test,
             mod_path: self.mod_path.clone(),
+            is_nested,
         });
     }
 }
@@ -262,13 +278,17 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
             FnSig::from_signature(&node.sig),
             FnBodyOwned::Block((*node.block).clone()),
             is_test,
+            self.in_unit_body,
         );
         // Recurse into the body so nested fns / methods / closures are collected,
-        // inheriting this unit's test-ness.
+        // inheriting this unit's test-ness and marking them nested.
         let saved_test = self.in_test;
+        let saved_in_unit = self.in_unit_body;
         self.in_test = is_test;
+        self.in_unit_body = true;
         visit::visit_item_fn(self, node);
         self.in_test = saved_test;
+        self.in_unit_body = saved_in_unit;
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
@@ -310,11 +330,15 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
             FnSig::from_signature(&node.sig),
             FnBodyOwned::Block(node.block.clone()),
             is_test,
+            self.in_unit_body,
         );
         let saved_test = self.in_test;
+        let saved_in_unit = self.in_unit_body;
         self.in_test = is_test;
+        self.in_unit_body = true;
         visit::visit_impl_item_fn(self, node);
         self.in_test = saved_test;
+        self.in_unit_body = saved_in_unit;
     }
 
     fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
@@ -349,11 +373,15 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
             FnSig::from_signature(&node.sig),
             FnBodyOwned::Block(block.clone()),
             is_test,
+            self.in_unit_body,
         );
         let saved_test = self.in_test;
+        let saved_in_unit = self.in_unit_body;
         self.in_test = is_test;
+        self.in_unit_body = true;
         visit::visit_trait_item_fn(self, node);
         self.in_test = saved_test;
+        self.in_unit_body = saved_in_unit;
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
@@ -401,9 +429,15 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
         };
         // A closure inherits its enclosing unit's test-ness (never adds any).
         let is_test = self.in_test;
-        self.emit(symbol, line, col, sig, body, is_test);
-        // Recurse so nested closures inside this one are collected.
+        // F8 — a closure is ALWAYS nested: it has no importable name, so it must
+        // never populate `CanonicalIndex.primary`, even at depth 0 (a `const`/
+        // `static` closure like `const ADD: fn(i32)->i32 = |x| x+1;`).
+        self.emit(symbol, line, col, sig, body, is_test, true);
+        // Recurse so nested closures / fns inside this one are collected (nested).
+        let saved_in_unit = self.in_unit_body;
+        self.in_unit_body = true;
         visit::visit_expr_closure(self, node);
+        self.in_unit_body = saved_in_unit;
     }
 }
 

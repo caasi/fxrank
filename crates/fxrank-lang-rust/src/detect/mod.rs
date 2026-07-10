@@ -120,7 +120,7 @@ pub fn build_record(
     let await_count = count_awaits(&unit.body);
     let async_boundary = unit.sig.asyncness || await_count > 0;
     let canonical_path = canonical_path_of(unit, module_tree);
-    let referencing_mod = module_of_unit(&canonical_path, &unit.symbol);
+    let referencing_mod = module_context_of(unit, module_tree);
     let call_refs = refs::extract(&unit.body, imports, &referencing_mod);
 
     fxrank_core::record::UnitRecord {
@@ -142,8 +142,15 @@ pub fn build_record(
 }
 
 /// canonical_path = ["crate"] ++ file-module ++ inline-mod nesting ++ symbol segments.
-/// Returns empty when the file has no module path (no crate root in scope).
+/// Returns empty when the file has no module path (no crate root in scope), OR
+/// when the unit is nested (a nested fn/method or any closure): a nested unit has
+/// no importable name, so an empty path keeps it out of `CanonicalIndex.primary`
+/// (`from_records` skips empty paths) — it can neither false-resolve a
+/// `use crate::m::helper` nor collide with a real module-level `helper`. (#83)
 fn canonical_path_of(unit: &FnUnit, module_tree: &crate::module_tree::ModuleTree) -> Vec<String> {
+    if unit.is_nested {
+        return vec![];
+    }
     let Some(file_mod) = module_tree.module_of(&unit.path) else {
         return vec![];
     };
@@ -154,17 +161,23 @@ fn canonical_path_of(unit: &FnUnit, module_tree: &crate::module_tree::ModuleTree
     segs
 }
 
-/// The module a unit lives in = its canonical_path minus the symbol segments.
-/// Returns an EMPTY vec for an empty canonical_path (a root-less file): callers
-/// pass it to `resolve_in_crate`, which returns `None` for self/super when the
-/// module is empty — so we never fabricate a `["crate"]` anchor that could
-/// false-resolve. (025-3e §6)
-fn module_of_unit(canonical: &[String], symbol: &str) -> Vec<String> {
-    if canonical.is_empty() {
+/// The module a unit lives in, computed DIRECTLY from the file module + inline
+/// `mod` nesting — independent of the (possibly-empty) canonical path.
+///
+/// Blocker 3 (#83): a nested unit's canonical_path is empty, so deriving the
+/// referencing module from it (the old `module_of_unit`) would strip a
+/// `self::`/`super::` ref inside the nested body of its anchor. A nested unit
+/// lives in the SAME module as its enclosing fn (Rust fn-local items open no new
+/// module path — `mod_path` tracks only inline `mod` blocks), so we anchor refs
+/// to the file module here regardless of canonical-path emptiness.
+fn module_context_of(unit: &FnUnit, mt: &crate::module_tree::ModuleTree) -> Vec<String> {
+    let Some(file_mod) = mt.module_of(&unit.path) else {
         return vec![];
-    }
-    let drop = symbol_segments(symbol).len();
-    canonical[..canonical.len().saturating_sub(drop)].to_vec()
+    };
+    let mut segs = vec!["crate".to_string()];
+    segs.extend(file_mod);
+    segs.extend(unit.mod_path.iter().cloned());
+    segs // module, NOT the unit path — no symbol segments
 }
 
 /// Split a display symbol into path-meaningful segments:
@@ -279,5 +292,104 @@ mod tests {
         let statics = std::collections::HashSet::new();
         let rec = build_record(unit, &imports, &statics, &mt);
         assert!(rec.canonical_path.is_empty());
+    }
+
+    // ── #83: nested-unit identity guard ─────────────────────────────────────
+
+    #[test]
+    fn nested_unit_gets_empty_canonical_path() {
+        use crate::module_tree::ModuleTree;
+        use fxrank_core::frontend::SourceFile;
+        let mt = ModuleTree::build(&[SourceFile {
+            path: "src/lib.rs".into(),
+            text: String::new(),
+        }]);
+        let file = syn::parse_file("fn outer() { fn helper() {} }").unwrap();
+        let imports = ImportTable::from_file(&file);
+        let statics = std::collections::HashSet::new();
+        let unit = crate::functions::collect(&file, "src/lib.rs")
+            .into_iter()
+            .find(|u| u.symbol == "helper")
+            .unwrap();
+        let rec = build_record(&unit, &imports, &statics, &mt);
+        assert!(
+            rec.canonical_path.is_empty(),
+            "a nested fn must not get an importable canonical_path; got {:?}",
+            rec.canonical_path
+        );
+    }
+
+    #[test]
+    fn same_name_module_level_fn_still_resolves_when_qualified() {
+        // A real module-level `helper` + a nested `helper` in a sibling fn.
+        // A `crate::helper()` (qualified) MUST still resolve to the module-level
+        // unit via CanonicalIndex, not drop to ambiguous.
+        use fxrank_core::frontend::{Frontend, SourceFile};
+        use fxrank_core::graph::Edge;
+        use fxrank_core::resolve::{CanonicalIndex, resolve_ref_precise};
+        let files = vec![SourceFile {
+            path: "src/lib.rs".into(),
+            text: "pub fn helper() {}\n\
+                   pub fn other() { fn helper() {} }\n\
+                   pub fn caller() { crate::helper(); }"
+                .into(),
+        }];
+        let out = crate::RustFrontend::default().analyze(&files);
+        let idx = CanonicalIndex::from_records(&out.records);
+        let caller = out.records.iter().find(|r| r.symbol == "caller").unwrap();
+        let r = caller
+            .refs
+            .iter()
+            .find(|r| r.base.ends_with("helper"))
+            .unwrap();
+        assert!(
+            matches!(
+                resolve_ref_precise(r, &idx, &caller.path),
+                Some(Edge::Resolved(_))
+            ),
+            "qualified crate::helper must resolve to the module-level unit, not drop"
+        );
+    }
+
+    #[test]
+    fn nested_unit_ref_keeps_self_super_anchor_despite_empty_canonical() {
+        use crate::module_tree::ModuleTree;
+        use fxrank_core::frontend::SourceFile;
+        // A nested fn whose body makes a `self::sibling()` call. Even though the
+        // nested unit's canonical_path is empty, its refs must still anchor to the
+        // file module (`crate::m`) so `self::sibling` resolves to crate::m::sibling.
+        // F2: `ModuleTree::build` only recognizes a crate root at `src/lib.rs`/
+        // `src/main.rs`. With ONLY `src/m.rs` in the batch there is no root, so
+        // `module_of("src/m.rs")` is `None` → `module_context_of` returns `[]` and
+        // the anchor assertion could never pass. Include `src/lib.rs` in the batch
+        // so `module_of("src/m.rs") = Some(["m"])`.
+        let mt = ModuleTree::build(&[
+            SourceFile {
+                path: "src/lib.rs".into(),
+                text: String::new(),
+            },
+            SourceFile {
+                path: "src/m.rs".into(),
+                text: String::new(),
+            },
+        ]);
+        let file = syn::parse_file("fn outer() { fn nested() { self::sibling(); } }").unwrap();
+        let imports = ImportTable::from_file(&file);
+        let statics = std::collections::HashSet::new();
+        let nested = crate::functions::collect(&file, "src/m.rs")
+            .into_iter()
+            .find(|u| u.symbol == "nested")
+            .unwrap();
+        let rec = build_record(&nested, &imports, &statics, &mt);
+        assert!(
+            rec.canonical_path.is_empty(),
+            "nested unit keeps empty canonical_path"
+        );
+        let r = rec.refs.iter().find(|r| r.base == "self::sibling").unwrap();
+        assert_eq!(
+            r.resolved_target,
+            Some(vec!["crate".into(), "m".into(), "sibling".into()]),
+            "self:: inside a nested unit must anchor to crate::m via module_context_of, not lose its anchor"
+        );
     }
 }
