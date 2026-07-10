@@ -93,6 +93,16 @@ impl RiskWalker {
 }
 
 impl<'ast> Visit<'ast> for RiskWalker {
+    // Nested-unit boundary (#83): stop at every nested item and closure so the
+    // parent does not count a nested unit's risk features. See calls.rs for the
+    // rationale. F5: a closure in an `unsafe fn` thereby loses the enclosing
+    // unsafe context (the closure unit is `unsafety=false`); this is an accepted,
+    // edition-dependent FN delta — we do NOT thread an `in_unsafe_fn` bit here.
+    fn visit_item(&mut self, _n: &'ast syn::Item) { /* nested-unit boundary: stop */
+    }
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) { /* boundary: stop */
+    }
+
     // ── unsafe { } blocks ────────────────────────────────────────────────────
 
     fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {

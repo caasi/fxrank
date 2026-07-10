@@ -78,6 +78,14 @@ pub fn analyze_unit(unit: &FnUnit, imports: &ImportTable, statics: &HashSet<Stri
 fn count_awaits(body: &crate::functions::FnBodyOwned) -> usize {
     struct AwaitCounter(usize);
     impl<'ast> Visit<'ast> for AwaitCounter {
+        // Nested-unit boundary (#83): a nested async fn's or async closure's awaits
+        // are its OWN unit's, so stop at every nested item and closure. A bare
+        // `async { … }` block is an `ExprAsync` (not a closure/item) and is NOT
+        // stopped — its awaits stay parent-attributed (N4).
+        fn visit_item(&mut self, _n: &'ast syn::Item) { /* nested-unit boundary: stop */
+        }
+        fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) { /* boundary: stop */
+        }
         fn visit_expr_await(&mut self, _node: &'ast syn::ExprAwait) {
             self.0 += 1;
             syn::visit::visit_expr_await(self, _node);
@@ -349,6 +357,120 @@ mod tests {
             ),
             "qualified crate::helper must resolve to the module-level unit, not drop"
         );
+    }
+
+    // ── #83 Task 4: own-body walk stops at nested-unit boundaries ───────────
+
+    /// All SIX own-body walkers (calls/macros/mutation/risk/refs) must own NONE
+    /// of the effects that live inside a nested unit (nested fn, closure, nested
+    /// impl method). A bare async fn's await stays parent-attributed (N4).
+    #[test]
+    fn parent_body_walk_stops_at_every_nested_unit_boundary() {
+        // Effects live ONLY inside nested units; the parent `outer` must own NONE.
+        let src = r#"
+            fn outer() {
+                fn nested_fn() { std::fs::write("a", b"x").unwrap(); }      // net.fs.db + panic
+                let c = || { println!("hi"); };                            // logging
+                struct S;
+                impl S { fn m(&self) { panic!("boom"); } }                 // panic (nested-impl method)
+                let _ = (nested_fn, c);
+            }
+            // Sibling async fixture (N4): a bare async block's await stays on the parent.
+            async fn awaiter() { do_thing().await; }
+        "#;
+        let file = syn::parse_file(src).unwrap();
+        let imports = crate::imports::ImportTable::from_file(&file);
+        let statics = std::collections::HashSet::new();
+        let units = crate::functions::collect(&file, "a.rs");
+        let outer = units.iter().find(|u| u.symbol == "outer").unwrap();
+
+        let calls = crate::detect::calls::detect(&outer.body, &imports, "a.rs", &statics);
+        let macros = crate::detect::macros::detect(&outer.body);
+        let muts = crate::detect::mutation::detect(&outer.body, &outer.sig, &statics, &imports);
+        let risks = crate::detect::risk::detect_fn_risks(&outer.body, &outer.sig, "a.rs");
+        // F-refs: the SIXTH walker. The parent's refs must contain NONE of the
+        // nested-body calls (`std::fs::write`, `println`, `panic`).
+        let referencing_mod: Vec<String> = vec![];
+        let refs = crate::detect::refs::extract(&outer.body, &imports, &referencing_mod);
+        assert!(
+            calls.is_empty() && macros.is_empty() && muts.is_empty() && risks.is_empty(),
+            "outer must own no nested-unit effects; calls={calls:?} macros={macros:?} muts={muts:?} risks={risks:?}"
+        );
+        assert!(
+            refs.iter().all(|r| r.base != "std::fs::write"),
+            "outer's refs must exclude the nested fn's call; got {refs:?}"
+        );
+
+        // N4: the bare async block's await IS the parent's.
+        let awaiter = units.iter().find(|u| u.symbol == "awaiter").unwrap();
+        assert!(
+            crate::detect::analyze_unit(awaiter, &imports, &statics).await_count >= 1,
+            "a bare async fn's await stays parent-attributed"
+        );
+    }
+
+    /// F-async: an `async ||` closure is an async boundary regardless of awaits;
+    /// its awaits belong to the closure, an `async { … }` block's to the parent.
+    #[test]
+    fn async_block_awaits_parent_async_closure_awaits_itself() {
+        let src = r#"
+            fn parent() {
+                let _ = async { f().await };          // async BLOCK → parent-attributed
+                let c = async || { g().await };       // async CLOSURE → its own unit
+                let _ = c;
+            }
+        "#;
+        let file = syn::parse_file(src).unwrap();
+        let imports = crate::imports::ImportTable::from_file(&file);
+        let statics = std::collections::HashSet::new();
+        let units = crate::functions::collect(&file, "a.rs");
+        let parent = units.iter().find(|u| u.symbol == "parent").unwrap();
+        let closure = units.iter().find(|u| u.symbol == "c").unwrap();
+        assert!(
+            closure.sig.asyncness,
+            "an `async ||` closure is async regardless of awaits"
+        );
+        let ph = crate::detect::analyze_unit(parent, &imports, &statics);
+        let ch = crate::detect::analyze_unit(closure, &imports, &statics);
+        assert_eq!(
+            ph.await_count, 1,
+            "the async BLOCK's await counts on the parent"
+        );
+        assert_eq!(
+            ch.await_count, 1,
+            "the async CLOSURE's await counts on the closure"
+        );
+        // The parent's refs must exclude the closure body's `g`.
+        let refs = crate::detect::refs::extract(&parent.body, &imports, &[]);
+        assert!(
+            refs.iter().all(|r| r.base != "g"),
+            "parent refs must exclude the async closure's call `g`; got {refs:?}"
+        );
+    }
+
+    /// F-3level: fn → impl → method → closure. The 3-level-deep closure's effect
+    /// stays on the closure unit; none of the enclosing three units carry it.
+    #[test]
+    fn three_level_nesting_boundary() {
+        let src = r#"
+            fn top() {
+                struct S;
+                impl S { fn method(&self) { let c = || { std::fs::write("a", b"x").ok(); }; let _ = c; } }
+            }
+        "#;
+        let file = syn::parse_file(src).unwrap();
+        let imports = crate::imports::ImportTable::from_file(&file);
+        let statics = std::collections::HashSet::new();
+        let units = crate::functions::collect(&file, "a.rs");
+        // The closure `c` owns the write; `top` and `S::method` own none.
+        for enclosing in ["top", "S::method"] {
+            let u = units.iter().find(|u| u.symbol == enclosing).unwrap();
+            let calls = crate::detect::calls::detect(&u.body, &imports, "a.rs", &statics);
+            assert!(
+                calls.iter().all(|e| e.kind.wire() != "net.fs.db"),
+                "`{enclosing}` must not carry the 3-level closure's write; got {calls:?}"
+            );
+        }
     }
 
     #[test]

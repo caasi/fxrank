@@ -50,6 +50,15 @@ struct CallWalker<'a> {
 }
 
 impl<'a, 'ast> Visit<'ast> for CallWalker<'a> {
+    // Nested-unit boundary (#83): a nested item (`fn`/`impl`/`trait`/`mod`) and a
+    // closure are each their OWN unit, so the parent walk must NOT descend into
+    // them — otherwise the parent double-counts the nested unit's effects. Empty
+    // no-ops (no default recursion) stop the walk at every such boundary.
+    fn visit_item(&mut self, _n: &'ast syn::Item) { /* nested-unit boundary: stop */
+    }
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) { /* boundary: stop */
+    }
+
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*node.func {
             let rendered = render_path(&p.path);

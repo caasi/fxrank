@@ -9,8 +9,9 @@ per-language differences. It is not a contract; nothing is required to conform.
 Each frontend (`crates/fxrank-lang-{rust,ts,python,shell}/src/detect/mutation.rs`) reduces
 a write to a **base name**, classifies it against **flat per-unit binding sets** via a
 **fixed priority cascade**, and emits an `EffectKind` (`fxrank-core`). No lexical scope
-stack; an *unresolved base* is the proxy for "captured/module". TS/Python stop at nested
-functions; Rust's mutation walker descends into closures and block-local `fn` items. Shell
+stack; an *unresolved base* is the proxy for "captured/module". Like TS/Python, Rust stops at
+nested functions and closures — each nested `fn`/method/closure is its own unit, so the
+enclosing walker does not descend into it (#83). Shell
 has no closures — its cascade is a **declaration-vs-hidden gate**, not a binding-resolution
 cascade (see *Per-frontend realization*).
 

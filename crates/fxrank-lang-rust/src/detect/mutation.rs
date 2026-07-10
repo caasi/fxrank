@@ -379,11 +379,16 @@ impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
         syn::visit::visit_arm(self, node);
     }
 
-    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
-        for pat in &node.inputs {
-            self.seed_pat_locals(pat); // closure params (`|x| …`)
-        }
-        syn::visit::visit_expr_closure(self, node);
+    // Nested-unit boundary (#83): a nested item and a closure are each their own
+    // unit, so stop the parent walk here (no default recursion). The closure's own
+    // unit seeds its params via `FnSig.is_closure` (Task 1) — the interim
+    // param-seeding this override used to do is now dead. `visit_local`/
+    // `visit_expr_for_loop`/`visit_expr_let`/`visit_arm` below still seed the
+    // PARENT's own bindings (not nested units). F5: a closure in an `unsafe fn`
+    // loses the enclosing unsafe context — accepted, edition-dependent FN delta.
+    fn visit_item(&mut self, _n: &'ast syn::Item) { /* nested-unit boundary: stop */
+    }
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) { /* boundary: stop */
     }
 
     fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
