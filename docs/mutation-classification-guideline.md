@@ -45,6 +45,15 @@ cascade (see *Per-frontend realization*).
   Rust is fully typed and does not apply it. Rust's `Effect` has no `contained` field.
 - **Python `nonlocal`→this.mutation/Exact/not-hidden** — an explicitly declared capture is
   visible (not hidden); distinct kind from the implicit-capture `hidden.mutation` (same class 3).
+- **Rust `move`-gated captured-binding (Q5(c), #83)** — a **non-`move`** closure that mutates a
+  captured local/param captures it by `&mut` **borrow**, which the borrow checker guarantees
+  cannot outlive the enclosing fn, so Rust classifies it as *contained* `local.mutation` (subreason
+  `"captured-borrow"`), **not** the shared `hidden.mutation "captured-binding"`. A **`move`**
+  closure (captures by value → can escape) and a named fn keep the hidden classification. `move` is
+  a Rust-only keyword, so this precision refinement is **Rust-specific** — TS/Python closures always
+  capture by reference and can escape freely with no syntactic marker, so they keep emitting
+  `captured-binding` for the identical closure shape. Intentional divergence (this file "is not a
+  contract"); evidence in `docs/032-nested-unit-dogfood.md`.
 - **Plain rebind `x = …`** — Python no-emits (name-rebinding ≠ mutation); TS/Rust emit
   local.mutation/1 (variable-slot reassignment).
 - **Per-language mutating-method allowlists** — language-appropriate vocabularies.
