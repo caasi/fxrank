@@ -125,7 +125,7 @@ It is a **join, never a sum**. Consequences:
 Implementation is a memoized fixpoint over the call graph with SCC handling; single
 units are computed once and shared.
 
-### Captured-effect re-attribution — a closure's *escaping* captures *(target model — not yet implemented)*
+### Captured-effect re-attribution — a closure's *escaping* captures *(target model — not yet implemented, #84)*
 
 The propagation above folds a callee's escaping summary into its callers along **edges**. But
 an **inline higher-order-function closure** — `things.for_each(|x| dst.push(x))` — has **no

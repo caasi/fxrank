@@ -37,15 +37,16 @@ cascade (see *Per-frontend realization*).
 `hidden.mutation` subreasons: `"interior-mut"` (Rust interior-mutability), `"ref-cell-write"`
 (TS `useRef().current`), `"captured-binding"` (the unresolved fallback, all three).
 
-## Target model — captured-write classification via the capture environment *(not yet implemented)*
+## Target model — captured-write classification via the capture environment *(not yet implemented — #84)*
 
 The two captured-write rows above (*interior-mutability / ref-cell write* and
 *captured-enclosing / unresolved base*) are where #83 currently **guesses**. Once a closure
 is its own unit, its write sites are classified with **no** enclosing scope in hand, and the
 dogfood (`docs/032-nested-unit-dogfood.md`, Q5) showed that forces a bad choice: Q5(a) emits a
-flat `hidden.mutation "captured-binding"` for every captured write (**over-scores**); Q5(c)
-move-gates it to contained `local.mutation` for every non-`move` closure (**under-scores** —
-see the Q5(c) bullet under *Honest per-language differences*, which is what current Rust ships).
+flat `hidden.mutation "captured-binding"` for every captured write (**over-scores** — **this is
+what Rust currently ships**); the move-gated interim Q5(c) swung the other way to contained
+`local.mutation` for every non-`move` closure (**under-scores** — **implemented then reverted**
+after review; see the Q5(c) bullet under *Honest per-language differences*).
 Neither can tell a captured **owned local** from a captured **`&mut` param** from a captured
 **`&RefCell`**, because the discriminator — the *nature of the captured binding* — lives in the
 enclosing scope the isolated closure unit threw away. The target model **stops guessing** by
@@ -76,9 +77,9 @@ handle** (`Arc`/`Mutex`/`Sender`/`RefCell`/raw ptr — see *Known residual*) is 
 even though it is an owned `let`, because mutating through it escapes the frame; such ambiguous
 owned-handle locals default to `hidden`.
 
-The `&mut`-param case is the crux: the move-gate (Q5(c)) contains it because a non-`move`
-closure borrows, but the *referent* is caller-owned, so the mutation is **caller-visible /
-escaping**, not contained. Only the capture environment distinguishes it from a captured owned
+The `&mut`-param case is the crux: the rejected move-gate (Q5(c)) *would have* contained it
+because a non-`move` closure borrows, but the *referent* is caller-owned, so the mutation is
+**caller-visible / escaping**, not contained. Only the capture environment distinguishes it from a captured owned
 local. Escaping captured writes are additionally **re-attributed to the binding's owner** (the
 enclosing unit); contained ones stay in the closure's own record — see
 `cross-file-resolution-guideline.md`, *Captured-effect re-attribution* (the principled
@@ -100,10 +101,10 @@ and **both default conservatively to `hidden`** (prefer over-report to a false-n
   owned value (`let v = Vec::new()`), so an ambiguous owned-handle local defaults **up** to
   `hidden`, not down to contained.
 
-**Why the owned-handle default is load-bearing:** it is what prevents a **regression vs the
-currently-shipped move-gate (Q5(c))** on the `spawn(move || arc_mutex.lock()…push())`
-cross-thread pattern — under-scoring an escaping cross-thread mutation is exactly the
-anti-Goodhart false-negative the tool exists to prevent.
+**Why the owned-handle default is load-bearing:** it is what keeps #84 from **under-scoring** the
+`spawn(move || arc_mutex.lock()…push())` cross-thread pattern — under-scoring an escaping
+cross-thread mutation is exactly the anti-Goodhart false-negative the tool exists to prevent, and
+exactly the regression that sank the rejected Q5(c) move-gate interim.
 
 Milestone-A is syntactic; a precise owned-vs-borrowed / owned-vs-aliasing-handle answer needs
 type inference and is out of scope.
@@ -135,7 +136,7 @@ There is **also** a **language-neutral** containment signal this model does not 
 **inline-non-escaping consumption** — the closure is passed **directly to a synchronous
 consumer** (`.forEach` / `.map` / `.for_each`) and is **never stored, returned, or spawned**.
 That proves containment in **TS/Python too** (not only Rust), and it would additionally catch the
-`move` + synchronous residual the Rust move-gate misses (see *Rust `move`-gated captured-binding*
+`move` + synchronous residual the move-gate interim would have missed (see *Rust `move`-gated captured-binding*
 below). Flag it as a **future cross-language refinement** to the conservative default.
 
 So the shared model is "thread the enclosing binding environment as context; absent a proof of
@@ -153,18 +154,22 @@ Rust's cheap syntactic proof** of containment.
   Rust is fully typed and does not apply it. Rust's `Effect` has no `contained` field.
 - **Python `nonlocal`→this.mutation/Exact/not-hidden** — an explicitly declared capture is
   visible (not hidden); distinct kind from the implicit-capture `hidden.mutation` (same class 3).
-- **Rust `move`-gated captured-binding (Q5(c), #83)** — a **non-`move`** closure that mutates a
-  captured local/param captures it by `&mut` **borrow**, which the borrow checker guarantees
-  cannot outlive the enclosing fn, so Rust classifies it as *contained* `local.mutation` (subreason
-  `"captured-borrow"`), **not** the shared `hidden.mutation "captured-binding"`. A **`move`**
-  closure (captures by value → can escape) and a named fn keep the hidden classification. `move` is
-  a Rust-only keyword, so this precision refinement is **Rust-specific** — TS/Python closures always
-  capture by reference and can escape freely with no syntactic marker, so they keep emitting
-  `captured-binding` for the identical closure shape. Intentional divergence (this file "is not a
-  contract"); evidence in `docs/032-nested-unit-dogfood.md`. **This move-gate is a coarse interim**:
-  it is superseded by the *Target model — captured-write classification via the capture environment*
-  above, which replaces "is the closure `move`?" with "what is the captured binding's nature in the
-  enclosing environment?" — the precise discriminator the move-gate only approximates.
+- **Rust `move`-gated captured-binding — Q5(c), implemented then reverted (#83 → #84).** A tried
+  interim: a **non-`move`** closure that mutates a captured local/param captures it by `&mut`
+  **borrow**, which the borrow checker guarantees cannot outlive the enclosing fn, so the move-gate
+  classified it as *contained* `local.mutation` (subreason `"captured-borrow"`) rather than the
+  shared `hidden.mutation "captured-binding"`, keeping `move` closures and named fns hidden. It was
+  **implemented and then reverted after review** as too coarse: keying on "is the closure `move`?"
+  instead of "what is the captured binding's nature?" **false-negatives a captured `&mut`-param
+  mutation** (the referent is caller-owned → escaping), **inverts** the `&RefCell` interior-mut
+  thesis (demotes a class-3 interior-mut write to contained), and **under-scores** an `Arc<Mutex>`
+  cross-thread mutation through a non-`move` scoped-thread closure — a net regression vs simply
+  shipping Q5(a). **Rust currently ships Q5(a)** — the flat `hidden.mutation "captured-binding"`
+  fallback, identical to TS/Python for the same closure shape. The correct fix is the *Target model
+  — captured-write classification via the capture environment* above, filed as **#84**, which
+  replaces "is the closure `move`?" with "what is the captured binding's nature in the enclosing
+  environment?" — the precise discriminator the move-gate only approximated. Evidence in
+  `docs/032-nested-unit-dogfood.md`.
 - **Plain rebind `x = …`** — Python no-emits (name-rebinding ≠ mutation); TS/Rust emit
   local.mutation/1 (variable-slot reassignment).
 - **Per-language mutating-method allowlists** — language-appropriate vocabularies.

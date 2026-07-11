@@ -150,12 +150,12 @@ in-frame value vs aliasing handle), not merely "is it an owned local."
 
 ### Verdict
 
-**Outcome: Q5(a) measured 16 FP sites → Q5(c) applied → 0 FP (see the next section).** The
-Q5(a) figures below passed the pre-registered gate (16 sites ≤ 20, far below the FP > 50 reopen
-line) — but **every** FP turned out to be a non-`move` closure (a borrow-contained, morally-local
-write), so instead of shipping the 16 the evidence drove **Q5(c) move-gating**, which reclassifies
-them to contained `local.mutation`. The Q5(a) measurement is kept here as the evidence that drove
-that decision:
+**Outcome: #83 ships Q5(a) — 16 FP sites, gate `≤ 20` passed** (far below the FP > 50 reopen
+line). Every FP turned out to be a non-`move` closure (a borrow-contained, morally-local write),
+which motivated a move-gated interim (**Q5(c)**) that was **implemented and then reverted after
+review** — it regresses several genuinely-escaping cases (see the next section). The correct fix
+is the **capture-environment model, filed as #84**. The Q5(a) measurement below is what the
+ship decision rests on:
 
 - **Per unique closure site: 16 FP ≤ 20** ⇒ clean-ship threshold met — the operative criterion.
   *Comparator caveat (not apples-to-apples):* the **#55 ~76-site** "unacceptable" figure was the
@@ -175,67 +175,52 @@ re-containment is not built**. The site-vs-emission distinction is surfaced for 
 recommendation is unambiguous: ship the escape-based Q5(a). The single ripgrep TP confirms the
 definition separates escaping mutation from morally-local writes as intended.
 
-## Q5(c) — move-gated captured-binding (applied): closure FP 25 → 0
+## Why not Q5(c) — and the correct fix (#84)
 
 The Q5(a) measurement above found **every** closure `captured-binding` FP (16 sites / 25
-emissions) to be a **non-`move`** closure mutating a captured local/param. That is not a
-coincidence: a non-`move` closure captures by `&mut` **borrow**, and Rust's borrow checker
-*guarantees* the borrow (and its mutation) cannot outlive the enclosing fn — the write is
-**contained by construction** (class 1), not hidden. Only a `move` closure captures by value and
-can escape (box / spawn / store / return), so only `move` can be a genuine TP. (Verified with
-`rustc`: returning / boxing / storing a non-`move` mutating closure is an **E0373** compile error,
-so *every escaping TP is necessarily `move`* — move-gating cannot downgrade a real escape.)
+emissions) to be a **non-`move`** closure mutating a captured local/param. That looked like a
+clean discriminator: a non-`move` closure captures by `&mut` **borrow**, and Rust's borrow checker
+*guarantees* the borrow cannot outlive the enclosing fn, so *that particular* write is contained
+by construction. So the interim **Q5(c)** move-gate was tried — a syntactic
+`ExprClosure.capture.is_some()` check threaded as `FnSig.is_move`: in `mutation.rs::record_write`,
+a captured write on a **non-`move` closure** emitted contained `local.mutation` (subreason
+`captured-borrow`) instead of `hidden.mutation "captured-binding"`, while `move` closures and
+named fns kept the hidden fallback.
 
-**The fix** — a syntactic `ExprClosure.capture.is_some()` check threaded as `FnSig.is_move`,
-frontend-only, no `fxrank-core` change, **not** N1-forbidden (it is not scope resolution): in
-`mutation.rs::record_write`, a captured write on a **non-`move` closure** (`is_closure && !is_move`)
-emits `local.mutation` (contained, subreason `captured-borrow`) instead of `hidden.mutation
-"captured-binding"`. A **`move` closure** and a **named fn** keep the hidden classification (they
-can escape / are genuine unresolved bases). This supersedes the deferred **Q5(b)** fold
-re-containment for the non-`move` set (cheaper and more precise; no fold change).
+**Q5(c) was implemented and then reverted after review.** Keying on *"is the closure `move`?"*
+instead of *"what is the captured binding's nature?"* is too coarse and regresses genuinely-visible
+cases — a net loss vs simply shipping Q5(a):
 
-**Re-dogfood after Q5(c) — real scan, same three corpora:**
+- **False-negatives a `&mut`-param mutation.** A non-`move` closure that mutates a captured
+  **`&mut` param** borrows the *param*, but the **referent is caller-owned** — the mutation is
+  caller-visible / escaping. Move-gating wrongly contained it to `local.mutation`, hiding a real
+  escaping effect.
+- **Inverts the `&RefCell` interior-mutability thesis.** A non-`move` closure mutating a captured
+  `&RefCell` (interior mutability) is exactly the case the anti-Goodhart model insists must score
+  **high** (class 3, hidden). Move-gating demoted it to contained `local.mutation` — the opposite
+  of the intended ordering.
+- **Under-scores an `Arc<Mutex>` cross-thread mutation.** A non-`move` closure run via
+  `thread::scope(|s| s.spawn(|| arc_mutex.lock()…push()))` mutates shared state cross-thread; it is
+  lifetime-contained yet genuinely "runs elsewhere." Move-gating contained it — a regression vs
+  Q5(a), which at least kept it hidden.
 
-| Corpus | closure `captured-binding` (hidden, remaining) | `captured-borrow` (now contained) |
-|--------|-----------------------------------------------:|----------------------------------:|
-| a fxrank `crates/` | **0** | 7 |
-| b agent-browser/cli | **0** | 3 |
-| c ripgrep | **1** (the `move` TP `core/main.rs:183`) | 15 |
-| **total** | **1** | **25** |
-
-The 25 non-`move` FP emissions are now contained `local.mutation`; the single genuine `move` TP is
-**retained** as `hidden.mutation "captured-binding"`. **Closure captured-binding FP: 25 → 0, zero
-TP loss** (empirical, this scan).
-
-**Caveats (honest — both zero-occurrence in this corpus):**
-- *Soundness edge — scoped concurrency.* A non-`move` closure run via `thread::scope(|s| s.spawn(||
-  …))` mutates a captured local cross-thread; it is lifetime-contained (joins before the fn
-  returns) yet "runs elsewhere," diverging from the escape-based TP reading. Rare — cross-thread
-  shared mutation without a `Mutex`/atomic is usually an aliasing error, and synchronized forms
-  classify through the interior-mut branch, not `captured-binding`.
-- *Precision edge — `move` + synchronous.* A `move` closure consumed synchronously (`let cb = move
-  |x| out.push(x); (0..3).for_each(cb);`) moves `out` into the closure (morally local) yet
-  move-gating keeps it hidden — a residual FP move-ness alone cannot catch. Zero occurrences here.
-  (The language-neutral **inline-non-escaping-consumption** proof flagged in
-  `mutation-classification-guideline.md` would also catch this residual.)
-
-**Free bonus when re-attribution lands (F5 restoration).** Re-attribution — threading the
-**enclosing** unit's env down into the closure (the capture environment that supersedes this
-interim move-gate; see
+The common root cause: **`move`-ness is not the discriminator** — the *nature of the captured
+binding* is (owned local vs `&mut` param vs `&RefCell` vs `static`), and that lives in the
+enclosing scope the isolated closure unit threw away. **The correct fix is the capture-environment
+model, filed as #84** (design in `mutation-classification-guideline.md`, *Target model —
+captured-write classification via the capture environment*, and
 [`cross-file-resolution-guideline.md`](cross-file-resolution-guideline.md), *Captured-effect
-re-attribution*) — is also the natural place to **restore the F5 `unsafe fn` context** the
-isolated closure currently loses. Today a closure is its own unit with `unsafety = false`, so a
-`RawPtrDeref` / discount-cancel write inside a closure sitting in an `unsafe fn` silently vanishes
-(plan F5). The same enclosing-env thread that carries the binding sets down can carry the
-`unsafe`-context bit and re-derive those signals — a **free correctness bonus** riding on the
-re-attribution machinery, not separate work.
+re-attribution*): thread the enclosing unit's binding sets down as classification *context* and
+classify each captured write by what its base actually is. **Rust today ships Q5(a)** — the flat
+`hidden.mutation "captured-binding"` fallback, identical to TS/Python for the same closure shape.
 
-**Cross-language:** `move` is a Rust-only keyword and the guarantee is the borrow checker's, so
-Q5(c) is a Rust-specific precision win with **no cross-language obligation** — but it *diverges*
-captured-binding semantics (post-Q5(c) Rust emits far fewer captured-binding hidden mutations than
-TS/Python for the identical closure shape). Intentional — per-frontend classification is
-explicitly "not a contract"; the divergence + its borrow-checker justification is noted in
-`mutation-classification-guideline.md`.
+**Free bonus when #84's re-attribution lands (F5 restoration).** Re-attribution — threading the
+**enclosing** unit's env down into the closure — is also the natural place to **restore the F5
+`unsafe fn` context** the isolated closure currently loses. Today a closure is its own unit with
+`unsafety = false`, so a `RawPtrDeref` / discount-cancel write inside a closure sitting in an
+`unsafe fn` silently vanishes (plan F5). The same enclosing-env thread that carries the binding
+sets down can carry the `unsafe`-context bit and re-derive those signals — a **free correctness
+bonus** riding on the re-attribution machinery, not separate work.
 
 ### Diagnostics (reported, not gated)
 

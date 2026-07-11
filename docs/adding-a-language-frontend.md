@@ -115,7 +115,7 @@ For each axis, add your language as a new **column** in that guideline's per-lan
 and a **bullet** under its *Honest per-language differences* / *Per-frontend realization* —
 and preserve any *intentional* difference already recorded there rather than "aligning" it.
 
-### 3.1 A closure is not a nested fn — thread the capture environment *(target model — not yet implemented)*
+### 3.1 A closure is not a nested fn — thread the capture environment *(target model — not yet implemented, #84)*
 
 The granularity row above makes **every** nested unit its own `Hotspot` + `UnitRecord`, and
 that is right for *effects*. But a **closure is fundamentally different from a nested named
@@ -123,9 +123,10 @@ fn**: a nested `fn` does **not** capture; a closure's whole essence is **capturi
 enclosing scope**. Making a closure its own unit and analyzing it *in isolation* throws away
 the enclosing binding context that mutation classification needs — and that loss is exactly
 the dilemma the #83 dogfood exposed (`docs/032-nested-unit-dogfood.md`, Q5): a captured write
-classified with no enclosing context is either **over-scored** (Q5(a): every captured write
-becomes `hidden.mutation "captured-binding"`) or **under-scored** (Q5(c) move-gate: every
-non-`move` captured write becomes contained `local.mutation`), because the isolated closure
+classified with no enclosing context is either **over-scored** (Q5(a), what Rust ships: every
+captured write becomes `hidden.mutation "captured-binding"`) or **under-scored** (the rejected
+Q5(c) move-gate interim: every non-`move` captured write becomes contained `local.mutation`),
+because the isolated closure
 unit cannot tell a captured **owned local** (genuinely contained) from a captured **`&mut`
 param** (caller-visible, escaping) from a captured **`&`/`&RefCell`** (interior-mut, must
 score high). Both are guesses.
@@ -169,8 +170,9 @@ There is **also** a **language-neutral** containment proof the model doesn't yet
 TS/Python too; flag it as a future cross-language refinement.
 
 Do **not** frame TS/Python as weaker — they simply **lack Rust's cheap syntactic proof** of
-containment. **Rust's #83 today isolates closures without the environment** (it ships the coarse
-`move`-gate); the capture environment is the target this row is headed toward.
+containment. **Rust's #83 today isolates closures without the environment** — it ships the coarse
+flat Q5(a) fallback (a `move`-gate, Q5(c), was tried and **reverted** as a rejected interim); the
+capture environment is the target this row is headed toward, filed as **#84**.
 
 ## 4. The scoring model (no spec needed)
 
