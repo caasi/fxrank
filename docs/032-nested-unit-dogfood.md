@@ -15,11 +15,15 @@ captured. The **merge gate** is a dogfood of the closure captured-binding false-
 | # | Corpus | Scan command | Role |
 |---|--------|--------------|------|
 | a | fxrank workspace itself | `cargo run --release -p fxrank -- scan crates/` | visitor/detector profile; **031 compat baseline** |
-| b | `~/GitHub/agent-browser/cli` | `... scan ~/GitHub/agent-browser/cli` | iterator/async-heavy; **TP calibration** (async-`\|\|` / spawn path) |
-| c | `~/GitHub/ripgrep` | `... scan ~/GitHub/ripgrep` | pure-synchronous; **morally-local FP ceiling** |
+| b | `~/GitHub/agent-browser/cli` | `cargo run --release -p fxrank -- scan ~/GitHub/agent-browser/cli` | iterator/async-heavy; **TP calibration** (async-`\|\|` / spawn path) |
+| c | `~/GitHub/ripgrep` | `cargo run --release -p fxrank -- scan ~/GitHub/ripgrep` | pure-synchronous; **morally-local FP ceiling** |
 
-Scanned build: `target/release/fxrank` at branch `feat/083-nested-unit-collection` (`1406b58`,
-Tasks 1–5 landed). Scan scope actually parsed:
+Scanned build: `target/release/fxrank` built from this PR at the dogfood-measurement point —
+after Tasks 1–5 landed, commit `0c6bcf2e80336d0e4a467de02b753328682a7ce2` (full id recorded so it
+survives rebases; the branch's earlier short SHA `1406b58` predated the rebase onto `main`). The
+later round-1–4 review fixes touch closure symbols, const-expr-container nesting, typed-param
+seeding, and docs — none change the closure `captured-binding` emission tally measured here. Scan
+scope actually parsed:
 
 | Corpus | files | functions (units) | closure units | closure `captured-binding` emissions |
 |--------|------:|------------------:|--------------:|-------------------------------------:|
