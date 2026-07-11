@@ -66,7 +66,7 @@ looked up in the capture environment and classified by **what it is there**:
 | captured base resolves to (in the enclosing env) | EffectKind | class | contained | escapes? |
 |---|---|:--:|:--:|:--:|
 | **owned local** (enclosing `let`/`let mut`, **plain in-frame value**) — **Rust-only case** | local.mutation | 1 | yes | no — the borrow can't outlive the enclosing frame, genuinely contained |
-| **`&mut` param** (enclosing `mut_params`) | param.mutation-class | 3 | no | **yes** — the referent is caller-owned |
+| **`&mut` param** (enclosing `mut_params`) | param.mutation | 3 | no | **yes** — the referent is caller-owned |
 | **`&` / `&RefCell`** (enclosing `shared_refs`) | hidden.mutation (`interior-mut`) | 3 | no | yes — interior mutability, must score high (anti-Goodhart) |
 | **`static`** (enclosing module statics) | global.mutation | 6 | no | yes |
 | **genuinely unresolved** (in no set, own or captured) | hidden.mutation (`captured-binding`) | 3 | no | yes — the existing fallback, now only the true unknowns |

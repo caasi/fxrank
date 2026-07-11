@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Issue:** [#83](../../../) — *Rust frontend: collect nested `fn`s & closures as their own `UnitRecord`s (cross-language alignment)*. **Dependent spec:** `031-scope-aware-binding-resolution-rust.md` (the Rust scope resolver) — **it lives only on branch `feat/078-rust-scope-resolution`, NOT on this branch and NOT the similarly-named `feat/078-scope-resolution`**. 031 diffs its compat baseline against the **post-#83** corpus and depends on nested units + captures existing (§1.1).
+**Issue:** [#83](https://github.com/caasi/fxrank/issues/83) — *Rust frontend: collect nested `fn`s & closures as their own `UnitRecord`s (cross-language alignment)*. **Dependent spec:** `031-scope-aware-binding-resolution-rust.md` (the Rust scope resolver) — **it lives only on branch `feat/078-rust-scope-resolution`, NOT on this branch and NOT the similarly-named `feat/078-scope-resolution`**. 031 diffs its compat baseline against the **post-#83** corpus and depends on nested units + captures existing (§1.1).
 
 **Branch / rebase mechanics.** This plan (#83) lands on `main` first (feature branch `feat/083-nested-unit-collection` → PR → merge). Spec 031's branch `feat/078-rust-scope-resolution` then **rebases onto post-#83 `main`** so it sees nested units + captures already collected; 031 does not merge before #83.
 
