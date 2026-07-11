@@ -170,6 +170,13 @@ Rust's cheap syntactic proof** of containment.
   replaces "is the closure `move`?" with "what is the captured binding's nature in the enclosing
   environment?" — the precise discriminator the move-gate only approximated. Evidence in
   `docs/032-nested-unit-dogfood.md`.
+- **Rust fn-body-local `const`/`static` effect drop — accepted (#83).** The `visit_item`
+  nested-unit boundary is a no-op (Option-A), so it stops the parent walk at a `const`/`static`
+  nested *inside a fn body* — and unlike a nested `fn`, such an item is never re-visited as its
+  own unit, so the direct effects of its initializer are attributed nowhere (a narrow FN vs
+  pre-#83). This is intentional: a `const`/`static` initializer is const-evaluated at compile
+  time, so dropping its runtime-effect attribution is defensible. Accepted consequence of the
+  Option-A `visit_item` no-op, not a bug to chase.
 - **Plain rebind `x = …`** — Python no-emits (name-rebinding ≠ mutation); TS/Rust emit
   local.mutation/1 (variable-slot reassignment).
 - **Per-language mutating-method allowlists** — language-appropriate vocabularies.

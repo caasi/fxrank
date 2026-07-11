@@ -109,7 +109,28 @@ impl<'a> MutationWalker<'a> {
         // let_mut` via `seed_pat_locals` (inert here — no closures in Task 1).
         for pat in &sig.inputs {
             if sig.is_closure {
+                // A closure param's by-value `mut` binding routes into `let_mut`
+                // via `seed_pat_locals` (preserves `|mut x| …` → local.mutation).
                 w.seed_pat_locals(pat);
+                // A TYPED closure param (`|x: &mut Vec<i32>|`) ALSO carries a
+                // reference type, exactly like a typed named-fn param — read
+                // `Pat::Type.ty` for a top-level `&mut`/`&` so `x` classifies
+                // identically (mut_params / shared_refs), not silently as a local.
+                if let syn::Pat::Type(pat_type) = pat {
+                    let mut bindings = Vec::new();
+                    collect_pat_bindings(&pat_type.pat, &mut bindings);
+                    for (name, _is_mut) in bindings {
+                        match &*pat_type.ty {
+                            syn::Type::Reference(r) if r.mutability.is_some() => {
+                                w.mut_params.insert(name);
+                            }
+                            syn::Type::Reference(_) => {
+                                w.shared_refs.insert(name);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             } else if let syn::Pat::Type(pat_type) = pat {
                 let mut bindings = Vec::new();
                 collect_pat_bindings(&pat_type.pat, &mut bindings);
@@ -343,6 +364,14 @@ impl MutationWalker<'_> {
     /// classifies as `local.mutation`, not the captured-binding `hidden.mutation`
     /// fallback (#55). Flat function-scoped seeding — the Milestone-A scope
     /// approximation `visit_local` already uses (true lexical scoping is #78).
+    ///
+    /// Known Milestone-A FN (plan 032): an UNTYPED closure param (`|v| v.push(1)`,
+    /// a bare `Pat::Ident`) seeds only `locals` here — its type is unknown, so it
+    /// cannot be routed to `mut_params`/`shared_refs`. `record_write` then finds
+    /// `v` in `locals` and emits NOTHING (should ideally be `param.mutation` if the
+    /// caller passed `&mut`). A *typed* closure param (`|v: &mut _|`) is fine — the
+    /// `seed` closure arm reads `Pat::Type.ty` for `&mut`/`&`. Resolving the untyped
+    /// case needs type inference, out of scope for Milestone-A.
     fn seed_pat_locals(&mut self, pat: &syn::Pat) {
         let mut bindings = Vec::new();
         collect_pat_bindings(pat, &mut bindings);
@@ -583,6 +612,33 @@ mod tests {
         assert!(
             kinds.contains(&EffectKind::LocalMutation),
             "the closure mutation should be local.mutation; got {kinds:?}"
+        );
+    }
+
+    /// A closure with a TYPED `&mut` param (`|x: &mut Vec<i32>| x.push(1)`) must
+    /// route `x` into `mut_params` (exactly like a typed named-fn param), so the
+    /// write emits `param.mutation` — NOT silently nothing. Before the fix the
+    /// closure-param path went through `seed_pat_locals` only, ignoring the
+    /// `Pat::Type` type, so `x` landed in `locals` and `x.push(1)` emitted nothing.
+    #[test]
+    fn closure_typed_mut_ref_param_emits_param_mutation() {
+        let src = "fn f(v: &mut Vec<i32>) { let c = |x: &mut Vec<i32>| { x.push(1); }; c(v); }";
+        let file = syn::parse_file(src).unwrap();
+        let imports = ImportTable::from_file(&file);
+        let statics = HashSet::new();
+        let units = crate::functions::collect(&file, "t.rs");
+        let closure = units
+            .iter()
+            .find(|u| u.sig.is_closure)
+            .expect("closure must be collected as its own unit");
+        assert_eq!(closure.symbol, "c", "let-bound closure adopts `c`");
+        let kinds: Vec<EffectKind> = detect(&closure.body, &closure.sig, &statics, &imports)
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(
+            kinds.contains(&EffectKind::ParamMutation),
+            "a typed &mut closure param mutation must be param.mutation; got {kinds:?}"
         );
     }
 }
