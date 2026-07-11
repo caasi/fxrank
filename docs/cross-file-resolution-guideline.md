@@ -125,6 +125,76 @@ It is a **join, never a sum**. Consequences:
 Implementation is a memoized fixpoint over the call graph with SCC handling; single
 units are computed once and shared.
 
+### Captured-effect re-attribution — a closure's *escaping* captures *(target model — not yet implemented)*
+
+The propagation above folds a callee's escaping summary into its callers along **edges**. But
+an **inline higher-order-function closure** — `things.for_each(|x| dst.push(x))` — has **no
+call edge** to the closure: the `.for_each` site is a `RefKind::Method`, dropped by the reach
+filter (*What becomes a reach*), and a caller calls the **enclosing** fn, not the closure.
+Since #83 also makes the closure its own unit whose captured mutation lives in *its* record, a
+closure's captured mutation that is genuinely caller-visible would **never reach the enclosing
+fn's caller** — a false-negative at the caller level.
+
+The fix is **re-attribution**: a captured write inside a closure whose base resolves (in the
+**capture environment** threaded down from the enclosing unit — see
+`mutation-classification-guideline.md`, *Target model — captured-write classification*) to an
+**escaping** binding is **re-attributed up to the binding's owner** — the enclosing unit —
+carrying provenance. A **contained** captured write is **not** re-attributed: it is the
+enclosing frame's private state, invisible to its caller (the cross-unit twin of *contained
+stays in `own` and does not propagate* above). The capture environment is exactly the
+discriminator:
+
+- base ∈ the enclosing unit's **`&mut`-param / shared-`&`-ref** set ⇒ **escaping** (the
+  referent is caller-owned) ⇒ **re-attribute** to the enclosing unit.
+- base ∈ the enclosing unit's **owned-local** set ⇒ **contained** ⇒ **stays** in the closure's
+  own record.
+
+This is the deferred **Q5(b) fold re-containment done right** — (b) was stuck on *which*
+captured writes to re-attribute, and the capture environment answers it. (It is distinct from
+the deferred **(c) scope-aware call resolution**, the orthogonal bare-name edge-drop concern;
+see `docs/032-nested-unit-dogfood.md`.)
+
+**Implementability — re-attribution is an absorption step.** Putting a child closure's escaping
+captured write onto the **parent's** record is an **absorption**, and it **violates** the
+`detect/mod.rs` build-record invariant that "`build_record` recomputes own-body via the same
+`gather` as `analyze_unit`" (the invariant holds only while `analyze_unit` does **no**
+post-`gather` mutation of the record's effects). Implementing re-attribution therefore takes two
+changes:
+
+- **(a) Nesting-aware two-pass analysis.** The parent's binding env must be computed **before**
+  the child and threaded **down** as the capture environment. Today `lib.rs` analyzes units in a
+  **flat loop** (`for unit in &units`) with **no parent handle**, and `FnUnit` stores **neither a
+  parent pointer nor the enclosing seed sets** — so a parent-before-child pass that carries the
+  enclosing env is genuinely new structure.
+- **(b) Migrate `build_record` off recompute-via-gather.** The absorbing (parent) record must
+  switch from recompute-via-`gather` to the **copy/absorb-from-Hotspot** path the invariant's own
+  escape hatch already spells out ("switch to copying from the Hotspot or the record's own-body
+  will drift") — exactly the path the TS frontend already uses for its React absorption.
+
+This is the **Rust analogue of the TS React two-pass** that #83's **N2** ("No Rust absorption")
+declared has **"no Rust analogue — do not replicate."** The target model **deliberately reverses
+N2 for this one escaping-capture channel only** (not a general Rust absorption mechanism), so an
+implementer who expects N2 to hold everywhere isn't blindsided.
+
+**Cross-language — re-attribution is the universal half (a provability limit).** TS/JS and
+Python nested functions capture outer variables **exactly like Rust closures**, and a captured
+mutation of a truly-local outer variable consumed in-frame is morally **contained** in those
+languages too. The difference is **epistemic, not ontological**: Rust's ownership/borrow system
+gives a cheap **syntactic proof of containment** (an owned `let`) that GC languages lack, so
+absent that proof they **conservatively default** captured mutations to external. So
+**re-attribution to the binding's owner is cross-language**: any frontend's nested-fn/closure
+that mutates a captured outer binding produces (conservatively) an external effect the enclosing
+scope's caller should see. The **Rust-only ownership-based refinement** is the *contained* branch
+— a captured **owned local** stays put (discounted), a subset with **no cross-language analog**,
+because only Rust can cheaply *prove* the owned-value capture contained. Do **not** frame
+TS/Python as weaker: they simply **lack Rust's cheap proof** and so keep only the external
+(re-attributed) default. A **language-neutral** proof the model doesn't yet exploit —
+**inline-non-escaping consumption** (the closure passed directly to a synchronous
+`.forEach`/`.map`/`.for_each` and never stored/returned/spawned) — would let TS/Python re-contain
+too; flagged as a future refinement in `mutation-classification-guideline.md`. Evidence and the
+FP/TP split that drove this: `docs/032-nested-unit-dogfood.md` (Q5) and
+`adding-a-language-frontend.md` §3.1.
+
 ### The opaque boundary — the one *unknown*
 
 An edge that leaves the in-scope set is a boundary FxRank is **not permitted to look

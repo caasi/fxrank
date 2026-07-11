@@ -37,6 +37,114 @@ cascade (see *Per-frontend realization*).
 `hidden.mutation` subreasons: `"interior-mut"` (Rust interior-mutability), `"ref-cell-write"`
 (TS `useRef().current`), `"captured-binding"` (the unresolved fallback, all three).
 
+## Target model — captured-write classification via the capture environment *(not yet implemented)*
+
+The two captured-write rows above (*interior-mutability / ref-cell write* and
+*captured-enclosing / unresolved base*) are where #83 currently **guesses**. Once a closure
+is its own unit, its write sites are classified with **no** enclosing scope in hand, and the
+dogfood (`docs/032-nested-unit-dogfood.md`, Q5) showed that forces a bad choice: Q5(a) emits a
+flat `hidden.mutation "captured-binding"` for every captured write (**over-scores**); Q5(c)
+move-gates it to contained `local.mutation` for every non-`move` closure (**under-scores** —
+see the Q5(c) bullet under *Honest per-language differences*, which is what current Rust ships).
+Neither can tell a captured **owned local** from a captured **`&mut` param** from a captured
+**`&RefCell`**, because the discriminator — the *nature of the captured binding* — lives in the
+enclosing scope the isolated closure unit threw away. The target model **stops guessing** by
+carrying that scope in.
+
+**The capture environment (context, not effects).** When a frontend recurses into a closure to
+analyze it as its own unit, it threads in the **enclosing** unit's binding sets: the
+`&mut`-param set, the shared-`&`-ref set, the owned-local (`let`/`let mut`) set, and the module
+`static`s. This is the **capture environment** — it supplies classification *context*
+downward and carries **no** effects (the closure still owns its own effects, so there is **no
+double-count**; the #83 boundary for *effects* is intact). See
+`adding-a-language-frontend.md` §3.1 for the cross-language principle.
+
+**The captured-write cascade.** A write whose base is **not** in the closure's OWN sets is
+looked up in the capture environment and classified by **what it is there**:
+
+| captured base resolves to (in the enclosing env) | EffectKind | class | contained | escapes? |
+|---|---|:--:|:--:|:--:|
+| **owned local** (enclosing `let`/`let mut`, **plain in-frame value**) — **Rust-only case** | local.mutation | 1 | yes | no — the borrow can't outlive the enclosing frame, genuinely contained |
+| **`&mut` param** (enclosing `mut_params`) | param.mutation-class | 3 | no | **yes** — the referent is caller-owned |
+| **`&` / `&RefCell`** (enclosing `shared_refs`) | hidden.mutation (`interior-mut`) | 3 | no | yes — interior mutability, must score high (anti-Goodhart) |
+| **`static`** (enclosing module statics) | global.mutation | 6 | no | yes |
+| **genuinely unresolved** (in no set, own or captured) | hidden.mutation (`captured-binding`) | 3 | no | yes — the existing fallback, now only the true unknowns |
+
+The owned-local → contained row holds **conditionally, not unconditionally**: only for an owned
+local whose *type* is a **plain in-frame value**. An owned local whose type is an **aliasing
+handle** (`Arc`/`Mutex`/`Sender`/`RefCell`/raw ptr — see *Known residual*) is **NOT** contained
+even though it is an owned `let`, because mutating through it escapes the frame; such ambiguous
+owned-handle locals default to `hidden`.
+
+The `&mut`-param case is the crux: the move-gate (Q5(c)) contains it because a non-`move`
+closure borrows, but the *referent* is caller-owned, so the mutation is **caller-visible /
+escaping**, not contained. Only the capture environment distinguishes it from a captured owned
+local. Escaping captured writes are additionally **re-attributed to the binding's owner** (the
+enclosing unit); contained ones stay in the closure's own record — see
+`cross-file-resolution-guideline.md`, *Captured-effect re-attribution* (the principled
+resolution of the deferred Q5(b)).
+
+**Known residual (honest).** A binding's nature is syntactically visible for **params** (types
+are written in the signature: `dst: &mut Vec`) and for **most locals** (`let r = &mut x` shows
+the `&mut`; `let v = Vec::new()` is owned). Two residual classes escape a purely syntactic pass,
+and **both default conservatively to `hidden`** (prefer over-report to a false-negative):
+
+- A rare **type-inferred reference local** — a `let` whose RHS doesn't syntactically reveal
+  `&`/`&mut` but whose *inferred* type is a reference — cannot be told from an owned local by a
+  syntactic pass.
+- An **owned handle / interior-mutability-carrier local** — an owned local whose *type* aliases
+  state **outside the frame**: `Arc`, `Rc`, `Mutex`, `RwLock`, `Cell`, `RefCell`,
+  `Sender`/channel handles, atomics-by-value, raw pointers, `&'static mut`. The handle is an
+  owned local, but mutating *through* it is **caller-visible / cross-thread** — so it is **NOT
+  contained**. Without type inference this is **syntactically indistinguishable** from a plain
+  owned value (`let v = Vec::new()`), so an ambiguous owned-handle local defaults **up** to
+  `hidden`, not down to contained.
+
+**Why the owned-handle default is load-bearing:** it is what prevents a **regression vs the
+currently-shipped move-gate (Q5(c))** on the `spawn(move || arc_mutex.lock()…push())`
+cross-thread pattern — under-scoring an escaping cross-thread mutation is exactly the
+anti-Goodhart false-negative the tool exists to prevent.
+
+Milestone-A is syntactic; a precise owned-vs-borrowed / owned-vs-aliasing-handle answer needs
+type inference and is out of scope.
+
+**Cross-language — an epistemic limit, not an ontological one.** TS/JS and Python nested
+functions **do** capture outer variables, exactly like Rust closures — this is not a Rust
+peculiarity. And a captured mutation of a **truly-local outer variable consumed in-frame** IS
+morally *contained* in those languages too — the very same shape as the Rust FP the capture
+environment discounts. The real difference is **not** that GC-language captures are
+ontologically external; it is **epistemic**: Rust's ownership/borrow system hands the frontend a
+cheap **syntactic proof of containment** (an owned `let` → the borrow can't outlive the frame)
+that GC languages lack. Absent that proof they **conservatively default** captured mutations to
+external — they *can't cheaply prove* containment, not that there is *nothing to contain*. So:
+
+- **Universal (all frontends).** Absent a containment proof, a captured mutation is treated as
+  an **external effect** → it **re-attributes to the binding's owner** (the enclosing unit).
+  Threading the enclosing binding environment in as context, and re-attributing the captured
+  mutation to the owner, is the **cross-language** core of this model — a TS/Python
+  nested-fn/closure mutating a captured outer binding is (conservatively) an external effect its
+  enclosing scope's caller should see, same principle.
+- **Rust-only ownership-based contained case.** Ownership gives Rust a *second*, **provable**
+  case where the GC languages conservatively keep **one**: a captured **owned local** is
+  *contained* (the mutation can't escape unless the closure is `move` and itself escapes) — the
+  owned-`let` syntax plus the capture environment is the cheap proof, and the capture
+  environment is what finds this subset and discounts it. A captured **`&mut` param / `&`-ref**
+  stays external and caller-visible, the same as the conservative GC-language default.
+
+There is **also** a **language-neutral** containment signal this model does not yet exploit:
+**inline-non-escaping consumption** — the closure is passed **directly to a synchronous
+consumer** (`.forEach` / `.map` / `.for_each`) and is **never stored, returned, or spawned**.
+That proves containment in **TS/Python too** (not only Rust), and it would additionally catch the
+`move` + synchronous residual the Rust move-gate misses (see *Rust `move`-gated captured-binding*
+below). Flag it as a **future cross-language refinement** to the conservative default.
+
+So the shared model is "thread the enclosing binding environment as context; absent a proof of
+containment, a captured mutation is external and re-attributes to the owner," and Rust *adds* an
+ownership-proved contained-owned-local discount on top — with inline-non-escaping consumption a
+still-unexploited proof available to **every** frontend. This supersedes both #83 guesses; it does
+**not** claim TS/Python already do it — and it does not frame them as weaker, only as **lacking
+Rust's cheap syntactic proof** of containment.
+
 ## Honest per-language differences (intentional — not aligned)
 
 - **Rust mut-channel discount** (`apply_discount`, `&mut`→−2/`&mut self`→−1, unsafe-cancel) —
@@ -53,7 +161,10 @@ cascade (see *Per-frontend realization*).
   a Rust-only keyword, so this precision refinement is **Rust-specific** — TS/Python closures always
   capture by reference and can escape freely with no syntactic marker, so they keep emitting
   `captured-binding` for the identical closure shape. Intentional divergence (this file "is not a
-  contract"); evidence in `docs/032-nested-unit-dogfood.md`.
+  contract"); evidence in `docs/032-nested-unit-dogfood.md`. **This move-gate is a coarse interim**:
+  it is superseded by the *Target model — captured-write classification via the capture environment*
+  above, which replaces "is the closure `move`?" with "what is the captured binding's nature in the
+  enclosing environment?" — the precise discriminator the move-gate only approximates.
 - **Plain rebind `x = …`** — Python no-emits (name-rebinding ≠ mutation); TS/Rust emit
   local.mutation/1 (variable-slot reassignment).
 - **Per-language mutating-method allowlists** — language-appropriate vocabularies.

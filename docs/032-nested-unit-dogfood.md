@@ -93,9 +93,26 @@ closure is consumed.
 
 **The single TP** is ripgrep `crates/core/main.rs:183` (`search_parallel`): a
 `Box::new(move |result| { … searcher.printer()… })` **boxed and moved into**
-`WalkParallel::run`, executed on worker threads — the captured `searcher` escapes, so its
-mutation is genuinely non-local. The escape-based definition correctly keeps this a TP; a
-naive "captured-write ⇒ FP" rule would have mislabeled it.
+`WalkParallel::run`, executed on worker threads — the captured `searcher` escapes. Under the
+shipped **escape-based** FP/TP definition this is correctly a TP (a naive "captured-write ⇒ FP"
+rule would have mislabeled it) — but the label is **lens-dependent**, and reading the two lenses
+side by side is instructive:
+
+- **Over-flagged under thread-escape.** The escape reading marks it a TP purely because the
+  closure *runs elsewhere* (on worker threads).
+- **Contained under caller-visibility.** `searcher` is a **private, cloned owned local** — the
+  closure's *own* data, `.clone()`d before capture and **never visible to `search_parallel`'s
+  caller** — so mutating it leaks nothing upward. Under the target model's **caller-visibility**
+  lens (the one re-attribution uses) this is morally **contained**, and the escape-based label
+  over-reports.
+
+**Keep the counterexample right here** — it is why owned-local → contained is **conditional, not
+unconditional** (ties to *Known residual* in
+[`mutation-classification-guideline.md`](mutation-classification-guideline.md)): had the closure
+captured-and-moved an `Arc<Mutex<…>>` or a `Sender` instead of a plain cloned value, mutating
+*through* that handle **would** be caller-visible / cross-thread — genuinely escaping — even
+though the handle is equally an owned local. The discriminator is the binding's **type** (plain
+in-frame value vs aliasing handle), not merely "is it an owned local."
 
 ### Per-site classification (evidence for spot-checking the escape judgment)
 
@@ -199,6 +216,19 @@ TP loss** (empirical, this scan).
 - *Precision edge — `move` + synchronous.* A `move` closure consumed synchronously (`let cb = move
   |x| out.push(x); (0..3).for_each(cb);`) moves `out` into the closure (morally local) yet
   move-gating keeps it hidden — a residual FP move-ness alone cannot catch. Zero occurrences here.
+  (The language-neutral **inline-non-escaping-consumption** proof flagged in
+  `mutation-classification-guideline.md` would also catch this residual.)
+
+**Free bonus when re-attribution lands (F5 restoration).** Re-attribution — threading the
+**enclosing** unit's env down into the closure (the capture environment that supersedes this
+interim move-gate; see
+[`cross-file-resolution-guideline.md`](cross-file-resolution-guideline.md), *Captured-effect
+re-attribution*) — is also the natural place to **restore the F5 `unsafe fn` context** the
+isolated closure currently loses. Today a closure is its own unit with `unsafety = false`, so a
+`RawPtrDeref` / discount-cancel write inside a closure sitting in an `unsafe fn` silently vanishes
+(plan F5). The same enclosing-env thread that carries the binding sets down can carry the
+`unsafe`-context bit and re-derive those signals — a **free correctness bonus** riding on the
+re-attribution machinery, not separate work.
 
 **Cross-language:** `move` is a Rust-only keyword and the guarantee is the borrow checker's, so
 Q5(c) is a Rust-specific precision win with **no cross-language obligation** — but it *diverges*
