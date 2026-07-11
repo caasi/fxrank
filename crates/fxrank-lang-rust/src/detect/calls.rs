@@ -54,9 +54,11 @@ impl<'a, 'ast> Visit<'ast> for CallWalker<'a> {
     // closure are each their OWN unit, so the parent walk must NOT descend into
     // them — otherwise the parent double-counts the nested unit's effects. Empty
     // no-ops (no default recursion) stop the walk at every such boundary.
-    fn visit_item(&mut self, _n: &'ast syn::Item) { /* nested-unit boundary: stop */
+    fn visit_item(&mut self, _n: &'ast syn::Item) {
+        // nested-unit boundary (#83): stop — this item is its own unit
     }
-    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) { /* boundary: stop */
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) {
+        // nested-unit boundary (#83): stop — this closure is its own unit
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {

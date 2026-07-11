@@ -98,9 +98,11 @@ impl<'ast> Visit<'ast> for RiskWalker {
     // rationale. F5: a closure in an `unsafe fn` thereby loses the enclosing
     // unsafe context (the closure unit is `unsafety=false`); this is an accepted,
     // edition-dependent FN delta — we do NOT thread an `in_unsafe_fn` bit here.
-    fn visit_item(&mut self, _n: &'ast syn::Item) { /* nested-unit boundary: stop */
+    fn visit_item(&mut self, _n: &'ast syn::Item) {
+        // nested-unit boundary (#83): stop — this item is its own unit
     }
-    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) { /* boundary: stop */
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) {
+        // nested-unit boundary (#83): stop — this closure is its own unit
     }
 
     // ── unsafe { } blocks ────────────────────────────────────────────────────

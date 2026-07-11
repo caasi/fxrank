@@ -36,9 +36,11 @@ struct MacroWalker {
 impl<'ast> Visit<'ast> for MacroWalker {
     // Nested-unit boundary (#83): stop at every nested item and closure so the
     // parent does not count a nested unit's macros. See calls.rs for the rationale.
-    fn visit_item(&mut self, _n: &'ast syn::Item) { /* nested-unit boundary: stop */
+    fn visit_item(&mut self, _n: &'ast syn::Item) {
+        // nested-unit boundary (#83): stop — this item is its own unit
     }
-    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) { /* boundary: stop */
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) {
+        // nested-unit boundary (#83): stop — this closure is its own unit
     }
 
     /// `visit_macro` fires for every `syn::Macro` node regardless of whether

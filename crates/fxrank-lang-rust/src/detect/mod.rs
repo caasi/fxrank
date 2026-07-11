@@ -82,9 +82,11 @@ fn count_awaits(body: &crate::functions::FnBodyOwned) -> usize {
         // are its OWN unit's, so stop at every nested item and closure. A bare
         // `async { … }` block is an `ExprAsync` (not a closure/item) and is NOT
         // stopped — its awaits stay parent-attributed (N4).
-        fn visit_item(&mut self, _n: &'ast syn::Item) { /* nested-unit boundary: stop */
+        fn visit_item(&mut self, _n: &'ast syn::Item) {
+            // nested-unit boundary (#83): stop — this item is its own unit
         }
-        fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) { /* boundary: stop */
+        fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) {
+            // nested-unit boundary (#83): stop — this closure is its own unit
         }
         fn visit_expr_await(&mut self, _node: &'ast syn::ExprAwait) {
             self.0 += 1;

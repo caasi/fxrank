@@ -44,9 +44,11 @@ struct RefsWalker<'a> {
 impl<'a, 'ast> Visit<'ast> for RefsWalker<'a> {
     // Nested-unit boundary (#83): stop at every nested item and closure so the
     // parent does not emit call refs for a nested unit's body. See calls.rs.
-    fn visit_item(&mut self, _n: &'ast syn::Item) { /* nested-unit boundary: stop */
+    fn visit_item(&mut self, _n: &'ast syn::Item) {
+        // nested-unit boundary (#83): stop — this item is its own unit
     }
-    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) { /* boundary: stop */
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) {
+        // nested-unit boundary (#83): stop — this closure is its own unit
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {

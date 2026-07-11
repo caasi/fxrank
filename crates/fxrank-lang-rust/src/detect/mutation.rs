@@ -415,9 +415,11 @@ impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
     // `visit_expr_for_loop`/`visit_expr_let`/`visit_arm` below still seed the
     // PARENT's own bindings (not nested units). F5: a closure in an `unsafe fn`
     // loses the enclosing unsafe context — accepted, edition-dependent FN delta.
-    fn visit_item(&mut self, _n: &'ast syn::Item) { /* nested-unit boundary: stop */
+    fn visit_item(&mut self, _n: &'ast syn::Item) {
+        // nested-unit boundary (#83): stop — this item is its own unit
     }
-    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) { /* boundary: stop */
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) {
+        // nested-unit boundary (#83): stop — this closure is its own unit
     }
 
     fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
