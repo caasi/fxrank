@@ -460,6 +460,46 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
         self.in_unit_body = saved_in_unit;
     }
 
+    // More const-expr container positions (siblings of the const/static/assoc-const
+    // overrides above): an enum discriminant, an array length, and a const-generic
+    // default are each a compile-time *expression* body, so a named `fn`/nested
+    // `impl` inside them is block-local and NOT importable — it must be nested.
+    //
+    // `visit_item_enum` threads `in_test` from the enum's own attrs (so a
+    // `#[cfg(test)] enum` makes its discriminant fn/closure test-only); the
+    // `in_unit_body` part is set per const-expr position below.
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        let saved_test = self.in_test;
+        self.in_test = self.in_test || is_cfg_test(&node.attrs);
+        visit::visit_item_enum(self, node);
+        self.in_test = saved_test;
+    }
+
+    fn visit_variant(&mut self, node: &'ast syn::Variant) {
+        // The variant's `discriminant` is the const-expr; treat the whole variant
+        // as a unit body (its contents are never importable).
+        let saved_in_unit = self.in_unit_body;
+        self.in_unit_body = true;
+        visit::visit_variant(self, node);
+        self.in_unit_body = saved_in_unit;
+    }
+
+    fn visit_const_param(&mut self, node: &'ast syn::ConstParam) {
+        // The const-generic `default` (`<const N: usize = { … }>`) is the const-expr.
+        let saved_in_unit = self.in_unit_body;
+        self.in_unit_body = true;
+        visit::visit_const_param(self, node);
+        self.in_unit_body = saved_in_unit;
+    }
+
+    fn visit_type_array(&mut self, node: &'ast syn::TypeArray) {
+        // The array `len` (`[u8; { … }]`) is the const-expr.
+        let saved_in_unit = self.in_unit_body;
+        self.in_unit_body = true;
+        visit::visit_type_array(self, node);
+        self.in_unit_body = saved_in_unit;
+    }
+
     fn visit_local(&mut self, node: &'ast syn::Local) {
         // `let f = |…|` — hand the binding name to the next closure visited.
         if let Some(init) = &node.init
@@ -736,6 +776,12 @@ mod tests {
             "static Y: () = { fn helper() {} };",
             "struct S; impl S { const C: () = { fn helper() {} }; }",
             "trait T { const C: () = { fn helper() {} }; }",
+            // Three more const-expr positions where a named fn is equally
+            // block-local and non-importable (added with visit_variant /
+            // visit_type_array / visit_const_param):
+            "enum E { A = { fn helper() {} 1 } }", // (a) enum discriminant
+            "type T = [u8; { fn helper() {} 1 }];", // (b) array length
+            "struct S<const N: usize = { fn helper() {} 1 }>;", // (c) const-generic default
         ] {
             let file = syn::parse_file(src).unwrap();
             let units = collect(&file, "a.rs");
@@ -748,5 +794,23 @@ mod tests {
                 "a fn inside a const-expr container must be nested (non-importable): {src}"
             );
         }
+    }
+
+    #[test]
+    fn cfg_test_enum_discriminant_fn_is_test() {
+        // A named fn inside a `#[cfg(test)] enum` discriminant must inherit the
+        // enum's cfg(test)-ness (base Collector threads in_test through the enum
+        // via visit_item_enum; visit_variant does the in_unit_body part).
+        let src = "#[cfg(test)]\nenum E { A = { fn h() {} 1 } }";
+        let file = syn::parse_file(src).unwrap();
+        let units = collect(&file, "a.rs");
+        let h = units
+            .iter()
+            .find(|u| u.symbol == "h")
+            .expect("discriminant fn `h` must be collected");
+        assert!(
+            h.is_test,
+            "a fn in a #[cfg(test)] enum discriminant must be is_test"
+        );
     }
 }
