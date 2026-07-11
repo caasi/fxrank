@@ -43,14 +43,6 @@ pub struct FnSig {
     /// closure's by-value `mut` param into `let_mut`; a named fn's by-value
     /// `mut` param stays silent. Distinct from `FnUnit`-level nesting identity.
     pub is_closure: bool,
-    /// True ONLY for a `move` closure (the `move` keyword token was present).
-    /// A non-`move` closure captures a local/param by `&mut` *borrow*, so the
-    /// borrow checker guarantees the mutation cannot outlive the enclosing fn —
-    /// the mutation seed uses this to classify such a captured write as
-    /// *contained* `local.mutation` rather than the hidden captured-binding
-    /// fallback. A `move` closure captures by value and can escape, so it keeps
-    /// the hidden classification. Always `false` for named fns/methods.
-    pub is_move: bool,
     /// `sig.span().start()` mapped to `(line, col+1)` for the `UnsafeFn` risk
     /// anchor — `Some` only for an `unsafe fn`; `None` otherwise (incl. closures).
     pub unsafe_anchor: Option<(usize, usize)>,
@@ -83,7 +75,6 @@ impl FnSig {
             unsafety,
             asyncness: sig.asyncness.is_some(),
             is_closure: false,
-            is_move: false,
             unsafe_anchor,
         }
     }
@@ -493,8 +484,6 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
             unsafety: false,
             asyncness: node.asyncness.is_some(),
             is_closure: true,
-            // The `move` keyword token: present → captures by value (can escape).
-            is_move: node.capture.is_some(),
             unsafe_anchor: None,
         };
         let body = match &*node.body {

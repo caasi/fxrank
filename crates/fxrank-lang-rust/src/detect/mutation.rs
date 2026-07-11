@@ -71,13 +71,6 @@ struct MutationWalker<'a> {
     statics: &'a HashSet<String>,
     /// The `use`-table, for resolving a write base through an import.
     imports: &'a ImportTable,
-    /// True when this unit is a closure (seeded from `sig.is_closure`).
-    is_closure: bool,
-    /// True when this unit is a `move` closure (seeded from `sig.is_move`). A
-    /// non-`move` closure (`is_closure && !is_move`) captures by `&mut` borrow →
-    /// its captured write is borrow-contained (`local.mutation`); a `move`
-    /// closure captures by value and can escape → hidden `captured-binding`.
-    is_move: bool,
     effects: Vec<Effect>,
 }
 
@@ -97,8 +90,6 @@ impl<'a> MutationWalker<'a> {
             unsafe_fn: sig.unsafety,
             statics,
             imports,
-            is_closure: sig.is_closure,
-            is_move: sig.is_move,
             effects: Vec::new(),
         };
         // Receiver (method `self`) — seed exactly as the old `FnArg::Receiver` arm.
@@ -275,42 +266,20 @@ impl<'a> MutationWalker<'a> {
             );
         } else if !self.locals.contains(&base) && base != "self" {
             // 008-F1: the base resolves to no local/param/self/static binding —
-            // a write to a captured/unresolved outer binding. How to classify it
-            // depends on WHETHER THIS UNIT IS A NON-`move` CLOSURE.
+            // a write to a captured/unresolved outer binding, hidden from this
+            // signature → hidden.mutation (class 3, hidden). TS parity.
             //
             // Guard: `base != "self"` drops misattributed nested-receiver writes
             // that reach here (same root cause as F5 guard above).
-            if self.is_closure && !self.is_move {
-                // Q5(c): a non-`move` closure captures the outer binding by `&mut`
-                // BORROW, so the borrow checker guarantees the mutation cannot
-                // outlive the enclosing fn — the write is *contained* to the fn,
-                // exactly like a body-local mutation → local.mutation (class 1,
-                // NOT hidden). Only a `move` closure captures by value and can
-                // escape; named fns/methods have no capture channel at all.
-                self.push_plain(
-                    EffectKind::LocalMutation,
-                    Tier::Heuristic,
-                    false,
-                    line,
-                    col,
-                    format!("write to captured borrow {base}"),
-                    Some("captured-borrow"),
-                );
-            } else {
-                // A `move` closure (captures by value → can escape the fn) OR a
-                // named fn/method (opaque outer binding) → the write is hidden
-                // from this signature → hidden.mutation (class 3, hidden). TS
-                // parity; the pre-Q5(c) behavior for this arm.
-                self.push_plain(
-                    EffectKind::HiddenMutation,
-                    Tier::Heuristic,
-                    true,
-                    line,
-                    col,
-                    format!("write to captured binding {base}"),
-                    Some("captured-binding"),
-                );
-            }
+            self.push_plain(
+                EffectKind::HiddenMutation,
+                Tier::Heuristic,
+                true,
+                line,
+                col,
+                format!("write to captured binding {base}"),
+                Some("captured-binding"),
+            );
         }
     }
 }
@@ -615,66 +584,5 @@ mod tests {
             kinds.contains(&EffectKind::LocalMutation),
             "the closure mutation should be local.mutation; got {kinds:?}"
         );
-    }
-
-    /// Collect the mutation effects of the single closure unit in `src`.
-    fn closure_effects(src: &str) -> Vec<Effect> {
-        let file = syn::parse_file(src).unwrap();
-        let imports = ImportTable::from_file(&file);
-        let statics = HashSet::new();
-        let units = crate::functions::collect(&file, "t.rs");
-        let closure = units
-            .iter()
-            .find(|u| u.sig.is_closure)
-            .expect("closure must be collected as its own unit");
-        detect(&closure.body, &closure.sig, &statics, &imports)
-    }
-
-    /// Q5(c): a NON-`move` closure that writes to a captured outer binding
-    /// captures it by `&mut` borrow, so the mutation is borrow-contained to the
-    /// enclosing fn → `local.mutation` (class 1, NOT hidden), subreason
-    /// `captured-borrow`. (Pre-Q5(c) this emitted the captured-binding
-    /// `hidden.mutation` FP.)
-    #[test]
-    fn nonmove_closure_captured_write_is_contained() {
-        let src = "fn f() { let mut v: Vec<i32> = Vec::new(); (0..3).for_each(|x| v.push(x)); }";
-        let effects = closure_effects(src);
-        let kinds: Vec<EffectKind> = effects.iter().map(|e| e.kind).collect();
-        assert!(
-            kinds.contains(&EffectKind::LocalMutation),
-            "non-move closure captured write must be contained local.mutation; got {kinds:?}"
-        );
-        assert!(
-            !kinds.contains(&EffectKind::HiddenMutation),
-            "non-move closure captured write must NOT be hidden.mutation; got {kinds:?}"
-        );
-        let e = effects
-            .iter()
-            .find(|e| e.kind == EffectKind::LocalMutation)
-            .expect("expected a local.mutation effect");
-        assert_eq!(e.subreason.as_deref(), Some("captured-borrow"));
-        assert!(!e.hidden, "borrow-contained write is not hidden");
-        assert!(e.contained, "borrow-contained write is contained");
-    }
-
-    /// Q5(c) boundary: a `move` closure captures by value and can escape the
-    /// enclosing fn, so its captured write STAYS hidden → `hidden.mutation`,
-    /// subreason `captured-binding` (unchanged pre-Q5(c) behavior).
-    #[test]
-    fn move_closure_captured_write_stays_hidden() {
-        let src =
-            "fn f() { let mut v: Vec<i32> = Vec::new(); let c = move |x| v.push(x); let _ = c; }";
-        let effects = closure_effects(src);
-        let kinds: Vec<EffectKind> = effects.iter().map(|e| e.kind).collect();
-        assert!(
-            kinds.contains(&EffectKind::HiddenMutation),
-            "move closure captured write must stay hidden.mutation; got {kinds:?}"
-        );
-        let e = effects
-            .iter()
-            .find(|e| e.kind == EffectKind::HiddenMutation)
-            .expect("expected a hidden.mutation effect");
-        assert_eq!(e.subreason.as_deref(), Some("captured-binding"));
-        assert!(e.hidden, "move-captured write is hidden");
     }
 }
