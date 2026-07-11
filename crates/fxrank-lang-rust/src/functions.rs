@@ -112,9 +112,11 @@ pub struct FnUnit {
     pub id: String,
     /// Source file path (as passed in).
     pub path: String,
-    /// 1-based line number of the function's name (`sig.ident`).
+    /// 1-based line number of the function's name (`sig.ident`), or of the
+    /// opening `|…|` for a closure (which has no name).
     pub line: usize,
-    /// 1-based character column of the function's name (`sig.ident`).
+    /// 1-based character column of the function's name (`sig.ident`), or of the
+    /// opening `|…|` for a closure.
     pub col: usize,
     /// The normalized function signature (for detectors to inspect asyncness,
     /// unsafety, receiver/params for mutation seeding, etc.).
@@ -264,6 +266,18 @@ impl Collector<'_> {
 fn name_line_col(span: proc_macro2::Span) -> (usize, usize) {
     let start = span.start();
     (start.line, start.column + 1)
+}
+
+/// Peel transparent `(…)` and invisible-group wrappers to reach the inner
+/// expression, so `let f = (|| …)` sees the closure the same as `let f = || …`.
+fn unwrap_expr_wrappers(mut expr: &syn::Expr) -> &syn::Expr {
+    loop {
+        match expr {
+            syn::Expr::Paren(p) => expr = &p.expr,
+            syn::Expr::Group(g) => expr = &g.expr,
+            other => return other,
+        }
+    }
 }
 
 /// The binding ident of a `let <ident> = …` pattern, else `None` (only the
@@ -502,8 +516,9 @@ impl<'ast> Visit<'ast> for Collector<'ast> {
 
     fn visit_local(&mut self, node: &'ast syn::Local) {
         // `let f = |…|` — hand the binding name to the next closure visited.
+        // Peel `(…)`/group wrappers so `let f = (|| …)` adopts `f` too.
         if let Some(init) = &node.init
-            && matches!(&*init.expr, syn::Expr::Closure(_))
+            && matches!(unwrap_expr_wrappers(&init.expr), syn::Expr::Closure(_))
         {
             self.pending_name = let_binding_name(&node.pat);
         }
@@ -695,6 +710,25 @@ mod tests {
         assert!(
             !syms.iter().any(|s| s.starts_with("<closure@L")),
             "no positional fallback for a typed let binding; got {syms:?}"
+        );
+    }
+
+    #[test]
+    fn paren_wrapped_let_closure_adopts_binding_name() {
+        // A parenthesized initializer parses as `Expr::Paren` wrapping the
+        // closure; peel it so `let f = (|| …)` adopts `f` (not a positional
+        // fallback), else the later `f()` ref can't resolve to the closure unit.
+        let src = "fn m() { let f = (|| 1); f(); }";
+        let file = syn::parse_file(src).unwrap();
+        let units = collect(&file, "a.rs");
+        let syms: Vec<&str> = units.iter().map(|u| u.symbol.as_str()).collect();
+        assert!(
+            syms.contains(&"f"),
+            "paren-wrapped let-bound closure adopts `f`; got {syms:?}"
+        );
+        assert!(
+            !syms.iter().any(|s| s.starts_with("<closure@L")),
+            "no positional fallback for a paren-wrapped let binding; got {syms:?}"
         );
     }
 
