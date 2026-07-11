@@ -150,30 +150,40 @@ in-frame value vs aliasing handle), not merely "is it an owned local."
 
 ### Verdict
 
-**Outcome: #83 ships Q5(a) — 16 FP sites, gate `≤ 20` passed** (far below the FP > 50 reopen
-line). Every FP turned out to be a non-`move` closure (a borrow-contained, morally-local write),
-which motivated a move-gated interim (**Q5(c)**) that was **implemented and then reverted after
-review** — it regresses several genuinely-escaping cases (see the next section). The correct fix
-is the **capture-environment model, filed as #84**. The Q5(a) measurement below is what the
-ship decision rests on:
+**Outcome: #83 ships Q5(a) — as a deliberate defer-to-#84, with the pre-registered clean-ship
+line breached.** The gate metric (§ "Gate & diagnostics") is **total** closure `captured-binding`
+FP; the total is **25**, which **exceeds the ≤ 20 clean-ship line** and lands in the **21–50
+advisory band** (far below the > 50 reopen line). Per the pre-registered protocol a breach of the
+clean-ship line does **not** auto-ship — it "records the finding and hands the merge-vs-defer
+decision to review." Review made that call: **ship Q5(a) now, track the precision fix as #84.**
+(Q5(c), a move-gated interim, was implemented and then **reverted after review** — it regresses
+several genuinely-escaping cases; see the next section. The correct fix is the
+**capture-environment model, filed as #84**.)
 
-- **Per unique closure site: 16 FP ≤ 20** ⇒ clean-ship threshold met — the operative criterion.
-  *Comparator caveat (not apples-to-apples):* the **#55 ~76-site** "unacceptable" figure was the
-  **pre-#78-fix** total across **all** previously-unseeded binding forms (`for`/`if let`/`while
-  let`/`match`-arm **and** closure params), most of which were fixed and closed *before* this
-  dogfood ran; today's **16 is a narrower, closure-only, post-#78** population. So the two are
-  not the same population — the `≤ 20` gate, not a headline percentage against 76, is what the
-  verdict rests on. (16 is comfortably under 20 on its own terms.)
-- **Per emission: 25 FP** — sits in the 21–50 advisory band (above the ≤ 20 clean-ship line,
-  far below the > 50 reopen line). Every emission beyond the 16 sites is a **repeat captured
-  write inside an already-counted non-escaping visitor closure** (e.g. `config.rs:90` = one
-  closure, three emissions `line_number`/`args`/`errs`; `bindings.rs:37` = one closure, three
-  `names` writes), not a new distinct false hotspot.
+What made *defer-not-reopen* the defensible call — **diagnostics, not a re-definition of the
+gate**:
 
-Either reading is below the 50 reopen trigger, so **Q5 is not reopened** and **option (b) fold
-re-containment is not built**. The site-vs-emission distinction is surfaced for review, but the
-recommendation is unambiguous: ship the escape-based Q5(a). The single ripgrep TP confirms the
-definition separates escaping mutation from morally-local writes as intended.
+- **The 25 emissions collapse to 16 unique closure sites.** Every emission beyond the 16 is a
+  *repeat* captured write inside an already-counted non-escaping visitor closure (e.g.
+  `config.rs:90` = one closure, three emissions `line_number`/`args`/`errs`; `bindings.rs:37` =
+  one closure, three `names` writes) — repeat-emission inflation of a small morally-local set, not
+  25 distinct false hotspots. This is a **diagnostic** characterizing the 25; it is **not** the
+  pre-registered metric, and the gate is **not** retroactively redefined to "sites."
+- **All 16 sites are morally-local** (visitor / `.map` / `.for_each` callbacks capturing a
+  local-or-param, non-escaping) except the single ripgrep TP, which the escape-based definition
+  correctly separates out.
+- **25 ≪ 50,** so the reopen trigger is not hit and **option (b) fold re-containment is not
+  built** — the finding is deferred to #84, not reopened.
+
+*Comparator caveat (not apples-to-apples):* the **#55 ~76-site** "unacceptable" figure was the
+**pre-#78-fix** total across **all** previously-unseeded binding forms (`for`/`if let`/`while
+let`/`match`-arm **and** closure params), most of which were fixed and closed *before* this
+dogfood ran; today's population is a narrower, **closure-only, post-#78** one. The two are not the
+same population, so no headline percentage against 76 is claimed either way.
+
+The recommendation is to ship the escape-based Q5(a) as a deliberate defer-to-#84, with the
+clean-ship-line breach recorded here in the open. The single ripgrep TP confirms the definition
+separates escaping mutation from morally-local writes as intended.
 
 ## Why not Q5(c) — and the correct fix (#84)
 
