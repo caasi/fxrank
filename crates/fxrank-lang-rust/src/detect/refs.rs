@@ -22,7 +22,7 @@ use syn::visit::Visit;
 /// `referencing_mod` is the module the calling unit lives in (e.g.
 /// `["crate","net"]`), used to expand `self::`/`super::` relative paths.
 pub fn extract(
-    block: &syn::Block,
+    body: &crate::functions::FnBodyOwned,
     imports: &ImportTable,
     referencing_mod: &[String],
 ) -> Vec<CallSiteRef> {
@@ -31,7 +31,7 @@ pub fn extract(
         referencing_mod,
         refs: Vec::new(),
     };
-    walker.visit_block(block);
+    body.walk_with(&mut walker);
     walker.refs
 }
 
@@ -42,6 +42,15 @@ struct RefsWalker<'a> {
 }
 
 impl<'a, 'ast> Visit<'ast> for RefsWalker<'a> {
+    // Nested-unit boundary (#83): stop at every nested item and closure so the
+    // parent does not emit call refs for a nested unit's body. See calls.rs.
+    fn visit_item(&mut self, _n: &'ast syn::Item) {
+        // nested-unit boundary (#83): stop — this item is its own unit
+    }
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) {
+        // nested-unit boundary (#83): stop — this closure is its own unit
+    }
+
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*node.func {
             let base = render_path(&p.path);
@@ -180,7 +189,7 @@ mod tests {
                 }
             })
             .unwrap();
-        extract(&block, &imports, &[])
+        extract(&crate::functions::FnBodyOwned::Block(block), &imports, &[])
     }
 
     fn refs_with_ctx(src: &str, referencing_mod: &[&str]) -> Vec<CallSiteRef> {
@@ -197,7 +206,11 @@ mod tests {
             })
             .expect("fixture must contain a fn item");
         let rmod: Vec<String> = referencing_mod.iter().map(|s| s.to_string()).collect();
-        extract(&block, &imports, &rmod)
+        extract(
+            &crate::functions::FnBodyOwned::Block(block),
+            &imports,
+            &rmod,
+        )
     }
 
     #[test]

@@ -20,12 +20,12 @@ use fxrank_core::score::weight_for_class;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
-/// Detect macro-invocation effects in `block`.
-pub fn detect(block: &syn::Block) -> Vec<Effect> {
+/// Detect macro-invocation effects in `body`.
+pub fn detect(body: &crate::functions::FnBodyOwned) -> Vec<Effect> {
     let mut walker = MacroWalker {
         effects: Vec::new(),
     };
-    walker.visit_block(block);
+    body.walk_with(&mut walker);
     walker.effects
 }
 
@@ -34,6 +34,15 @@ struct MacroWalker {
 }
 
 impl<'ast> Visit<'ast> for MacroWalker {
+    // Nested-unit boundary (#83): stop at every nested item and closure so the
+    // parent does not count a nested unit's macros. See calls.rs for the rationale.
+    fn visit_item(&mut self, _n: &'ast syn::Item) {
+        // nested-unit boundary (#83): stop — this item is its own unit
+    }
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) {
+        // nested-unit boundary (#83): stop — this closure is its own unit
+    }
+
     /// `visit_macro` fires for every `syn::Macro` node regardless of whether
     /// it appears in expression position (`Expr::Macro`), statement position
     /// (`Stmt::Macro`), or item position (`Item::Macro`). All three ultimately

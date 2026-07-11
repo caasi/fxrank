@@ -37,18 +37,18 @@ use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
-/// Detect mutation effects in `block`, seeding binding sets from `sig`.
+/// Detect mutation effects in `body`, seeding binding sets from `sig`.
 ///
 /// `statics` is the file-level set of real `static` item names; `imports` is the
 /// `use`-table. Both feed `record_write`'s base-resolution cascade.
 pub fn detect<'a>(
-    block: &syn::Block,
-    sig: &syn::Signature,
+    body: &crate::functions::FnBodyOwned,
+    sig: &crate::functions::FnSig,
     statics: &'a HashSet<String>,
     imports: &'a ImportTable,
 ) -> Vec<Effect> {
     let mut walker = MutationWalker::seed(sig, statics, imports);
-    walker.visit_block(block);
+    body.walk_with(&mut walker);
     walker.effects
 }
 
@@ -75,7 +75,11 @@ struct MutationWalker<'a> {
 }
 
 impl<'a> MutationWalker<'a> {
-    fn seed(sig: &syn::Signature, statics: &'a HashSet<String>, imports: &'a ImportTable) -> Self {
+    fn seed(
+        sig: &crate::functions::FnSig,
+        statics: &'a HashSet<String>,
+        imports: &'a ImportTable,
+    ) -> Self {
         let mut w = MutationWalker {
             mut_params: HashSet::new(),
             mut_self: false,
@@ -83,29 +87,39 @@ impl<'a> MutationWalker<'a> {
             let_mut: HashSet::new(),
             locals: HashSet::new(),
             unsafe_depth: 0,
-            unsafe_fn: sig.unsafety.is_some(),
+            unsafe_fn: sig.unsafety,
             statics,
             imports,
             effects: Vec::new(),
         };
-        for input in &sig.inputs {
-            match input {
-                syn::FnArg::Receiver(recv) => {
-                    // `&self` / `&mut self` both have `reference = Some`.
-                    if recv.reference.is_some() {
-                        if recv.mutability.is_some() {
-                            w.mut_self = true;
-                        } else {
-                            w.shared_refs.insert("self".to_string());
-                        }
-                    }
-                    w.locals.insert("self".to_string());
+        // Receiver (method `self`) — seed exactly as the old `FnArg::Receiver` arm.
+        if let Some(recv) = &sig.receiver {
+            // `&self` / `&mut self` both have `reference = Some`.
+            if recv.reference.is_some() {
+                if recv.mutability.is_some() {
+                    w.mut_self = true;
+                } else {
+                    w.shared_refs.insert("self".to_string());
                 }
-                syn::FnArg::Typed(pat_type) => {
+            }
+            w.locals.insert("self".to_string());
+        }
+        // Params. Named fns/methods route through the silent signature path
+        // (by-value `mut` discarded, spec 031 Q1); closures honor `is_mut →
+        // let_mut` via `seed_pat_locals` (inert here — no closures in Task 1).
+        for pat in &sig.inputs {
+            if sig.is_closure {
+                // A closure param's by-value `mut` binding routes into `let_mut`
+                // via `seed_pat_locals` (preserves `|mut x| …` → local.mutation).
+                w.seed_pat_locals(pat);
+                // A TYPED closure param (`|x: &mut Vec<i32>|`) ALSO carries a
+                // reference type, exactly like a typed named-fn param — read
+                // `Pat::Type.ty` for a top-level `&mut`/`&` so `x` classifies
+                // identically (mut_params / shared_refs), not silently as a local.
+                if let syn::Pat::Type(pat_type) = pat {
                     let mut bindings = Vec::new();
                     collect_pat_bindings(&pat_type.pat, &mut bindings);
                     for (name, _is_mut) in bindings {
-                        w.locals.insert(name.clone());
                         match &*pat_type.ty {
                             syn::Type::Reference(r) if r.mutability.is_some() => {
                                 w.mut_params.insert(name);
@@ -115,6 +129,21 @@ impl<'a> MutationWalker<'a> {
                             }
                             _ => {}
                         }
+                    }
+                }
+            } else if let syn::Pat::Type(pat_type) = pat {
+                let mut bindings = Vec::new();
+                collect_pat_bindings(&pat_type.pat, &mut bindings);
+                for (name, _is_mut) in bindings {
+                    w.locals.insert(name.clone());
+                    match &*pat_type.ty {
+                        syn::Type::Reference(r) if r.mutability.is_some() => {
+                            w.mut_params.insert(name);
+                        }
+                        syn::Type::Reference(_) => {
+                            w.shared_refs.insert(name);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -335,6 +364,14 @@ impl MutationWalker<'_> {
     /// classifies as `local.mutation`, not the captured-binding `hidden.mutation`
     /// fallback (#55). Flat function-scoped seeding — the Milestone-A scope
     /// approximation `visit_local` already uses (true lexical scoping is #78).
+    ///
+    /// Known Milestone-A FN (plan 032): an UNTYPED closure param (`|v| v.push(1)`,
+    /// a bare `Pat::Ident`) seeds only `locals` here — its type is unknown, so it
+    /// cannot be routed to `mut_params`/`shared_refs`. `record_write` then finds
+    /// `v` in `locals` and emits NOTHING (should ideally be `param.mutation` if the
+    /// caller passed `&mut`). A *typed* closure param (`|v: &mut _|`) is fine — the
+    /// `seed` closure arm reads `Pat::Type.ty` for `&mut`/`&`. Resolving the untyped
+    /// case needs type inference, out of scope for Milestone-A.
     fn seed_pat_locals(&mut self, pat: &syn::Pat) {
         let mut bindings = Vec::new();
         collect_pat_bindings(pat, &mut bindings);
@@ -371,11 +408,18 @@ impl<'a, 'ast> Visit<'ast> for MutationWalker<'a> {
         syn::visit::visit_arm(self, node);
     }
 
-    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
-        for pat in &node.inputs {
-            self.seed_pat_locals(pat); // closure params (`|x| …`)
-        }
-        syn::visit::visit_expr_closure(self, node);
+    // Nested-unit boundary (#83): a nested item and a closure are each their own
+    // unit, so stop the parent walk here (no default recursion). The closure's own
+    // unit seeds its params via `FnSig.is_closure` (Task 1) — the interim
+    // param-seeding this override used to do is now dead. `visit_local`/
+    // `visit_expr_for_loop`/`visit_expr_let`/`visit_arm` below still seed the
+    // PARENT's own bindings (not nested units). F5: a closure in an `unsafe fn`
+    // loses the enclosing unsafe context — accepted, edition-dependent FN delta.
+    fn visit_item(&mut self, _n: &'ast syn::Item) {
+        // nested-unit boundary (#83): stop — this item is its own unit
+    }
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) {
+        // nested-unit boundary (#83): stop — this closure is its own unit
     }
 
     fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
@@ -505,23 +549,22 @@ mod tests {
         let file = syn::parse_file(src).unwrap();
         let imports = ImportTable::from_file(&file);
         let statics = HashSet::new();
-        let item_fn = file
-            .items
-            .iter()
-            .find_map(|it| match it {
-                syn::Item::Fn(f) => Some(f),
-                _ => None,
-            })
-            .expect("expected one fn");
-        detect(&item_fn.block, &item_fn.sig, &statics, &imports)
+        let units = crate::functions::collect(&file, "t.rs");
+        let unit = units.first().expect("expected one fn");
+        detect(&unit.body, &unit.sig, &statics, &imports)
             .iter()
             .map(|e| e.kind)
             .collect()
     }
 
-    /// #78/#55: writes to `for` / `if let` / `while let` / `match`-arm / closure
-    /// bindings must classify as `local.mutation`, not the captured-binding
+    /// #78/#55: writes to `for` / `if let` / `while let` / `match`-arm bindings
+    /// must classify as `local.mutation`, not the captured-binding
     /// `hidden.mutation` FP (previously only `let` seeded locals — ~76× in dogfood).
+    ///
+    /// The closure form (`let c = |mut x| x.push(1)`) is now its OWN unit and is
+    /// asserted separately in `closure_binding_seeds_locals_on_own_unit` — the
+    /// closure's by-value `mut` param routes through `is_closure → let_mut` on the
+    /// closure unit's own seed.
     #[test]
     fn binding_forms_seed_locals_not_captured() {
         let cases = [
@@ -529,7 +572,6 @@ mod tests {
             "fn f(o: Option<Vec<i32>>) { if let Some(mut x) = o { x.push(1); } }",
             "fn f(o: Option<Vec<i32>>) { while let Some(mut x) = o { x.push(1); } }",
             "fn f(r: Result<Vec<i32>, ()>) { match r { Ok(mut x) => x.push(1), _ => {} } }",
-            "fn f() { let c = |mut x: Vec<i32>| x.push(1); let _ = c; }",
         ];
         for src in cases {
             let kinds = mut_kinds(src);
@@ -542,5 +584,63 @@ mod tests {
                 "the mutation should be local.mutation; src={src:?} got {kinds:?}"
             );
         }
+    }
+
+    /// A closure with a by-value `mut` param (`let c = |mut x: Vec<i32>| x.push(1)`)
+    /// is its own unit (Task 2). Its `FnSig.is_closure` routes the `mut` param
+    /// into `let_mut`, so the write classifies as `local.mutation` on the closure
+    /// unit — NOT the captured-binding `hidden.mutation` FP. Assert on the closure
+    /// unit directly (the enclosing `f` transiently double-counts until Task 4).
+    #[test]
+    fn closure_binding_seeds_locals_on_own_unit() {
+        let src = "fn f() { let c = |mut x: Vec<i32>| x.push(1); let _ = c; }";
+        let file = syn::parse_file(src).unwrap();
+        let imports = ImportTable::from_file(&file);
+        let statics = HashSet::new();
+        let units = crate::functions::collect(&file, "t.rs");
+        let closure = units
+            .iter()
+            .find(|u| u.sig.is_closure)
+            .expect("closure must be collected as its own unit");
+        assert_eq!(closure.symbol, "c", "let-bound closure adopts `c`");
+        let kinds: Vec<EffectKind> = detect(&closure.body, &closure.sig, &statics, &imports)
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(
+            !kinds.contains(&EffectKind::HiddenMutation),
+            "closure by-value mut must not be captured hidden.mutation; got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&EffectKind::LocalMutation),
+            "the closure mutation should be local.mutation; got {kinds:?}"
+        );
+    }
+
+    /// A closure with a TYPED `&mut` param (`|x: &mut Vec<i32>| x.push(1)`) must
+    /// route `x` into `mut_params` (exactly like a typed named-fn param), so the
+    /// write emits `param.mutation` — NOT silently nothing. Before the fix the
+    /// closure-param path went through `seed_pat_locals` only, ignoring the
+    /// `Pat::Type` type, so `x` landed in `locals` and `x.push(1)` emitted nothing.
+    #[test]
+    fn closure_typed_mut_ref_param_emits_param_mutation() {
+        let src = "fn f(v: &mut Vec<i32>) { let c = |x: &mut Vec<i32>| { x.push(1); }; c(v); }";
+        let file = syn::parse_file(src).unwrap();
+        let imports = ImportTable::from_file(&file);
+        let statics = HashSet::new();
+        let units = crate::functions::collect(&file, "t.rs");
+        let closure = units
+            .iter()
+            .find(|u| u.sig.is_closure)
+            .expect("closure must be collected as its own unit");
+        assert_eq!(closure.symbol, "c", "let-bound closure adopts `c`");
+        let kinds: Vec<EffectKind> = detect(&closure.body, &closure.sig, &statics, &imports)
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(
+            kinds.contains(&EffectKind::ParamMutation),
+            "a typed &mut closure param mutation must be param.mutation; got {kinds:?}"
+        );
     }
 }

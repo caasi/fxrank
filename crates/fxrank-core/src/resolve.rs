@@ -178,10 +178,8 @@ impl CanonicalIndex {
             if !seen.insert(cur.clone()) {
                 return None; // cycle
             }
-            match self.aliases.get(&cur) {
-                Some(next) => cur = next.clone(),
-                None => return None,
-            }
+            let next = self.aliases.get(&cur)?;
+            cur = next.clone();
         }
     }
 }

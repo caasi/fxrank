@@ -33,19 +33,21 @@ use syn::visit::Visit;
 ///
 /// `path` is the source-file path (the file the risk lives in, as passed
 /// into the frontend); it is stored in every emitted `RiskFeature`.
-pub fn detect_fn_risks(block: &syn::Block, sig: &syn::Signature, path: &str) -> Vec<RiskFeature> {
+pub fn detect_fn_risks(
+    body: &crate::functions::FnBodyOwned,
+    sig: &crate::functions::FnSig,
+    path: &str,
+) -> Vec<RiskFeature> {
     let mut walker = RiskWalker {
         path: path.to_string(),
         unsafe_depth: 0,
-        fn_is_unsafe: sig.unsafety.is_some(),
+        fn_is_unsafe: sig.unsafety,
         features: Vec::new(),
     };
 
-    // `unsafe fn` → UnsafeFn (class 5, Exact).
-    if sig.unsafety.is_some() {
-        let loc = sig.span().start();
-        let line = loc.line;
-        let col = loc.column + 1;
+    // `unsafe fn` → UnsafeFn (class 5, Exact). The anchor is precomputed at
+    // collection time from `sig.span().start()` (Some only for an `unsafe fn`).
+    if let Some((line, col)) = sig.unsafe_anchor {
         walker.push(
             RiskKind::UnsafeFn,
             Tier::Exact,
@@ -55,7 +57,7 @@ pub fn detect_fn_risks(block: &syn::Block, sig: &syn::Signature, path: &str) -> 
         );
     }
 
-    walker.visit_block(block);
+    body.walk_with(&mut walker);
     walker.features
 }
 
@@ -91,6 +93,18 @@ impl RiskWalker {
 }
 
 impl<'ast> Visit<'ast> for RiskWalker {
+    // Nested-unit boundary (#83): stop at every nested item and closure so the
+    // parent does not count a nested unit's risk features. See calls.rs for the
+    // rationale. F5: a closure in an `unsafe fn` thereby loses the enclosing
+    // unsafe context (the closure unit is `unsafety=false`); this is an accepted,
+    // edition-dependent FN delta — we do NOT thread an `in_unsafe_fn` bit here.
+    fn visit_item(&mut self, _n: &'ast syn::Item) {
+        // nested-unit boundary (#83): stop — this item is its own unit
+    }
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) {
+        // nested-unit boundary (#83): stop — this closure is its own unit
+    }
+
     // ── unsafe { } blocks ────────────────────────────────────────────────────
 
     fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {

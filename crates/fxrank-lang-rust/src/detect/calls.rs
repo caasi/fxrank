@@ -13,7 +13,7 @@ use fxrank_core::score::weight_for_class;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
-/// Detect call-based effects in `block`. Path calls are resolved through
+/// Detect call-based effects in `body`. Path calls are resolved through
 /// `imports`; `path` is unused here today but kept for parity with sibling
 /// detectors (T12–T14) that emit `RiskFeature`s carrying a path.
 ///
@@ -23,7 +23,7 @@ use syn::visit::Visit;
 /// `visit_expr_call` sets `in_callee = true` before visiting the callee, so
 /// `visit_expr_path` skips static-name emission for callee paths.
 pub fn detect(
-    block: &syn::Block,
+    body: &crate::functions::FnBodyOwned,
     imports: &super::Imports,
     _path: &str,
     statics: &std::collections::HashSet<String>,
@@ -34,7 +34,7 @@ pub fn detect(
         effects: Vec::new(),
         in_callee: false,
     };
-    walker.visit_block(block);
+    body.walk_with(&mut walker);
     walker.effects
 }
 
@@ -50,6 +50,17 @@ struct CallWalker<'a> {
 }
 
 impl<'a, 'ast> Visit<'ast> for CallWalker<'a> {
+    // Nested-unit boundary (#83): a nested item (`fn`/`impl`/`trait`/`mod`) and a
+    // closure are each their OWN unit, so the parent walk must NOT descend into
+    // them — otherwise the parent double-counts the nested unit's effects. Empty
+    // no-ops (no default recursion) stop the walk at every such boundary.
+    fn visit_item(&mut self, _n: &'ast syn::Item) {
+        // nested-unit boundary (#83): stop — this item is its own unit
+    }
+    fn visit_expr_closure(&mut self, _n: &'ast syn::ExprClosure) {
+        // nested-unit boundary (#83): stop — this closure is its own unit
+    }
+
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*node.func {
             let rendered = render_path(&p.path);
@@ -266,7 +277,7 @@ mod tests {
         let statics = std::collections::HashSet::new();
         let units = crate::functions::collect(&file, "t.rs");
         let unit = units.iter().find(|u| u.symbol == "f").expect("unit f");
-        let effects = detect(&unit.block, &imports, "t.rs", &statics);
+        let effects = detect(&unit.body, &imports, "t.rs", &statics);
         let net: Vec<_> = effects
             .iter()
             .filter(|e| e.kind.wire() == "net.fs.db")

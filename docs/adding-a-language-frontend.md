@@ -115,6 +115,65 @@ For each axis, add your language as a new **column** in that guideline's per-lan
 and a **bullet** under its *Honest per-language differences* / *Per-frontend realization* —
 and preserve any *intentional* difference already recorded there rather than "aligning" it.
 
+### 3.1 A closure is not a nested fn — thread the capture environment *(target model — not yet implemented, #84)*
+
+The granularity row above makes **every** nested unit its own `Hotspot` + `UnitRecord`, and
+that is right for *effects*. But a **closure is fundamentally different from a nested named
+fn**: a nested `fn` does **not** capture; a closure's whole essence is **capturing the
+enclosing scope**. Making a closure its own unit and analyzing it *in isolation* throws away
+the enclosing binding context that mutation classification needs — and that loss is exactly
+the dilemma the #83 dogfood exposed (`docs/032-nested-unit-dogfood.md`, Q5): a captured write
+classified with no enclosing context is either **over-scored** (Q5(a), what Rust ships: every
+captured write becomes `hidden.mutation "captured-binding"`) or **under-scored** (the rejected
+Q5(c) move-gate interim: every non-`move` captured write becomes contained `local.mutation`),
+because the isolated closure
+unit cannot tell a captured **owned local** (genuinely contained) from a captured **`&mut`
+param** (caller-visible, escaping) from a captured **`&`/`&RefCell`** (interior-mut, must
+score high). Both are guesses.
+
+**The rule (cross-language principle, where this is headed).** A frontend that makes a
+closure its own unit **must thread the *enclosing* unit's binding sets in as classification
+context** — the params (`&mut`-param set, shared-`&`-ref set), the owned locals
+(`let`/`let mut` set), and the module statics. This is the **capture environment**. It
+carries classification *context* downward; it does **not** carry the enclosing unit's
+*effects* (the closure still owns its own effects — the #83 no-double-count boundary for
+*effects* is intact). A captured write is then classified by the **nature of the captured
+binding** in that environment (owned local → contained; `&mut` param / shared ref →
+escaping / interior-mut; static → global — the full cascade is
+`mutation-classification-guideline.md`), and an **escaping** captured effect is
+**re-attributed to the binding's owner** — the enclosing unit — because an inline
+higher-order-function closure (`things.for_each(|x| dst.push(x))`) has **no call edge** to the
+closure, so its escaping mutation would otherwise never reach the enclosing fn's caller
+(`cross-file-resolution-guideline.md`, *Captured-effect re-attribution*).
+
+**Cross-language shape (a provability limit, not an ontological one).** TS/JS and Python nested
+functions capture outer variables **exactly like Rust closures** — this is not a Rust
+peculiarity. A captured mutation of a **truly-local outer variable consumed in-frame** is morally
+**contained** in those languages too. The difference is **epistemic**: Rust's ownership/borrow
+system gives a cheap **syntactic proof of containment** (an owned `let`) that GC languages lack,
+so absent that proof they **conservatively default** captured mutations to external — not because
+there is *nothing to contain*. So the model splits cleanly:
+
+- **Universal (all frontends):** absent a containment proof, a captured mutation is treated as an
+  **external effect** and **re-attributes to the binding's owner** (the enclosing unit).
+  Threading the enclosing environment as context and re-attributing the captured mutation up is
+  the **cross-language** core.
+- **Rust-only ownership-based refinement:** ownership gives Rust a *second*, provable case where
+  the GC languages conservatively keep *one* — a captured **owned local** is *contained*
+  (discounted; the owned-`let` syntax plus the capture environment is the proof), while a
+  captured **`&mut` param / `&`-ref** stays external, the same as the conservative default. The
+  contained owned-local subset has **no cross-language analog**.
+
+There is **also** a **language-neutral** containment proof the model doesn't yet exploit —
+**inline-non-escaping consumption** (the closure passed directly to a synchronous
+`.forEach`/`.map`/`.for_each`, never stored/returned/spawned) — which proves containment in
+TS/Python too; flag it as a future cross-language refinement.
+
+Do **not** frame TS/Python as weaker — they simply **lack Rust's cheap syntactic proof** of
+containment. **Rust's #83 today isolates closures without the environment** — it ships the coarse
+flat Q5(a) fallback (a `move`-gate, Q5(c), was tried and **reverted** as a rejected interim); the
+capture environment is the target this row is headed toward, filed as **#84**.
+
 ## 4. The scoring model (no spec needed)
 
 Normative source: `crates/fxrank-core/src/score.rs`. You emit effects/risks with a
